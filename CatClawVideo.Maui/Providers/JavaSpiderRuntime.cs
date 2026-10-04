@@ -973,8 +973,26 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         {
             var dir = Path.Combine(_workDir, "guest-prefs");
             if (!Directory.Exists(dir)) return;
+            // ⚠ 2026-10-04 用户实测「扫码能播、重启显示未登录」。定位到两套来源在抢同一批文件：
+            //   guest-prefs\*.xml      —— prefsput 用的，可能是陈旧副本
+            //   guest-prefs\sharedb\*  —— 桥每 5s 上行的 file-sync 落点，是**最新**数据
+            // 两者最终都写进 guest 的 /data/catclaw/shared_prefs/，prefsput 先跑会把
+            // sharedb 里的新 Cookie 覆盖成旧 Cookie ⇒ 重启后回到未登录。
+            // 实测时间戳佐证：guest-prefs\guazi_auth.xml 是 18:57 的旧文件，
+            // 而 guest-prefs\sharedb\guazi_auth.xml 是刚刚（扫码后）的最新文件。
+            // 现在：**同名以 sharedb 为准**（它才是实时上行的），sharedb 里没有的才走 prefsput。
+            var sbDirForSkip = Path.Combine(dir, "sharedb");
+            var freshNames = Directory.Exists(sbDirForSkip)
+                ? Directory.GetFiles(sbDirForSkip).Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var f in Directory.GetFiles(dir, "*.xml"))
             {
+                var fn = Path.GetFileName(f);
+                if (freshNames.Contains(fn))
+                {
+                    Log($"[回灌] {fn} 跳过 prefsput（sharedb 有更新版本，由下行 writefile 写入）");
+                    continue;
+                }
                 var xml = await File.ReadAllTextAsync(f, ct);
                 var req = new JsonObject
                 {
