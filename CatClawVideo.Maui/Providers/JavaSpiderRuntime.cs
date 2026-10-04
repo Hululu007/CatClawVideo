@@ -941,10 +941,14 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 using var sr = new StreamReader(fs, Encoding.UTF8);
                 text = sr.ReadToEnd();
             }
-            // 取最后一次挂载尝试的结果
-            var lastMount = LastValue(text, "[persist] mount RC=");
-            var lastFsck = LastValue(text, "[persist] fsck 后 mount RC=");
-            var rcText = !string.IsNullOrEmpty(lastFsck) ? lastFsck : lastMount;
+            // 取**在日志里更靠后**的那条挂载结果。挂载一次成功时 guest 根本不会再打 "fsck 后 mount RC="
+            // 那行，而串口日志是跨开机累加的：一律优先 "fsck 后" 的话，上一次开机失败的残留（255）
+            // 会把这次的 RC=0 盖掉 ⇒ 宿主误判"不持久"，又去回灌，把盘上的新状态倒回去。
+            var iMount = text.LastIndexOf("[persist] mount RC=", StringComparison.Ordinal);
+            var iFsck = text.LastIndexOf("[persist] fsck 后 mount RC=", StringComparison.Ordinal);
+            var rcText = iFsck > iMount
+                ? LastValue(text, "[persist] fsck 后 mount RC=")
+                : LastValue(text, "[persist] mount RC=");
             var persisted = rcText == "0";
             Log($"[persist] guest /data 持久性实测：{(persisted ? "持久" : "不持久")}（mount RC={rcText}）");
             return Task.FromResult(persisted);
