@@ -1004,7 +1004,11 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                         {
                             ["id"] = Interlocked.Increment(ref _id),
                             ["op"] = "writefile",
-                            ["path"] = "/data/cache/sharedb/" + Path.GetFileName(f),
+                            // 2026-10-04：下行回灌目录必须与桥的上行扫描目录一致，
+                            // 否则「上行存 A、下行写 B」，两边永远不闭环。
+                            // 实测（桥 op=find-cookie）壳读 /data/catclaw/shared_prefs，
+                            // 该目录名与桥的 Server.sharedbDir() 保持一致。
+                            ["path"] = "/data/catclaw/shared_prefs/" + Path.GetFileName(f),
                             ["data"] = b64,
                         };
                         var resp = await RoundTripAsync(req, TimeSpan.FromSeconds(15), ct);
@@ -1341,7 +1345,9 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                         catch { }
                     }
                     // file-sync：网盘 Cookie 等（/data/cache/sharedb/*，tmpfs 冷启即清）——
-                    // 桥在每个 call 后检测到变化就上行，存 guest-prefs\sharedb\ 下次回灌
+                    // 桥每 5s 检测到变化就上行，存 guest-prefs\sharedb\ 下次回灌。
+                    // guest 侧目录见桥的 Server.sharedbDir()（/data/catclaw/shared_prefs），
+                    // 与本方法下行写回（RestoreGuestPrefsAsync）同一目录 —— 上下行必须同源。
                     else if (obj["ev"]?.GetValue<string>() == "file-sync")
                     {
                         try
