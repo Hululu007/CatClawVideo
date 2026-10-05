@@ -130,6 +130,21 @@ if (-not $ver) {
 }
 Write-Msg "版本: $ver   目标: $Tfm ($Rid)" -Color Cyan
 
+# 参数护栏：OutDir/ObjDir 必须分别以 bin\ 和 obj\ 开头。
+# 起因（2026-10-05 复发；09-25 踩过一次，.gitignore:447-448 那两条就是当时的疤）：
+# 从 bash / Git-Bash 里写「... -NoPause *> out.log」时，bash 不认 PowerShell 的 *>，
+# 会把 '*' 当通配符展开成仓库根目录的名字，PowerShell 再按位置把它们绑给 -OutDir / -ObjDir。
+# 实测今天绑到的是 OutDir=APKINDEX、ObjDir=APKINDEX.tar.gz —— 编译不报错、ISCC 也照常出包，
+# 但打包读的是那个意外目录；而 bin\win-release 里留着**上一版**的 publish（initrd 是旧的），
+# 一旦有人按老路径去取件，装出去的就是旧运行时。这种错法必须当场拦下。
+# 正确调用：powershell -NoProfile -ExecutionPolicy Bypass -File build-win-release.ps1 -NoPause > log 2>&1
+if ($OutDir -notmatch '^bin(\\|/)' -or $ObjDir -notmatch '^obj(\\|/)') {
+    Write-Msg "参数异常: OutDir=[$OutDir]  ObjDir=[$ObjDir]（应分别以 bin 和 obj 开头）。" -Color Red
+    Write-Msg "多半是调用方把 PowerShell 的 *> 重定向交给了 bash：bash 会把星号展开成文件名并按位置绑参。" -Color Red
+    Write-Msg "改用它： ... -NoPause > 日志文件 2>&1" -Color Red
+    Pause-And-Exit 1
+}
+
 # [1/2] 发布绿色目录
 Write-Msg ""
 Write-Msg "[1/2] 发布 Windows 绿色目录（self-contained，无 pdb，多语言保留）..." -Color Yellow
