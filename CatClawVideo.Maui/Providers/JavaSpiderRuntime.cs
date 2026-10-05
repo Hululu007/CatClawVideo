@@ -760,7 +760,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 .Where(s => s.SpiderKind == CatClawVideo.Core.Models.VodSpiderKind.Jar
                          && !string.IsNullOrEmpty(s.Api)
                          && !_loadedSites.ContainsKey(s.Key)      // 已 loaded 的跳过 ⇒ 换源后只补新增的
-                         && !_loadFailedSites.ContainsKey(s.Key)) // 已知失败的跳过（负缓存）
+                         && !LoadLatched(s.Key)) // 已知失败的跳过（负缓存；超时类到期就再给机会）
                 .Take(120).ToList();
             if (sites.Count == 0) return;
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1289,9 +1289,21 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     /// 防止旧 QemuHostRuntime 被复活成孤儿 qemu（2026-09-27 多 qemu 事故）。</summary>
     private int _bridgeEpoch;
 
-    /// <summary>会话级加载失败负缓存（站点键 → 失败原因）：命中直接快速失败，不反复烧桥。
-    /// 只记结构性失败（VerifyError/类不存在等）；桥重置时清空。</summary>
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _loadFailedSites = new();
+    /// <summary>加载失败负缓存（站点键 → 原因 + 到期时刻）。
+    /// 值为 null 的是**结构性**失败（VerifyError/类不存在等，重试也不会好，
+    /// 实测 Wogg/Douban 每轮搜索白跑 5~7s）⇒ 整个会话生效，桥重置时清空。
+    /// 带到期时刻的是**超时**：这类多半不是这个站坏了，而是它在桥的串行队列里排到了别人后面
+    /// （2026-10-05 实测：预热改并行后，10 个站在 190ms 内一起报「load 超时 25s」，
+    ///  而 Jianpian 在两次超时之间 14:19:01 明明加载成功过）⇒ 只冷却 90 秒，
+    ///  且用户点名（force，如播放）时立刻放行重试。
+    /// 桥重置时两种一起清空（见 ResetEngineAsync / Shutdown）。</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Why, DateTime? Until)>
+        _loadFailedSites = new();
+
+    /// <summary>这一站现在是否仍被负缓存挡住（超时类到期即放行）。</summary>
+    private bool LoadLatched(string key) =>
+        _loadFailedSites.TryGetValue(key, out var v) && (v.Until is null || v.Until > DateTime.UtcNow);
+
 
     /// <summary>
     /// 把当前桥会话判废并后台重开：期间请求快速失败，重开后 <see cref="_loadedSites"/> 已清空，
@@ -1839,10 +1851,19 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
         bool force = false, BridgeSlot? slot = null)
     {
         if (_loadedSites.TryGetValue(site.Key, out _) && !force) return;
-        // 会话级负缓存：结构性加载失败（VerifyError 等，重试也不会好）不再反复烧桥——
-        // 实测 Wogg/Douban 每轮搜索都要白跑 5~7s 的 load。重置引擎时清空，给重试机会。
-        if (_loadFailedSites.TryGetValue(site.Key, out var failedWhy))
-            throw new InvalidOperationException($"站点 {site.Key} 此前加载失败，本轮跳过：{failedWhy}");
+        // 负缓存（策略见 _loadFailedSites 注释）：结构性失败整会话跳过（实测 Wogg/Douban 每轮
+        // 搜索白跑 5~7s）；超时只冷却 90 秒，且 force（用户点名要这一站，如播放）时立刻放行重试。
+        if (_loadFailedSites.TryGetValue(site.Key, out var latch))
+        {
+            var timedOutLatch = latch.Until is not null;
+            if (timedOutLatch && (force || latch.Until <= DateTime.UtcNow))
+            {
+                _loadFailedSites.TryRemove(site.Key, out _);
+                Log($"站点 {site.Key} 重试加载（上次：{latch.Why}{(force ? "，用户点名" : "，冷却期已过")}）");
+            }
+            else
+                throw new InvalidOperationException($"站点 {site.Key} 此前加载失败，本轮跳过：{latch.Why}");
+        }
         var className = classNameOf(site);
         var req = new JsonObject
         {
@@ -1871,8 +1892,9 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
         // 搜索是「广撒网」，这些站本轮失败即可，不该让整轮 96 个站陪着等。
         // 25s 与 SearchContentAsync 的搜索超时对齐（同一批站、同一量级）。
         //
-        // 超时也要进负缓存（_loadFailedSites）：否则下一次搜索又对这个站重新 load 一遍、
-        // 再耗 25s —— 实测「TingShijie 30s」反复出现 5 次就是这么来的。
+        // 超时也进负缓存，但**只冷却 90 秒**（策略与依据见 _loadFailedSites 注释）：
+        // 完全不记的话，下一次搜索又对这个站重新 load、再耗 25s（实测「TingShijie 30s」
+        // 反复出现 5 次就是这么来的）；记成整会话的话就会把排队的健康站判死（2026-10-05 误伤）。
         JsonObject resp;
         try
         {
@@ -1880,15 +1902,16 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
         }
         catch (TimeoutException)
         {
-            _loadFailedSites[site.Key] = "load 超时 25s（本会话不再重试）";
-            Log($"站点 {site.Key} load 超时 25s（类名 {className}）→ 本会话跳过，不再重试");
+            _loadFailedSites[site.Key] = ("load 超时 25s（90 秒内跳过，之后自动重试）", DateTime.UtcNow.AddSeconds(90));
+            Log($"站点 {site.Key} load 超时 25s（类名 {className}）→ 冷却 90s，用户点名则立即重试");
             throw;
         }
         if (resp["ok"]?.GetValue<bool>() != true)
         {
             // 加载失败必须留痕：此前只 log 成功分支，导致「站点没反应」无从查因
             Log($"站点 {site.Key} 加载失败（类名 {className}，jar {Path.GetFileName(jarPath)}）: {resp["error"]}");
-            _loadFailedSites[site.Key] = resp["error"]?.GetValue<string>() ?? "";
+            // 结构性失败（桥自己答 ok:false）：重试也不会好 ⇒ Until=null，整会话跳过
+            _loadFailedSites[site.Key] = (resp["error"]?.GetValue<string>() ?? "", null);
             throw new InvalidOperationException($"spider {site.Key} 加载失败: {resp["error"]}");
         }
         _loadedSites[site.Key] = true;
