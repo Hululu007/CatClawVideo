@@ -47,14 +47,3 @@ public sealed record BtFileInfo(
     long DownloadedBytes,
     double ProgressPercent,
     bool Selected);
-
-/// <summary>下载任务周期统计（下载服务 → 任务卡片）</summary>
-public sealed record BtTaskStats(
-    long Downloaded,
-    long Total,
-    long DownloadRate,
-    long UploadRate,
-    long Uploaded,
-    int Connections,
-    int Seeds,
-    int Leeches);
