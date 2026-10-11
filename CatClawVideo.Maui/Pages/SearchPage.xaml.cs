@@ -1365,6 +1365,64 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
             //   后续站点的请求。原实现连令牌都没传，退出后几十个 JNI 调用仍在后台跑。
             var ct = _searchCts?.Token ?? CancellationToken.None;
 
+            // ★ 桥内聚合搜索（2026-10-11）：jar 站一次 op 进桥，桥内并发逐站流式回推；
+            // 未装载站在桥内就地 loadFull。聚合失败（旧 gb.dex/超时）自动回落下面的逐站路径。
+            var jrBatch = CatClawVideo.Core.Providers.JavaSpiderRuntime.Current;
+            if (jrBatch is not null && jrBatch.SupportsBatchSearch)
+            {
+                var jarSites = sites.Where(x => x.SpiderKind == CatClawVideo.Core.Models.VodSpiderKind.Jar)
+                    .Select(x => (Site: x, Jar: jrBatch.CachedJarPathOf(x.Key), ClassName: jrBatch.ClassNameFor(x.Key, x), Ext: (string?)null))
+                    .Where(x => x.Jar is not null)
+                    .Select(x => (x.Site, Jar: x.Jar!, ClassName: x.ClassName, Ext: x.Ext))
+                    .ToList();
+                if (jarSites.Count > 0)
+                {
+                    DiagLog.Write($"[搜索] {kw} 走桥内聚合（{jarSites.Count} 个 jar 站）");
+                    var jarKeys = jarSites.Select(x => x.Site.Key).ToHashSet();
+                    var rest = sites.Where(x => !jarKeys.Contains(x.Key)).ToList();
+                    var batchOk = false;
+                    try
+                    {
+                        var batchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        batchCts.CancelAfter(TimeSpan.FromSeconds(150));
+                        var finished = await jrBatch.BatchSearchAsync(kw, jarSites,
+                            (site, resultJson) =>
+                            {
+                                var items = CatClawVideo.Core.Providers.SpiderJsonParser.ParseItems(resultJson, site.Key);
+                                if (items.Count == 0) return Task.CompletedTask;
+                                foreach (var it in items) { it.SiteName = site.Name; it.Category ??= site.Name; }
+                                List<VodItem> addedBatch;
+                                lock (gate) { foreach (var it in items) _sourceResults.Add(it); addedBatch = items; }
+                                MainThread.BeginInvokeOnMainThread(() =>
+                                {
+                                    ApplySiteFilter();
+                                    StatusLabel.Text = $"「{kw}」已找到 {_sourceResults.Count} 个结果…（{site.Name} +{items.Count}）";
+                                    CoverResolver.Attach(_covers, addedBatch);
+                                });
+                                return Task.CompletedTask;
+                            }, batchCts.Token);
+                        batchOk = finished >= 0;
+                        DiagLog.Write($"[搜索] 桥内聚合完成：{finished} 站（ok={batchOk}）");
+                    }
+                    catch (Exception bex)
+                    {
+                        DiagLog.Write($"[搜索] 桥内聚合失败，回落逐站: {bex.Message}");
+                    }
+                    if (batchOk && rest.Count == 0)
+                    {
+                        MainThread.BeginInvokeOnMainThread(() =>
+                        {
+                            StatusLabel.Text = _sourceResults.Count > 0
+                                ? $"「{kw}」找到 {_sourceResults.Count} 个结果（{sites.Count} 个站点）"
+                                : $"未找到与「{kw}」相关的内容";
+                        });
+                        return;
+                    }
+                    // 聚合成功但还有非 jar 站：继续走下面的逐站路径（rest）；聚合失败：全量走逐站（sites）
+                    if (batchOk) sites = rest;
+                }
+            }
+
             var tasks = sites.Select(async site =>
             {
                 bool entered = false;   // 是否已从 searchGate 拿到名额（决定 finally 要不要 Release）
@@ -1469,6 +1527,8 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
             // 的规划，单进程并发仍是主要压力源，故取折中 6，且下方有失败重试与日志）。
             // 关键：**超时只是不再等**，已在飞的任务不取消 —— 它们回来后照样上屏
             // （用户可继续看到结果，无需重搜）。
+
+
             var all = Task.WhenAll(tasks);
 
             // 搜索等待预算（2026-10-04 二次修正：公式按实测重算，不再拍脑袋）。

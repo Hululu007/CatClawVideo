@@ -1044,17 +1044,31 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             // 实测时间戳佐证：guest-prefs\guazi_auth.xml 是 18:57 的旧文件，
             // 而 guest-prefs\sharedb\guazi_auth.xml 是刚刚（扫码后）的最新文件。
             // 现在：**同名以 sharedb 为准**（它才是实时上行的），sharedb 里没有的才走 prefsput。
+            // ★ 2026-10-11 九修（修「重启后登录状态丢失」）：不再无条件「sharedb 为准」，
+            //   改为**按 mtime 取新**。原因：sharedb 上行通道只在 call 结束后扫 /data/cache/sharedb，
+            //   该目录在新 guest 里长期为空 ⇒ sharedb 副本停在 2026-10-10，而 prefs-sync 一直在更新
+            //   guest-prefs\*.xml（最新到 10-11）。旧逻辑拿 10-10 的旧令牌覆盖 10-11 的新令牌，
+            //   每次冷启都把刚扫的登录态打回未登录。实测：guazi_auth/app_cfg_v2/spUtils 等 6 个文件
+            //   prefs 均比 sharedb 新。
             var sbDirForSkip = Path.Combine(dir, "sharedb");
-            var freshNames = Directory.Exists(sbDirForSkip)
-                ? Directory.GetFiles(sbDirForSkip).Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase)
-                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sbTimes = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+            if (Directory.Exists(sbDirForSkip))
+                foreach (var sf in Directory.GetFiles(sbDirForSkip))
+                    sbTimes[Path.GetFileName(sf)] = File.GetLastWriteTimeUtc(sf);
+            // prefs 比 sharedb 新（或 sharedb 没有）⇒ 由 prefsput 写；同时登记，避免 sharedb 再盖一次
+            var prefsWin = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var f in Directory.GetFiles(dir, "*.xml"))
             {
                 var fn = Path.GetFileName(f);
-                if (freshNames.Contains(fn))
+                if (sbTimes.TryGetValue(fn, out var sbTime) && sbTime > File.GetLastWriteTimeUtc(f))
                 {
-                    Log($"[回灌] {fn} 跳过 prefsput（sharedb 有更新版本，由下行 writefile 写入）");
+                    Log($"[回灌] {fn} 跳过 prefsput（sharedb 更新：{sbTime:MM-dd HH:mm} > {File.GetLastWriteTimeUtc(f):MM-dd HH:mm}）");
                     continue;
+                }
+                if (sbTimes.ContainsKey(fn))
+                {
+                    prefsWin.Add(fn);
+                    Log($"[回灌] {fn} prefs 更新，以 prefsput 为准并跳过 sharedb 回写");
                 }
                 var xml = await File.ReadAllTextAsync(f, ct);
                 var req = new JsonObject
@@ -1078,6 +1092,8 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             {
                 foreach (var f in Directory.GetFiles(sbDir))
                 {
+                    // ★ 九修：prefs 更新时已被 prefsput 写过，这里再写会把新值盖回旧值
+                    if (prefsWin.Contains(Path.GetFileName(f))) continue;
                     try
                     {
                         var b64 = Convert.ToBase64String(await File.ReadAllBytesAsync(f, ct));
@@ -1672,6 +1688,79 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
 
     /// <summary>常驻读桥输出（ART guest 的 socket 流）：按 id 分发响应、按 ev 分发 UI 事件。</summary>
     /// <summary>
+    // ═══════════ 桥内聚合搜索（searchall，2026-10-11）═══════════
+    // 一个 op 进桥，桥内并发跑全部站点 searchContent，逐站流式回推；宿主只剩一个请求状态机。
+    private readonly ConcurrentDictionary<int, Func<JsonObject, Task>> _batchHandlers = new();
+
+    /// <summary>桥侧是否支持聚合搜索（gb.dex 2026-10-11 之后）。默认 true——桥不支持时 BatchSearchAsync 返回负值，调用方回落。</summary>
+    public bool SupportsBatchSearch { get; set; } = true;
+
+    /// <summary>站点已缓存的 jar 路径（未下载过返回 null）。聚合搜索需要它向桥提供 jar 位置。</summary>
+    public string? CachedJarPathOf(string siteKey)
+        => _convertedJars.TryGetValue(siteKey, out var p) && File.Exists(p) ? p : null;
+
+    /// <summary>站点在桥内要加载的类名（classNameOf 的公开包装）。</summary>
+    public string ClassNameFor(string siteKey, VodSiteInfo site) => classNameOf(site);
+
+    /// <summary>
+    /// 桥内聚合搜索：kw 发给 sites 全部站点，每站完成即回调 onPartial（结果 JSON 原文）。
+    /// 返回完成站点数；桥不支持（旧 gb.dex）时返回 -1，调用方回落逐站路径。
+    /// </summary>
+    public async Task<int> BatchSearchAsync(string kw,
+        IReadOnlyList<(VodSiteInfo Site, string Jar, string ClassName, string? Ext)> sites,
+        Func<VodSiteInfo, string, Task> onPartial, CancellationToken ct)
+    {
+        await EnsureBridgeAsync(ct).ConfigureAwait(false);
+        var id = Interlocked.Increment(ref _id);
+        var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _batchHandlers[id] = obj =>
+        {
+            if (obj["done"] is not null) { SupportsBatchSearch = true; tcs.TrySetResult(obj); return Task.CompletedTask; }
+            var siteKey = obj["site"]?.GetValue<string>() ?? "";
+            var result = obj["ok"]?.GetValue<bool>() == true ? obj["result"]?.GetValue<string>() ?? "{}" : "{}";
+            var site = sites.FirstOrDefault(x => x.Site.Key == siteKey).Site;
+            if (site is not null) return onPartial(site, result);
+            return Task.CompletedTask;
+        };
+        try
+        {
+            var arr = new JsonArray();
+            foreach (var s in sites)
+            {
+                var st = new JsonObject
+                {
+                    ["site"] = s.Site.Key,
+                    ["className"] = classNameOf(s.Site),
+                    ["jar"] = Path.GetFileName(s.Jar).Replace("raw-", "").Replace(".jar", ""),
+                    ["rawJar"] = s.Jar,
+                    ["ext"] = s.Ext ?? "",
+                };
+                arr.Add(st);
+            }
+            var req = new JsonObject
+            {
+                ["id"] = id,
+                ["op"] = "searchall",
+                ["kw"] = kw,
+                ["sites"] = arr,
+            };
+            // 写行协议（与 RoundTripAsync 相同的写法：主桥 stdin + 写锁）
+            var w = _stdin ?? throw new InvalidOperationException("桥未连接");
+            await _stdinLock.WaitAsync(ct).ConfigureAwait(false);
+            try { await w.WriteLineAsync(req.ToJsonString()).ConfigureAwait(false); await w.FlushAsync().ConfigureAwait(false); }
+            finally { _stdinLock.Release(); }
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(180));
+            var done = await tcs.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            return done["finished"]?.GetValue<int>() ?? -2;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return -3;   // 180s 硬顶超时：宿主自行回落或放弃
+        }
+        finally { _batchHandlers.TryRemove(id, out _); }
+    }
+
     /// 主桥读循环。多桥（2026-10-04）时副桥走 <see cref="ReadLoopAsync(StreamReader,int,Action{int}?)"/>，
     /// 那条路径在读完时只丢该桥槽位（<c>onBridgeLost</c>），不会触发 <see cref="FailAllPending"/>
     /// —— 主桥与其它副桥都不受影响，即用户要的「一个桥崩了其他桥替补」。
@@ -1741,6 +1830,13 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 }
 
                 var id = obj["id"]?.GetValue<int>() ?? int.MinValue;
+                // 聚合搜索流式行（seq/done）：交给注册的批量处理器，不进 pending 表
+                if ((obj.ContainsKey("seq") || obj.ContainsKey("done")) && _batchHandlers.TryGetValue(id, out var bh))
+                {
+                    try { await bh(obj).ConfigureAwait(false); } catch { }
+                    if (obj.ContainsKey("done")) _batchHandlers.TryRemove(id, out _);
+                    continue;
+                }
                 if (_pendingResponses.TryRemove(id, out var tcs))
                 {
                     // 端到端耗时（发出→抵达）：喂给自适应宽限，让窗口跟着桥的真实速度走。
