@@ -510,3 +510,8 @@ JavaBridge/sources.txt
 /JavaBridge/build.cmd
 /JavaBridge/guest-sources.txt
 /JavaBridge/vendor/dex2jar/
+
+# 工作产物与本地分析数据库（2026-10-11）
+.zwork/
+androguard.db
+*.db-journal

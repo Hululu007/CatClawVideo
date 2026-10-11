@@ -318,10 +318,15 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
            && url.Contains("/proxy?do=config", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// BT 流式拦截（对齐 <see cref="CatClawSourceProvider"/> 的磁力分支）：
-    /// magnet: → 本机 127.0.0.1 BT 代理地址（可 Range 拖动）；ed2k 明确不支持并给出可读提示。
-    /// 非磁力/电驴返回 null，交回常规解析管线。
+    /// BT 流式拦截（对齐 TVBox <c>Thunder.isSupportUrl</c> = magnet/thunder/torrent）：
+    /// magnet:/thunder:///.torrent → 迅雷引擎；ed2k 明确不支持并给出可读提示。
+    /// 非磁力系返回 null，交回常规解析管线。
     /// </summary>
+    private static bool IsThunderUrl(string url)
+        => url.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase)
+        || url.StartsWith("thunder", StringComparison.OrdinalIgnoreCase)
+        || url.Split(';')[0].EndsWith(".torrent", StringComparison.OrdinalIgnoreCase);
+
     private async Task<PlayRequest?> TryOpenBtAsync(PlayRequest play, VodEpisode episode, CancellationToken ct)
     {
         var url = play.Url ?? "";
@@ -329,7 +334,7 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
         if (url.StartsWith("ed2k://", StringComparison.OrdinalIgnoreCase))
             throw new NotSupportedException("该集为电驴(ed2k)下载链接，暂不支持在线播放；可复制链接到下载工具");
 
-        if (!url.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
+        if (!IsThunderUrl(url))
             return null;
 
         // 磁力只走迅雷引擎（内置 BT 引擎已移除：公共 BT 网络实测无速度，见 docs/playback-latency-analysis.md）

@@ -11,6 +11,7 @@
         <BackButtonBehavior IsVisible="False" />
     </Shell.BackButtonBehavior>
 
+    <Grid>
     <ScrollView x:Name="ContentScroll">
         <VerticalStackLayout x:Name="ContentStack" Padding="24,14,24,28" Spacing="14">
 
@@ -34,14 +35,26 @@
                 <BoxView x:Name="TitleBarDragArea" Grid.Column="2" Color="Transparent"
                          HorizontalOptions="Fill" VerticalOptions="Fill" />
 
-                <!-- 线路切换（顶栏右侧；集数多时横向滚动）。
-                     贴紧右边缘：原生窗口按钮在最顶端一行（y≈0-25），芯片在下一行（y≈30+），
-                     垂直不重叠，无需右侧留白（2026-09-11 真机截图核对） -->
-                <ScrollView Grid.Column="3" Orientation="Horizontal" HorizontalOptions="End"
-                            HorizontalScrollBarVisibility="Never" VerticalScrollBarVisibility="Never"
-                            VerticalOptions="Center" MaximumWidthRequest="520">
-                    <HorizontalStackLayout x:Name="LinesHost" Spacing="8" />
-                </ScrollView>
+                <!-- 线路切换已搬到播放器上方独立行（顶栏 520px 装不下 17 条线路，横向滚不动） -->
+            </Grid>
+
+            <!-- ═══ 线路行：右侧下拉框 = "切换线路"前缀 + 当前路线（17 条收进下拉） ═══ -->
+            <Grid x:Name="RouteBar" ColumnDefinitions="*,Auto" ColumnSpacing="10"
+                   Margin="0,2,0,0" VerticalOptions="Start">
+                <BoxView Grid.Column="0" Color="Transparent" />
+                <Border Grid.Column="1" StrokeThickness="0" StrokeShape="RoundRectangle 8"
+                        BackgroundColor="{DynamicResource PrimaryColor}" Padding="14,6">
+                    <Border.GestureRecognizers>
+                        <TapGestureRecognizer Tapped="OnSwitchRouteClicked" />
+                    </Border.GestureRecognizers>
+                    <HorizontalStackLayout Spacing="8" VerticalOptions="Center">
+                        <Label Text="切换线路" FontSize="12" TextColor="#BFD4FF" VerticalOptions="Center" />
+                        <Label x:Name="CurrentRouteLabel" Text="—" FontSize="12" FontFamily="OpenSansSemibold"
+                               TextColor="White" VerticalOptions="Center" />
+                        <Label x:Name="RouteCountLabel" Text="" FontSize="11" TextColor="#BFD4FF" VerticalOptions="Center" />
+                        <Label Text="▾" FontSize="12" TextColor="White" VerticalOptions="Center" />
+                    </HorizontalStackLayout>
+                </Border>
             </Grid>
 
             <!-- ═══ 主区：播放器 + 右侧选集栏（主流播放器形态；全屏模式下选集列隐藏） ═══ -->
@@ -234,5 +247,26 @@
 
         </VerticalStackLayout>
     </ScrollView>
+
+    <!-- ═══ 线路下拉悬浮层：与 ScrollView 同 Grid 单元叠放，不占文档流 ═══ -->
+    <Grid x:Name="RouteOverlay" IsVisible="False" ZIndex="100">
+        <BoxView Color="#80000000">
+            <BoxView.GestureRecognizers>
+                <TapGestureRecognizer Tapped="OnRouteOverlayTapped" />
+            </BoxView.GestureRecognizers>
+        </BoxView>
+        <Border x:Name="RouteDropdown" StrokeThickness="0"
+                StrokeShape="RoundRectangle 10" BackgroundColor="{DynamicResource CardBackgroundColor}"
+                Padding="8" HorizontalOptions="End" VerticalOptions="Start"
+                Margin="0,110,24,0" WidthRequest="240">
+            <Border.Shadow>
+                <Shadow Brush="Black" Opacity="0.4" Radius="12" Offset="0,4" />
+            </Border.Shadow>
+            <ScrollView MaximumHeightRequest="360" VerticalScrollBarVisibility="Default">
+                <VerticalStackLayout x:Name="RouteDropdownHost" Spacing="4" />
+            </ScrollView>
+        </Border>
+    </Grid>
+    </Grid>
 
 </ContentPage>

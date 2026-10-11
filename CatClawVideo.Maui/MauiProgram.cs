@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using CatClawVideo.Maui.Services;
 using CatClawVideo.Maui.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
@@ -149,13 +149,16 @@ public static class MauiProgram
             catch (Exception ex) { BtFileLog.Write($"[qemu] 预热失败（不影响后续懒启动）：{ex.Message}"); }
         });
 
-        // Guard 解密 VM（2026-09-24 用户拍板架构）：Guard 网盘源的解密/签名/proxyInvoke（ARM
-        // ftyguard so）跑在独立 QEMU 实例里，桥进程经 hostfwd 直连；so 弹的对话框/二维码经
-        // 控制口上行由 SpiderUiHost 渲染（jar 框架全权负责登录 UX，宿主只做 UI 接入）。
-        // 不预热（首个 Guard 站点加载时懒启动），运行时缺失则 Guard 解密通道不可用（ARM 调用明确报错）。
-        var qemuGuard = new CatClaw.Qemu.QemuGuardEngine(
-            Path.Combine(AppContext.BaseDirectory, "QemuGuest"), BtFileLog.Write);
-        CatClaw.Qemu.GuardRuntime.Attach(qemuGuard);
+        // Guard 解密 VM 已退役为回退开关（单VM合并：x86 走桥内 guard-decrypt op → 宿主
+        // :18481 GuardSvcLoop → 壳内转译 SO 进程内解密，无独立 QEMU；实测 QemuGuardEngine
+        // 全仓库零调用，留着只会再起一台 VM）。默认不建；CATCLAW_LEGACY_GUARD_VM=1 时召回旧路径。
+        if (Environment.GetEnvironmentVariable("CATCLAW_LEGACY_GUARD_VM") == "1")
+        {
+            var qemuGuard = new CatClaw.Qemu.QemuGuardEngine(
+                Path.Combine(AppContext.BaseDirectory, "QemuGuest"), BtFileLog.Write);
+            CatClaw.Qemu.GuardRuntime.Attach(qemuGuard);
+            BtFileLog.Write("[qemu] 独立 Guard VM 已启用（回退模式 CATCLAW_LEGACY_GUARD_VM=1）");
+        }
 #endif
 
         // TVBox 系爬虫（ProxyOrigin 等）会把播放地址拼成 http://127.0.0.1:<port>/proxy?...

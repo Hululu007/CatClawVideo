@@ -14,5 +14,7 @@
     <PackageReference Include="sqlite-net-pcl" Version="1.11.285" />
     <!-- 锁定 16KB 对齐版本（Android 16/16KB 页设备兼容），同 CatClawMusic -->
     <PackageReference Include="SQLitePCLRaw.bundle_green" Version="2.1.11" />
+    <!-- 直接提升 e_sqlite3 本机库以修复漏洞（从 2.1.11 -> 2.1.12-pre） -->
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12-pre20260709125052" />
   </ItemGroup>
 </Project>

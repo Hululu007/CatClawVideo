@@ -1,4 +1,4 @@
-﻿using System.Collections.ObjectModel;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using Microsoft.Maui.Controls.Shapes;
 using CatClawVideo.Core.Interfaces;
@@ -64,7 +64,7 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     /// <summary>最近一次 MediaOpened 的时刻（过滤"起播瞬间的伪 ended"，见 MediaEnded 守卫）</summary>
     private DateTime _mediaOpenedUtc;
 
-    /// <summary>线路芯片（SelectSource 高亮用；LinesHost 首位可能是"线路"前缀标签）</summary>
+    /// <summary>线路收纳：RouteBar 只展示当前线路，其余经切换弹窗选择（17 条全铺太乱）</summary>
     private readonly List<Border> _lineChips = [];
 
     /// <summary>播放历史会话（观看页播放也落库，海报墙封面来自 _item.Cover）</summary>
@@ -352,7 +352,7 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
                 TitleBarDragArea?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
                 BackButtonHost?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
                 TopBarTitle?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-                LinesHost?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement);
+                RouteBar?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement);
         }
         catch { }
     }
@@ -1382,43 +1382,87 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         if (first) await ShowTipAsync("该影片暂无可播放线路");
     }
 
-    /// <summary>重建线路芯片、应用续看上下文并选中线路（两条加载路径共用）。</summary>
+    /// <summary>线路切换弹窗：列出全部线路（当前打勾），选中即切线路并重载选集</summary>
+    private async void OnSwitchRouteClicked(object? sender, EventArgs e)
+    {
+        if (_sources.Count == 0)
+        {
+            await ShowTipAsync("该影片暂无可播放线路");
+            return;
+        }
+        ToggleRouteDropdown();
+    }
+
+    /// <summary>线路下拉遮罩：点空白收起</summary>
+    private void OnRouteOverlayTapped(object? sender, TappedEventArgs e)
+    {
+        try { RouteOverlay.IsVisible = false; } catch { }
+    }
+
+    /// <summary>线路下拉面板：展开/收起；展开时重建 17 条选项（当前高亮），点选即切线路</summary>
+    private void ToggleRouteDropdown()
+    {
+        try
+        {
+            if (RouteOverlay.IsVisible) { RouteOverlay.IsVisible = false; return; }
+            RouteDropdownHost.Children.Clear();
+            for (int i = 0; i < _sources.Count; i++)
+            {
+                var index = i;
+                var isCur = i == _currentSourceIndex;
+                var row = new Border
+                {
+                    StrokeThickness = 0,
+                    StrokeShape = new RoundRectangle { CornerRadius = 8 },
+                    Padding = new Thickness(12, 8),
+                    BackgroundColor = isCur
+                        ? (Color)Application.Current!.Resources["PrimaryColor"]
+                        : Colors.Transparent,
+                    Content = new Label
+                    {
+                        Text = isCur ? $"● {DisplayNameFor(_sources[i].Name)}" : DisplayNameFor(_sources[i].Name),
+                        FontSize = 12.5,
+                        TextColor = isCur ? Colors.White : (Color)Application.Current!.Resources["TextPrimaryColor"],
+                    },
+                };
+                var tap = new TapGestureRecognizer();
+                tap.Tapped += async (_, _) =>
+                {
+                    RouteOverlay.IsVisible = false;
+                    if (index != _currentSourceIndex) await SelectSourceAsync(index);
+                };
+                row.GestureRecognizers.Add(tap);
+                RouteDropdownHost.Children.Add(row);
+            }
+            RouteOverlay.IsVisible = true;
+        }
+        catch { }
+    }
+
+    /// <summary>刷新 RouteBar 下拉按钮："切换线路"前缀 + 当前路线 +（总数）</summary>
+    private void RefreshRouteBar()
+    {
+        try
+        {
+            string cur;
+            if (_currentSourceIndex >= 0 && _currentSourceIndex < _sources.Count)
+                cur = DisplayNameFor(_sources[_currentSourceIndex].Name);
+            else if (_sources.Count > 0)
+                cur = DisplayNameFor(_sources[0].Name);
+            else
+                cur = "—";
+            CurrentRouteLabel.Text = cur;
+            RouteCountLabel.Text = _sources.Count > 1 ? $"（{_sources.Count}）" : "";
+            try { if (RouteOverlay.IsVisible) RouteOverlay.IsVisible = false; } catch { }
+        }
+        catch { }
+    }
+
+    /// <summary>重建线路展示、应用续看上下文并选中线路（两条加载路径共用）。</summary>
     private async Task ApplySourcesAsync()
     {
-        // 线路芯片（右侧选集栏上方）：点击切换线路并重载选集；多线路时加"线路"前缀提示可切换
-        LinesHost.Children.Clear();
+        // 收纳模式：RouteBar 只展示当前线路 + 切换按钮，不再全量铺芯片
         _lineChips.Clear();
-        if (_sources.Count > 1)
-            LinesHost.Children.Add(new Label
-            {
-                Text = "线路",
-                FontSize = 10.5,
-                TextColor = (Color)Application.Current!.Resources["TextHintColor"],
-                VerticalOptions = LayoutOptions.Center,
-            });
-        for (int i = 0; i < _sources.Count; i++)
-        {
-            var index = i;
-            var chip = new Border
-            {
-                StrokeThickness = 0,
-                StrokeShape = new RoundRectangle { CornerRadius = 8 },
-                Padding = new Thickness(12, 5),
-                BackgroundColor = i == 0 ? (Color)Application.Current!.Resources["PrimaryColor"] : (Color)Application.Current!.Resources["ChipInactiveColor"],
-                VerticalOptions = LayoutOptions.Center,
-                Content = new Label
-                {
-                    Text = DisplayNameFor(_sources[i].Name),
-                    FontSize = 11.5,
-                    TextColor = i == 0 ? Colors.White : (Color)Application.Current!.Resources["TextSecondaryColor"],
-                },
-            };
-            var tap = new TapGestureRecognizer();
-            tap.Tapped += (_, _) => _ = SelectSourceAsync(index);
-            chip.GestureRecognizers.Add(tap);
-            LinesHost.Children.Add(chip);
-            _lineChips.Add(chip);
-        }
 
         if (_sources.Count == 0)
         {
@@ -1550,16 +1594,8 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
             _playback.SaveProgress(keepPos, Player.Duration.TotalSeconds);
         }
 
-        // 线路芯片高亮（_lineChips 与 _sources 索引一一对应）
-        for (int i = 0; i < _lineChips.Count; i++)
-        {
-            var chip = _lineChips[i];
-            chip.BackgroundColor = i == index
-                ? (Color)Application.Current!.Resources["PrimaryColor"]
-                : (Color)Application.Current.Resources["ChipInactiveColor"];
-            if (chip.Content is Label l)
-                l.TextColor = i == index ? Colors.White : (Color)Application.Current.Resources["TextSecondaryColor"];
-        }
+        // 收纳模式：刷新 RouteBar 当前线路展示（芯片已收进切换弹窗）
+        RefreshRouteBar();
 
         // 重建选集模型：全量行模型各挂一次高亮回调，可视件按当前页渲染（一页 20 集，2 列）
         EpisodeListHost.Children.Clear();

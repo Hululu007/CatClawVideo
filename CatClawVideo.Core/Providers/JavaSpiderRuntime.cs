@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -321,10 +321,11 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            // 搜索专用 25s 短超时：搜索是全员扫描，个别慢源（实测某源 18s 且 0 结果）不该占桥 90s；
+            // 搜索专用 10s 超时（对齐 TVBox FastSearchActivity.SEARCH_SITE_TIMEOUT_SECONDS=10）：
+            // 全员扫描下慢源不该占槽——实测 FishMuou 17.6s 且 0 结果，10s 砍掉放行后续站。
             // 超时不重置桥——慢源只占自己那把站点锁（桥已 per-site 并行），重置会连累正在跑的其它源。
             return await CallAsync(site, "searchContent", new JsonArray(keyword, pg), ct,
-                TimeSpan.FromSeconds(25), resetOnTimeout: false).ConfigureAwait(false);
+                TimeSpan.FromSeconds(10), resetOnTimeout: false).ConfigureAwait(false);
         }
         finally { SearchElapsedMs[site.Key] = sw.ElapsedMilliseconds; }
     }
@@ -544,6 +545,51 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private readonly SemaphoreSlim _stdinLock = new(1, 1);   // 仅保护 stdin 写
 
     /// <summary>
+    /// 已超时但仍可能收到响应的请求（迟到回收窗口内继续等）。
+    /// <para>为什么需要它（2026-10-10 实测）：宿主给单站 25s 预算，而桥侧 load/call 是
+    /// <c>lane.submit(...)</c> 异步执行、可能远超预算才 emit。旧实现超时即从
+    /// <see cref="_pendingResponses"/> 移除 waiter，迟到的 <c>{"ok":true,...}</c> 抵达读循环时
+    /// 已无对应等待者 → 走进「未匹配响应」分支被<b>静默丢弃</b>。现场表现是日志刷屏
+    /// <c>桥上行未匹配响应 id=536: {"result":"loaded"}</c>，站点其实早已加载成功却拿不到结果；
+    /// 而恰好在超时边界抵达的 id=595（内容为 <c>{"list":[],...}</c>）也被丢掉——
+    /// 这正是「数据源加载出空 list」的直接原因，与爬虫本身返回空无关。
+    /// <para>现改为：超时后不立即丢弃，把 waiter 挪进本字典，由迟到响应或宽限到期回收。</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonObject>> _lateResponses = new();
+
+    /// <summary>
+    /// 迟到响应宽限窗口的**下限**（秒）。超时不是「调用作废」，只是宿主不再阻塞等它——
+    /// 桥侧可能随后把有效结果送回来；这段时间内抵达就交付观察者，并记账。
+    /// </summary>
+    private const int LateResponseGraceFloorSeconds = 45;
+
+    /// <summary>宽限窗口上限（秒）：再慢的站也不无限等，否则过期 waiter 会无限堆积。</summary>
+    private const int LateResponseGraceCeilingSeconds = 180;
+
+    /// <summary>
+    /// 窗口按**实测最慢的桥端耗时**自适应，而不是写死。
+    /// <para>为什么必须自适应（2026-10-10 实测）：固定 45s 仍会漏。Libvio 站的
+    /// <c>load</c> 宿主 10s 就超时，而桥侧实耗 <b>65.9s</b>（<c>spider Libvio init 完成 (65890ms)</c>）——
+    /// 迟到 58s 才回来，远超 45s 窗口，照样被丢成「未匹配响应 id=179」。
+    /// 这类慢站的主因是壳类 init 要做重活：FishCrypto SO load failed 反复重试、
+    /// svccheck 全表扫描、4.3MB jar 重新取回 + DexClassLoader 重建。</para>
+    /// </summary>
+    private int _lateGraceSeconds = LateResponseGraceFloorSeconds;
+
+    /// <summary>记录一次应答的耗时，让宽限窗口跟着桥的真实速度走（只在变慢时抬升）。</summary>
+    private void NoteBridgeLatency(long elapsedMs)
+    {
+        if (elapsedMs <= 0) return;
+        var seconds = (int)Math.Clamp(elapsedMs / 1000 + LateResponseGraceFloorSeconds,
+            LateResponseGraceFloorSeconds, LateResponseGraceCeilingSeconds);
+        if (seconds > Volatile.Read(ref _lateGraceSeconds))
+            Volatile.Write(ref _lateGraceSeconds, seconds);
+    }
+
+    /// <summary>迟到达成的响应数（排障用：持续大于 0 说明预算普遍偏紧该调预算，而不是抓 id）。</summary>
+    private int _lateCompleted;
+
+    /// <summary>
     /// 桥正在重置（上一次调用没回来）。1 = 重置中。
     /// <para>为什么要有这个状态：桥的 <c>call</c> 在主循环里 <c>synchronized(LOCK)</c> 串行执行，
     /// 一次超时说明它**还在里面跑**，后面每个请求都只能排队到自己那条超时。实测（2026-09-26）
@@ -571,6 +617,16 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 Shutdown();
                 _loadedSites.Clear();
                 _loadFailedSites.Clear();
+                // 桥已换会话：残留的迟到 waiter 等的是旧桥的响应，永远等不到，
+                // 在这里一次性作废（否则 _lateResponses 会一路涨到宽限到期）。
+                foreach (var key in _lateResponses.Keys)
+                {
+                    if (_lateResponses.TryRemove(key, out var orphan))
+                        _ = orphan.TrySetResult(null!);
+                    _lateDeadline.TryRemove(key, out _);
+                    _sentAt.TryRemove(key, out _);
+                }
+                _sentAt.Clear();   // 桥换会话：所有在飞的发出时刻都失去意义
                 Log("爬虫引擎已重置，下一次调用会重新起桥（ART guest 约 15s）");
             }
             catch (Exception ex)
@@ -597,6 +653,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 if (raw == null) break;
                 var line = raw.Trim();
                 if (line.Length == 0) continue;
+                ReapLateResponses();   // 宽限到期的 waiter 在这里回收，避免无限堆积
                 JsonObject? obj;
                 try { obj = JsonNode.Parse(line)!.AsObject(); }
                 catch { continue; }
@@ -624,7 +681,23 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
 
                 var id = obj["id"]?.GetValue<int>() ?? int.MinValue;
                 if (_pendingResponses.TryRemove(id, out var tcs))
+                {
+                    // 端到端耗时（发出→抵达）：喂给自适应宽限，让窗口跟着桥的真实速度走。
+                    if (_sentAt.TryRemove(id, out var sent)) NoteBridgeLatency(Environment.TickCount64 - sent);
                     _ = tcs.TrySetResult(obj);
+                }
+                else if (_lateResponses.TryRemove(id, out var lateTcs))
+                {
+                    // 迟到但在宽限窗口内：请求方早已按超时返回，这里只记账+回收，
+                    // 不再抛给已放弃的调用者（避免污染上一个调用的异常路径）。
+                    //
+                    // ⚠ 耗时照记：迟到本身正是「桥比宿主预算慢」的度量，不记的话窗口永远抬不起来，
+                    //   下一个同样慢的站还会被丢（Libvio 实测迟到 58s > 固定 45s 窗口）。
+                    if (_sentAt.TryRemove(id, out var sentLate)) NoteBridgeLatency(Environment.TickCount64 - sentLate);
+                    _lateDeadline.TryRemove(id, out _);
+                    Interlocked.Increment(ref _lateCompleted);
+                    _ = lateTcs.TrySetResult(obj);
+                }
                 else
                     Log($"桥上行未匹配响应 id={id}: {line[..Math.Min(line.Length, 120)]}");
             }
@@ -678,6 +751,8 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             throw new InvalidOperationException("爬虫引擎正在重置（上一次调用无响应），请稍后重试");
         var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingResponses[expectId] = tcs;
+        // 发出时刻：应答/迟到应答抵达时算端到端耗时，喂给 NoteBridgeLatency 让宽限窗口自适应。
+        _sentAt[expectId] = Environment.TickCount64;
         try
         {
             // 先注册再写（响应可能在写返回前就到）——读循环按 id 完成之
@@ -694,8 +769,20 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             try { return await tcs.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false); }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                // 握手那条 ping 不触发重置：它本来就是"桥还没起来"的信号，交给连接流程自己收尾。
+                // ⚠ 超时不等于「桥白跑了」：桥侧 load/call 是 lane.submit 异步执行，可能远晚于
+                // 本预算才 emit。旧实现在这里直接走 finally 的TryRemove，迟到响应随后
+                // 无主被丢（实测 2026-10-10：96 站探测刷出整屏「未匹配响应 id=…{"result":"loaded"}」，
+                // 边界抵达的那条 {"list":[]} 被丢→ 首页空数据源）。故先把 waiter 转交
+                // _lateResponses 继续等一段，迟到即回收记账，避免响应凭空消失。
                 var op = req["op"]?.GetValue<string>() ?? "";
+                if (KeepLateResponseWindow(op))
+                {
+                    _lateResponses[expectId] = tcs;
+                    _lateDeadline[expectId] = DateTime.UtcNow
+                        .AddSeconds(Volatile.Read(ref _lateGraceSeconds));
+                }
+
+                // 握手那条 ping 不触发重置：它本来就是"桥还没起来"的信号，交给连接流程自己收尾。
                 if (op != "ping" && op != "exit" && resetOnTimeout)
                 {
                     // 先探桥生死再决定重置：call 已异步化（CALL_POOL），ping 能穿透慢 call——
@@ -709,8 +796,57 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 throw new TimeoutException(BuildTimeoutMessage(op, timeout, expectId));
             }
         }
-        finally { _pendingResponses.TryRemove(expectId, out _); }
+        finally
+        {
+            // 移除在飞登记。注意 tcs：若它**仍未完成**（调用方取消 ct 的路径不会进上面的
+            // 超时 catch，2026-10-10 实测：init 只要 2ms 的站也刷「未匹配响应 id=39」），
+            // 说明响应已经在路上/刚到但已无人等 —— 同样转交迟到表，别让有效结果凭空消失。
+            if (_pendingResponses.TryRemove(expectId, out var orphan) && !orphan.Task.IsCompleted
+                && KeepLateResponseWindow(req["op"]?.GetValue<string>() ?? ""))
+            {
+                _lateResponses[expectId] = orphan;
+                _lateDeadline[expectId] = DateTime.UtcNow
+                    .AddSeconds(Volatile.Read(ref _lateGraceSeconds));
+            }
+        }
     }
+
+    /// <summary>
+    /// 超时后是否保留迟到回收窗口。握手类短 op（ping/setProxyPort 等）响应必定即时到达，
+    /// 超时说明桥本身有问题，保留窗口只会让陈旧 waiter 堆积；load/call 等重活才需要。
+    /// </summary>
+    private static bool KeepLateResponseWindow(string op) => !LateWindowExemptOps.Contains(op);
+
+    /// <summary>不参与迟到回收的 op：这些超时应立刻按「桥有问题」处理。</summary>
+    private static readonly HashSet<string> LateWindowExemptOps = new(StringComparer.Ordinal)
+    {
+        "ping", "setProxyPort", "exit", "probe", "netstat",
+    };
+
+    /// <summary>
+    /// 宽限窗口到期即回收 waiter，防止 _lateResponses 随超时次数无限增长。
+    /// 由读循环每收到一行驱动（读循环是唯一会看到「再也没人来领」的时刻）。
+    /// </summary>
+    private void ReapLateResponses()
+    {
+        if (_lateResponses.IsEmpty) return;
+        foreach (var key in _lateDeadline.Keys)
+        {
+            if (_lateDeadline.TryGetValue(key, out var due) && DateTime.UtcNow >= due
+                && _lateResponses.TryRemove(key, out var stale))
+            {
+                _lateDeadline.TryRemove(key, out _);
+                _ = stale.TrySetResult(null!);   // null = 宽限到期无人来领，作废
+            }
+        }
+    }
+
+    /// <summary>迟到 waiter 的宽限到期时刻（与 _lateResponses 同 key，仅在有 waiter 时有条目）。</summary>
+    private readonly ConcurrentDictionary<int, DateTime> _lateDeadline = new();
+
+    /// <summary>请求发出时刻（id → Environment.TickCount64）：用于测端到端耗时，让迟到宽限自适应。
+    /// 与 _pendingResponses 同生命周期，读循环完成应答时顺手清掉。</summary>
+    private readonly ConcurrentDictionary<int, long> _sentAt = new();
 
     /// <summary>正在桥上执行的调用（site.method）：超时/重置日志能直接指出卡死的是谁。
     /// 典型现场（2026-09-26 实测）：聚合网盘源的 detailContent 串行探测阿里/夸克/UC/百度等
@@ -860,7 +996,8 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         req["jars"] = new JsonArray(url);
         req["rawJar"] = url;
         Log($"{site.Name}: ART guest 取 jar ← {url}");
-        var resp = await RoundTripAsync(req, TimeSpan.FromSeconds(60), ct);
+        // 搜索场景 load 超时 10s（对齐 TVBox SEARCH_SITE_TIMEOUT_SECONDS=10；生效实现见 Maui 侧同名文件）
+        var resp = await RoundTripAsync(req, TimeSpan.FromSeconds(10), ct);
         if (resp["ok"]?.GetValue<bool>() != true)
         {
             // 加载失败必须留痕：此前只 log 成功分支，导致「站点没反应」无从查因

@@ -1,4 +1,4 @@
-﻿#if WINDOWS
+#if WINDOWS
 using Microsoft.Maui.Handlers;
 using Microsoft.UI.Xaml.Controls;
 
@@ -107,6 +107,28 @@ public class TreeWebView2Handler : ViewHandler<TreeWebView2, WebView2>
             VirtualView?.RaiseLog($"[tree] CoreWebView2Initialized 异常：{args.Exception.GetType().Name}: {args.Exception.Message}");
     }
 
+    /// <summary>
+    /// 诊断：HTML 里重复的 id —— jar 侧把同一个文件夹重复塞进列表时，渲染出来就是「最近保存」
+    /// 无限刷屏。打印重复 id 及其次数，便于直接定位是壳侧数据重复还是宿主拼装重复。
+    /// </summary>
+    private static string DupIdHint(string html)
+    {
+        try
+        {
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            // 用字符类而非转义引号，避免源码里的 " 逃逸问题。
+            var rx = new System.Text.RegularExpressions.Regex("id[ \\t]*=[ \\t]*[^A-Za-z0-9_-]([A-Za-z0-9_:.-]+)[^A-Za-z0-9_-]");
+            foreach (System.Text.RegularExpressions.Match m in rx.Matches(html))
+            {
+                var id = m.Groups[1].Value;
+                counts[id] = counts.TryGetValue(id, out var n) ? n + 1 : 1;
+            }
+            var dups = counts.Where(kv => kv.Value > 1).OrderByDescending(kv => kv.Value).Take(5).ToList();
+            return dups.Count == 0 ? "" : "  ⚠ 重复 id: " + string.Join(", ", dups.Select(kv => $"{kv.Key}×{kv.Value}"));
+        }
+        catch { return ""; }
+    }
+
     private static void MapHtml(TreeWebView2Handler h, TreeWebView2 v) => h.Apply();
 
     private void Apply()
@@ -116,7 +138,18 @@ public class TreeWebView2Handler : ViewHandler<TreeWebView2, WebView2>
         try
         {
             PlatformView?.CoreWebView2?.NavigateToString(html);
-            VirtualView?.RaiseLog($"[tree] 已注入 HTML（{html.Length} 字符）");
+            // 2026-10-11 排障：jar 侧 HTML 渲染出重复条目（「最近保存」无限刷屏）。
+            // 把原文落盘便于定位重复 id 的来源；确认后可删。
+            try
+            {
+                var dump = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "CatClawVideo.debug", "tree-html-dump.html");
+                Directory.CreateDirectory(Path.GetDirectoryName(dump)!);
+                File.WriteAllText(dump, html);
+            }
+            catch { /* 落盘失败不影响渲染 */ }
+            VirtualView?.RaiseLog($"[tree] 已注入 HTML（{html.Length} 字符）{DupIdHint(html)}");
         }
         catch (Exception ex)
         {
