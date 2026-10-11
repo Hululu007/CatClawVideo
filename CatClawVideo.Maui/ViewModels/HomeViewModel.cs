@@ -1,6 +1,7 @@
-﻿using System.Collections.ObjectModel;
+using System.Collections.ObjectModel;
 using CatClawVideo.Core.Interfaces;
 using CatClawVideo.Core.Models;
+using CatClawVideo.Core.Providers;
 using CatClawVideo.Core.Services;
 using CatClawVideo.Data;
 using CatClawVideo.Maui.Services;
@@ -477,7 +478,9 @@ public partial class HomeViewModel : ObservableObject
     /// 不让死站把首页拖满自身超时。</para>
     /// </summary>
     private const int ProbeConcurrency = 4;   // 2026-10-03：试过 8/16，收益不明且突发并发易被站方限流——回 4
-    private const int ProbeTimeoutSeconds = 45;
+    // 2026-10-08：45s 在冷启动下必然跑满（并发 4 × 单站 25s，97 站最坏 600s）。
+    //   放宽到 150s —— 冷启动只发生一次，之后 _loadedSites/桥侧 SPIDERS 命中即秒回。
+    private const int ProbeTimeoutSeconds = 150;
 
     /// <summary>
     /// 爬虫站（依赖 QEMU ART guest）取分类的预算秒数。这类站不会抛异常，只会**一直挂着**
@@ -496,10 +499,16 @@ public partial class HomeViewModel : ObservableObject
     /// 于是前 4 个死站就把窗口耗光、110 个候选里剩下 106 个连排队都没轮到
     /// （2026-10-02 实测：探测 15s 零胜出 → 首页直接判失败）。
     /// </summary>
-    private const int ProbeSiteTimeoutSeconds = 8;   // 2026-10-03：试过降到 5，结果误杀大量慢站（整轮零胜出）——保持 8
+    // 2026-10-08（Arch+Waydroid 直连）：jar 站首轮需现场装载（jar 拉取 + ARM64 壳解密 +
+    //   DexClassLoader），单站远超 8s。原值 8 只适合「已预热」场景，冷启动下 97 站全超时。
+    private const int ProbeSiteTimeoutSeconds = 25;
 
     private async Task<(VodSiteInfo Site, List<VodCategory> Cats)?> ProbeSitesAsync(IEnumerable<VodSiteInfo> candidates)
     {
+        // ★ 系统探测标记（2026-10-11 六修）：首页探测一次要试几十个站、跑上几分钟，
+        //   本质是系统自检而非用户交互。挂上 SystemProbeScope 后，运行时不再把探测调用
+        //   计入「用户请求在飞」⇒ jar 预加载不再被探测整轮顶掉（14:02 boot 实测 81/97 让路）。
+        using var _probeScope = CatClawVideo.Core.Providers.JavaSpiderRuntime.BeginSystemProbe();
         // 排序（2026-10-03 重排，治「每次启动站点都变」）：
         //   0 = 上次成功过且**不依赖 guest**：秒回且稳定 → 让它稳居第一梯队（这样胜出者不再漂）
         //   1 = 其他不依赖 guest 的站：同样秒回
@@ -511,9 +520,23 @@ public partial class HomeViewModel : ObservableObject
         //   排到后面，等于每次都换站。其余仍按「不依赖 guest 优先」（它们秒回）。
         var lastGood = (Preferences.Default.Get(LastGoodSiteKey, string.Empty) ?? string.Empty)
             .Split(',', StringSplitOptions.RemoveEmptyEntries);
+        // ★ Round87：冷却/隔离中的站 + 同 jar 家族排到队尾，健康站先上。
+        // 否则 45s 窗口全耗在 ce647a 旋转门里（同 jar 串行后一个个排队撞崩，实试 49 站失败 49）。
+        // 家族判定：任一成员被负缓存挡住 ⇒ 整 jar 冷却中（未试过的同 jar 站也会撞崩，不必再试）。
+        var rt = JavaSpiderRuntime.Current;
+        var coolingJars = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (rt is not null)
+        {
+            foreach (var s in candidates)
+                if (!string.IsNullOrEmpty(s.Jar) && rt.LoadLatched(s.Key))
+                    coolingJars.Add(s.Jar);
+        }
+        bool ProbeCooling(VodSiteInfo s) => rt is not null &&
+            (rt.LoadLatched(s.Key) || (!string.IsNullOrEmpty(s.Jar) && coolingJars.Contains(s.Jar)));
         var list = candidates
             .OrderBy(s => Array.IndexOf(lastGood, s.Key) >= 0 ? 0 : 1)
             .ThenBy(s => s.SpiderKind == VodSpiderKind.None ? 0 : 1)
+            .ThenBy(s => ProbeCooling(s) ? 1 : 0)
             .ToList();
         if (list.Count == 0) return null;
         DiagLog.Write($"[home] 回退并发探测 {list.Count} 站（并发 {ProbeConcurrency}，单站 {ProbeSiteTimeoutSeconds}s，窗口 {ProbeTimeoutSeconds}s）");
@@ -542,6 +565,11 @@ public partial class HomeViewModel : ObservableObject
                 }
                 if (!gotSlot || winner.Task.IsCompleted) return;
 
+                // ★ Round91：拿到并发位后、真试之前再查一次冷却 —— 排队期间同 jar 家族
+                // 可能已被别的 worker 撞崩（家族冷却写每个成员 key），再试就是白占 8s 预算
+                // （03:43:36 TuXiaoBei 走通后三秋影视撞崩，后面排队的同 jar 站还一个个试实锤）。
+                // 跳过的不计实试（attempted 在检查之后++）。
+                if (rt is not null && rt.LoadLatched(site.Key)) { Interlocked.Increment(ref failed); return; }
                 Interlocked.Increment(ref attempted);
                 using var siteCts = CancellationTokenSource.CreateLinkedTokenSource(overall.Token);
                 siteCts.CancelAfter(TimeSpan.FromSeconds(ProbeSiteTimeoutSeconds));
@@ -605,12 +633,14 @@ public partial class HomeViewModel : ObservableObject
                 cats = await _provider.GetCategoriesAsync(site);
                 if (cats.Count == 0)
                 {
-                    FailedSites.Add(site.Key);
-                    HomeStatus = $"「{site.Name}」未返回分类，该站点可能不可用";
-                    IsHomeLoading = false;
-                    return;
+                    // TVBox 同款容错（HomeActivity.sortResult.onChanged）：homeContent 超时/异常/空分类
+                    // 都不拦进站，照常 showSuccess 只剩「主页」tab。设置中心这类 action 型站点靠它进门。
+                    HomeStatus = $"「{site.Name}」未返回分类，仅保留主页";
                 }
-                _catsCache[site.Key] = cats;
+                else
+                {
+                    _catsCache[site.Key] = cats;
+                }
             }
             catch (Exception ex)
             {
@@ -670,6 +700,10 @@ public partial class HomeViewModel : ObservableObject
 
         var items = new List<VodItem>();
         var fromCache = false;
+        // 首屏拉取失败标记（2026-10-11）：失败时不再自动触发 LoadMoreAsync（那只会把同一个
+        // 坏调用再打一遍——01:27:50 实测 cat-select 失败 7ms 后 loadmore 立刻挂住转圈），
+        // 并把失败原因亮在状态栏而不是伪装成「暂无影片」。
+        var fetchFailed = false;
         if (CurrentSite != null)
         {
             var cacheKey = FirstPageKey(CurrentSite, category);
@@ -689,14 +723,20 @@ public partial class HomeViewModel : ObservableObject
                         _firstPageCache[cacheKey] = items;
                     }
                 }
-                catch (Exception ex) { DiagLog.Write($"[cat-select] 拉取失败: {ex.Message}"); }
+                catch (Exception ex)
+                {
+                    fetchFailed = true;
+                    DiagLog.Write($"[cat-select] 拉取失败: {ex.Message}");
+                }
             }
         }
 
         foreach (var it in items) Items.Add(it);
         CoverResolver.Attach(_covers, items);   // 列表先出，封面异步补齐（失败 → 占位海报）
         DiagLog.Write($"[cat-select] 完成 cat={category.Name} items={items.Count} 耗时={sw.ElapsedMilliseconds}ms{(fromCache ? "（缓存）" : "")}");
-        HomeStatus = Items.Count == 0
+        HomeStatus = fetchFailed
+            ? $"{CurrentSite?.Name ?? "当前源"} · {category.Name} · 加载失败（桥繁忙或站点未就绪，稍后重试）"
+            : Items.Count == 0
             ? $"{CurrentSite?.Name ?? "当前源"} · {category.Name} · 暂无影片"
             : $"{CurrentSite!.Name} · {category.Name} · 已加载 {Items.Count} 部";
         IsHomeLoading = false;
@@ -704,7 +744,7 @@ public partial class HomeViewModel : ObservableObject
         // 首屏填充保底：第一页条目太少（内容不满一屏）时滚动条不出现，
         // RemainingItemsThresholdReached 永远不触发 → 无限滚动死锁（2026-09-26 发行版实测：
         // 15 条无滚动条，卡死在第一页）。这里主动补载到可滚动，交给滚动接管。
-        if (HasMoreItems && Items.Count < MinFillCount)
+        if (!fetchFailed && HasMoreItems && Items.Count < MinFillCount)
             await LoadMoreAsync();
     }
 
@@ -808,9 +848,12 @@ public partial class HomeViewModel : ObservableObject
                 if (Items.Count >= MinFillCount) return;
             }
         }
-        catch
+        catch (Exception ex)
         {
+            // 2026-10-11：失败留痕。此前静默吞掉，转圈 27 分钟也无从查因。
+            DiagLog.Write($"[loadmore] 追加页失败: {ex.Message}");
             HasMoreItems = false;
+            HomeStatus = $"{CurrentSite?.Name} · {_currentCategory?.Name} · 加载失败（{ex.Message}）";
         }
         finally
         {

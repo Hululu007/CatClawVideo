@@ -66,6 +66,11 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
     private int _searchGen;
     private bool _hotLoaded;
 
+    /// <summary>慢空站隔离（22:10 实测：FishDuoduo/ALLLive/TvDy/孟葭 15~30s 回 28B 空包，占槽拖尾）。
+    /// 站点键 → 连续「慢且空」次数；≥2 次后延后 24h（期间搜只跑快站，尾站不占并发槽）。内存态，重启清零。</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int Streak, DateTime Until)> _slowEmpty =
+        new(StringComparer.Ordinal);
+
     /// <summary>结果态（true）／输入态（false）。结果态下键盘收起、结果显示。</summary>
     private bool _resultMode;
 
@@ -1278,9 +1283,20 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
             //   现在：① 先按站点类型分层（None 直链 → Script 脚本 → Jar 爬虫）；
             //        ② 同层内仍按历史实测耗时（快站先搜），无记录的按**该层的中位数量级**给默认值，
             //        而不是一律 0；③ >8s 的慢源沉底（+30s 惩罚），不占首批名额。
+            // 对齐 TVBox 快慢分组：已 load 的 jar 站（搜时只剩 searchContent，毫秒级）与直链/脚本先行；
+            // 未 load 的 jar 站延后——它们还要先走 load（DexClassLoader+init），且 21:45 实测未 load 站 10s 全超时。
+            var jrCurrent = CatClawVideo.Core.Providers.JavaSpiderRuntime.Current;
+            static int LoadTier(CatClawVideo.Core.Models.VodSiteInfo s, CatClawVideo.Core.Providers.JavaSpiderRuntime? jr) =>
+                s.SpiderKind != CatClawVideo.Core.Models.VodSpiderKind.Jar ? 0
+                : (jr != null && jr.IsSiteLoaded(s.Key) ? 0 : 1);
+            // 隔离中（24h 内连续≥2 次慢且空）沉底：本轮照样搜，但排在最后、不占首批并发槽
+            static int QuarantineTier(CatClawVideo.Core.Models.VodSiteInfo s) =>
+                _slowEmpty.TryGetValue(s.Key, out var q) && q.Until > DateTime.UtcNow ? 1 : 0;
             var sites = SiteRegistry.Playable
                 .Where(x => SearchSourceStore.IsSearchable(x.SubscriptionName, x.Key))
-                .OrderBy(x => SearchTier(x))
+                .OrderBy(x => QuarantineTier(x))
+                .ThenBy(x => LoadTier(x, jrCurrent))
+                .ThenBy(x => SearchTier(x))
                 .ThenBy(x => SearchSpeedHint(x))
                 .ToList();
 
@@ -1337,7 +1353,12 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
             //   而 searchContent 本身中位只有 373ms —— 慢的全在 load/init。
             //   桥侧 load 与 call 共用 CALL_POOL（newCachedThreadPool，不限线程），
             //   瓶颈在宿主侧闸门：8 路 ⇒ 96 站 12 批 ×0.6s ≈ 70s；提到 16 ⇒ 6 批 ≈ 35s。
-            const int SearchConcurrency = 16;
+            // 并发 16→24（八修）：桥侧 CALL_POOL 不限线程、16 并发实测稳定。★ 八修补丁（15:10 冻结教训）：
+            // 冷启后副桥未就绪（MultiBridgeReady=false）时全部流量压向单桥 ART——恰逢 guest 还在起副桥 ART，
+            // 24 路 load 并发轰一座桥 → guest 整体冻结（console 断流、TCP 活但 ART 死）→ 全站被隔离 24h。
+            // 副桥没就绪就降 8 路起步；多桥就绪后自动全速。
+            var multiReady = CatClawVideo.Core.Providers.JavaSpiderRuntime.Current?.MultiBridgeReady == true;
+            var SearchConcurrency = multiReady ? 24 : 8;   // 非 const：随多桥就绪状态变化
             var searchGate = new SemaphoreSlim(SearchConcurrency);
 
             // ⚠ 必须用**本次搜索**的令牌（_searchCts）：用户退出页面 / 重新搜索时应当立即停止
@@ -1362,11 +1383,30 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
                         DiagLog.Write($"[搜索] {site.Name}: 排队后 _searching 已为 false，仍照常搜索");
                     }
 
-                    // ⚠ 不要用 Task.WhenAny(search, Delay(12s)) 把「迟到的结果」丢掉：
-                    //   实测某盘搜站点 14.2s 才返回几十条，被整批丢弃会让用户看到的条数远少于实际。
-                    //   改成「先到先上屏，迟到照样收」，总时长由外层两段式等待控制。
-                    var items = await _provider.SearchAsync(site, kw, ct);
-                    if (items.Count == 0) return;
+                    // 单站总闸：已装载站 12s（search 本身中位 373ms，12s 极宽裕）；
+                    // 未装载站 30s（2026-10-11 四修）：冷启后 97 站同 jar，load 在宿主侧 per-jar
+                    // 锁上串行（转译层约束），前排站 load 0.7~3s + 排队，12s 预算会在**排队**时
+                    // 烧光 → 大批 OperationCanceledException、97 站只出 7 个结果（13:36 实测）。
+                    // 30s 只影响"冷启后第一轮"，装载完成后自动回到 12s 快车道。
+                    var siteBudget = jrCurrent != null && jrCurrent.IsSiteLoaded(site.Key) ? 12 : 18;   // 30→18：init p90=2.1s，18s 含排队余量
+                    using var siteCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    siteCts.CancelAfter(TimeSpan.FromSeconds(siteBudget));
+                    var items = await _provider.SearchAsync(site, kw, siteCts.Token);
+                    // 慢空计数：≥8s 且 0 条 → streak；连续 2 次 → 隔离 24h（22:10 实测 FishDuoduo/ALLLive 等 15~30s 空包拖尾）
+                    static void NoteSlowEmpty(string key, long ms)
+                    {
+                        if (ms < 8000) return;
+                        var (streak, _) = _slowEmpty.TryGetValue(key, out var q) ? q : (0, DateTime.MinValue);
+                        streak++;
+                        _slowEmpty[key] = (streak, streak >= 2 ? DateTime.UtcNow.AddHours(24) : DateTime.MinValue);
+                        if (streak >= 2) DiagLog.Write($"[搜索] {key} 连续{streak}次慢且空（{ms}ms/0条）→ 隔离24h");
+                    }
+                    if (items.Count == 0)
+                    {
+                        NoteSlowEmpty(site.Key, CatClawVideo.Core.Providers.JavaSpiderRuntime.LastSearchMs(site.Key) ?? 0);
+                        return;
+                    }
+                    _slowEmpty.TryRemove(site.Key, out _);
 
                     // 跨站聚合：每条结果标出来源站（卡片左下角站点角标，方便同片多站时挑源）
                     foreach (var it in items) { it.SiteName = site.Name; it.Category ??= site.Name; }
@@ -1389,6 +1429,16 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
                     // 只看到「未找到」，日志里连一条线索都没有。这里把原因写出来（前 8 条，避免刷屏）。
                     if (Interlocked.Increment(ref failCount) <= 8)
                         DiagLog.Write($"[搜索] {site.Name} 失败：{ex.GetType().Name}: {ex.Message}");
+                    // 超时/取消只记"延后"不计隔离档（★ 八修补丁 15:24 灾难）：15:10 冻结事故里，
+                    // 系统性超时（guest 冻结）把几十个**健康站**连打两次 → 全部隔离 24h → 之后搜索结果稀烂。
+                    // 真正的坏站（慢且空）仍走 NoteSlowEmpty 的隔离路径；超时只让站延后一轮。
+                    if (ex is TimeoutException || ex is OperationCanceledException)
+                    {
+                        var (streak, _) = _slowEmpty.TryGetValue(site.Key, out var q) ? q : (0, DateTime.MinValue);
+                        streak++;
+                        _slowEmpty[site.Key] = (streak, DateTime.MinValue);   // Until=MinValue ⇒ 不隔离，仅排序延后
+                        if (streak >= 2) DiagLog.Write($"[搜索] {site.Key} 连续{streak}次超时 → 本轮延后（不隔离）");
+                    }
                 }
                 finally
                 {
@@ -1437,10 +1487,12 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
             //
             // ⚠ 刻意写成最直白的「总量 ÷ 并发 × 冗余 + 尾部」，全程 double：
             //   之前两次都栽在算术上（先漏乘批数、后把单批耗时当总预算），预算反而缩回 60s。
-            var avgSiteMs = 1200.0;            // 每站均摊耗时（实测 p50~p90 之间）
-            var serialFloorMs = 120_000.0;     // 慢站尾部兜底：实测 4~5 个站各撞满 25s
+            // 对齐 TVBox：单站 10s 熔断（load/search 均 10s），预算按 10s 档重算。
+            // 96 站 / 并发 16 ≈ 6 批 × 10s ≈ 60s，尾部 4~5 个慢站各 10s 兜底 50s。
+            var avgSiteMs = 800.0;             // 每站均摊耗时（10s 熔断下 p50~p90 下移）
+            var serialFloorMs = 50_000.0;      // 慢站尾部兜底：4~5 个站各撞满 10s
             var totalBudgetMs = (int)Math.Clamp(
-                avgSiteMs * sites.Count / SearchConcurrency * 1.6 + serialFloorMs, 60000, 300000);
+                avgSiteMs * sites.Count / SearchConcurrency * 1.4 + serialFloorMs, 30000, 120000);
             var waited = 0;
             DiagLog.Write($"[搜索] 「{kw}」共 {sites.Count} 个站点，并发 {SearchConcurrency}，" +
                          $"等待预算 {totalBudgetMs / 1000}s（实测均摊 {avgSiteMs}ms/站）");

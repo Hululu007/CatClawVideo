@@ -73,6 +73,17 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private readonly ConcurrentDictionary<string, bool> _loadedSites = new();
     private readonly ConcurrentDictionary<string, string> _convertedJars = new();
 
+    /// <summary>同 jar load 串行锁（jarKey → 1 许可）：ce647a 家族并发 load 会在转译层抢 so 句柄
+    /// （一个 init 走通、下个 init 把桥撞崩，Round65/66 实锤）。同 jar 一次只进一个 load，
+    /// 不同 jar 仍并行 —— 串行范围收敛到最小。</summary>
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _jarLoadGates = new();
+
+    /// <summary>当前生效实例（SearchPage 排序用：已 load 的站先搜；MauiProgram 构造后赋值）。</summary>
+    public static JavaSpiderRuntime? Current { get; private set; }
+
+    /// <summary>该站是否已在桥内装载（已 load 即搜时只剩 searchContent，毫秒级）。</summary>
+    public bool IsSiteLoaded(string siteKey) => _loadedSites.ContainsKey(siteKey);
+
     /// <summary>最近装载成功的 Guard 家族站点键（<c>csp_*Guard</c>）。
     /// csp_*Guard 同 jar 家族的多个源共享壳内部的约定流服务端口（6678）——任何兄弟源在本源
     /// 之后被装载（跨源预取/手动浏览）都会把本源的流服务顶掉，本源 playerContent 返回的 6678
@@ -161,6 +172,8 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         // 正常退出先走一次优雅收尾（VM 进程另有 KillOnClose job 兜底崩溃/被 kill 的情况）
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown();
         StartBridgeDebugPump();
+
+        Current = this;
 
         // 换源后自动补预热（2026-10-04，用户问「换其他源也能正常预热吗」）：
         // 订阅集合一变就后台补一轮，PreloadSitesAsync 只处理**尚未 loaded / 未失败**的站，
@@ -366,6 +379,11 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             GuestInitrdName = _guestInitrdFile ?? @"x86guest\art_initrd_x64.gz",
             GuestQemuExeName = _guestQemuExe ?? "qemu-system-x86_64.exe",
         };
+        // 外部桥（2026-10-07，Arch + Waydroid 路线）：构造函数已从 CATCLAW_EXTERNAL_BRIDGE
+        // 读入端点。外部桥模式下 QemuArtGuest 跳过三件套校验与 QEMU 启动，直连外部已就绪的桥
+        // （跑在 Waydroid 的 ART 里，见 docs）。
+        if (art.UsingExternalBridge)
+            Log($"外部桥模式：不自起 QEMU，直连 {art.ExternalBridge}（Arch+Waydroid 链路）");
         // ★ 出生即带合并配置（2026-10-03 修）：此前只有 EnsureThunderVmAsync（磁力预热时，~3s）
         //   才注入合并配置，而桥自己 ~0.5s 就把 VM 用**纯桥配置**拉起来了 → 3s 后必然触发一次
         //   「重启为合并配置」：白丢一次 28s 的 ART 冷启动，还顺带清掉网盘登录态（guest tmpfs）。
@@ -550,10 +568,11 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            // 搜索专用 25s 短超时：搜索是全员扫描，个别慢源（实测某源 18s 且 0 结果）不该占桥 90s；
+            // 搜索专用 10s 超时（对齐 TVBox FastSearchActivity.SEARCH_SITE_TIMEOUT_SECONDS=10）：
+            // 全员扫描下慢源不该占槽——实测 FishMuou 17.6s 且 0 结果，10s 砍掉放行后续站。
             // 超时不重置桥——慢源只占自己那把站点锁（桥已 per-site 并行），重置会连累正在跑的其它源。
             return await CallAsync(site, "searchContent", new JsonArray(keyword, pg), ct,
-                TimeSpan.FromSeconds(25), resetOnTimeout: false).ConfigureAwait(false);
+                TimeSpan.FromSeconds(10), resetOnTimeout: false).ConfigureAwait(false);
         }
         finally { SearchElapsedMs[site.Key] = sw.ElapsedMilliseconds; }
     }
@@ -578,7 +597,11 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 Log($"{site.Name}: Guard 端口守卫——最近装载为 {_lastGuardSiteKey ?? "(无)"}，force 重装载本源抢回 6678");
                 await EnsureBridgeAsync(ct).ConfigureAwait(false);
                 var jar = await EnsureConvertedJarAsync(site, ct).ConfigureAwait(false);
-                await EnsureSiteLoadedAsync(site, jar, ct, force: true).ConfigureAwait(false);
+                // ⚠ 2026-10-11 修的跨桥分裂：slot 必须与初次装载**同一条桥**。
+                //   SPIDERS 是 artlaunch 进程私有的（bridges=3 ⇒ 三个独立进程）。
+                //   ★ 五修起 AcquireSlot 按**站点**绑定（原按 jar 会把同 jar 全家钉在一座桥），
+                //   这里同样按站点取槽，保证守卫重装落在该站实际绑定的桥上。
+                await EnsureSiteLoadedAsync(site, jar, ct, force: true, slot: AcquireSlot(site.Key)).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -736,10 +759,10 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     }
 
     /// <summary>
-    /// 预热让路标志：用户发出任何桥请求时由 RoundTripAsync 置 1（本轮预热随即让路），
-    /// 下一次预热开始时复位为 0。见 PreloadSitesAsync。
+    /// 「本轮预加载已让路」公告旗（2026-10-11 二修）：用户请求到来时置 1，只用于把
+    /// 让路日志打进一次，避免 45 个站各刷一条。每轮预加载开始时复位为 0。
     /// </summary>
-    private int _preloadGate;
+    private int _preloadParkAnnounced;
 
     /// <summary>预加载站点 jar：让首次搜索只剩 searchContent（不再等 load/init）。
     /// 失败即跳过（负缓存已由 EnsureSiteLoadedAsync 记），不影响用户后续手动搜索。
@@ -751,9 +774,9 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     /// </summary>
     private async Task PreloadSitesAsync(CancellationToken ct)
     {
-        // 用户请求优先（2026-10-04）：_preloadGate 初始为 0，用户请求到达时由 RoundTripAsync
-        // 置为 1，预热每站前检查它 —— 非 0 就跳���这站，让出桥给交互操作。
-        _preloadGate = 0;
+        // 用户请求优先（2026-10-04，2026-10-11 二修）：预热每站起跑前查 UserRequestsInFlight()
+        // —— 有用户请求在飞就让这站停车，让出桥给交互操作；在飞的 load 不掐断（排队不抢占）。
+                _preloadParkAnnounced = 0;
         try
         {
             var sites = CatClawVideo.Core.Models.SiteRegistry.Playable
@@ -764,7 +787,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 .Take(120).ToList();
             if (sites.Count == 0) return;
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var ok = 0; var fail = 0;
+            var ok = 0; var fail = 0; var yield = 0; var skipped = 0;
 
             // ⚠ 2026-10-04：原来这里是**串行**，于是「load 超时 25s」的站会一个接一个把预加载拖死
             //   （实测 Kan360 → Rebo → App3Q 各吃掉 25s，结果一个都没预热上）。
@@ -777,18 +800,26 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             //   ① 并发从 8 降到 **2**（对桥的压力小到可以忽略，用户请求随时插进来）；
             //   ② 每次取名额前先看「有没有用户请求在飞」——有就等它跑完再预热
             //      （_pendingResponses 非空即说明有请求在途）。
-            var gate = new SemaphoreSlim(2);
+            // 并发 2 → 4：45 站里同 jar 的被 _jarLoadGates 串行，不同 jar 的可并行。
+            // 仍远低于早期试过的 8（那次用户反馈「扫码变得很卡」），桥是共享资源要留余量。
+            var gate = new SemaphoreSlim(4);
             using var preloadCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             preloadCts.CancelAfter(TimeSpan.FromSeconds(240));   // 整体封顶
+            // 整轮唯一硬取消是 240s 封顶；用户请求只让路不掐轮（见 NudgePreloadToPark）。
+            Volatile.Write(ref _preloadCts, preloadCts);
 
-            // 用户请求在飞时不预热：最多等 20s，超时也继续（宁可慢也别卡住用户）
+            // 用户请求在飞/活跃窗口内不预热（2026-10-11 三修）：
+            //   判据从 UserRequestsInFlight()（只数已发出桥请求的）扩到 UserRecentlyActive()——
+            //   用户请求还在装载锁上排队时计数是 0，预加载看不见就继续灌站（实测「夸克网盘」
+            //   被预热的 长泽/云岫/zhiqiu 各 10s 超时轮番插队，排队 60s）。
+            //   上限 6s：队尾任务不能白等光 240s 预算。
             async Task WaitIdleAsync()
             {
                 var waited = 0;
-                while (waited < 20000 && _pendingResponses.Count > 0)
+                while (waited < 6000 && (UserRequestsInFlight() > 0 || UserRecentlyActive()))
                 {
-                    await Task.Delay(400).ConfigureAwait(false);
-                    waited += 400;
+                    await Task.Delay(300).ConfigureAwait(false);
+                    waited += 300;
                 }
             }
 
@@ -801,18 +832,40 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                     entered = true;
                     await WaitIdleAsync().ConfigureAwait(false);      // ★ 让路给用户操作
                     if (preloadCts.IsCancellationRequested) return;
-                    if (Volatile.Read(ref _preloadGate) != 0) return;  // ★ 用户正在操作，本轮预热让路
+                    // ★ 2026-10-11 修判据失真：旧 _preloadGate 是「一次性置位、永不复位」，
+                    //   第一次用户请求之后余下预热永久让路——实测 45 站只跑过 4 个。
+                    //   改成「当前确实有在途用户请求/活跃窗口才算让路」，判据与 WaitIdleAsync 同源。
+                    // ★ 2026-10-11 七修「让路改降速」：拿到并发名额后若用户正在等（活跃窗口内），
+                    //   不再整站放弃——那会让"一次搜索 56s 在飞"把整轮 97 站全部报废
+                    //   （14:45 boot 实测两轮各 79-81 让路、搜索时 42 站未装载被迫现场装载）。
+                    //   改为**降速续跑**：等 1.2s 再装载。装载走按桥锁（3 桥并行），用户请求在
+                    //   同桥上最多多等 3s；而 searchContent 毫秒级、可打任意桥，实际影响很小。
+                    //   真要让路（高危场景）由 PreloadYieldException（EnsureSiteLoadedAsync）保留。
+                    if (UserRequestsInFlight() > 0 || UserRecentlyActive())
+                    {
+                        Interlocked.Increment(ref yield);
+                        await Task.Delay(1200, preloadCts.Token).ConfigureAwait(false);
+                    }
+                    // ★ 2026-10-11：名额要到了才排队等 jar 转换。此前 WaitIdleAsync 之后才取名额，
+                    //   队尾任务在 gate 上把 240s 预算白等光（实测 45 站只有 2 个真跑过）。
+                    //   提前到取名额**之前**判一次预算：被掐掉的直接记账走人，不占名额。
                     if (!IsBridgeReady) await EnsureBridgeAsync(preloadCts.Token).ConfigureAwait(false);
                     var jar = await EnsureConvertedJarAsync(s, preloadCts.Token).ConfigureAwait(false);
-                    await EnsureSiteLoadedAsync(s, jar, preloadCts.Token).ConfigureAwait(false);
+                    await EnsureSiteLoadedAsync(s, jar, preloadCts.Token, fromPreload: true).ConfigureAwait(false);
                     Interlocked.Increment(ref ok);
                 }
+                catch (PreloadYieldException) { Interlocked.Increment(ref yield); }          // 用户活跃，让路
+                catch (OperationCanceledException) { Interlocked.Increment(ref skipped); }   // 240s 封顶掐掉的
                 catch { Interlocked.Increment(ref fail); }
                 finally { if (entered) gate.Release(); }
             }).ToArray();
 
             await Task.WhenAll(tasks).ConfigureAwait(false);
-            Log($"jar 预加载完成：{ok} 成功 / {fail} 失败 / 共 {sites.Count}（{sw.ElapsedMilliseconds}ms）");
+            // 收尾：清掉引用，避免下次用户请求去取消一个已结束的 CTS。
+            if (ReferenceEquals(Volatile.Read(ref _preloadCts), preloadCts)) Volatile.Write(ref _preloadCts, null);
+            // ⚠ 必须把「让路」和「被 240s 封顶掐掉」也算进去：这两类原本静默 return，
+            //   于是日志长期显示「成功 2 / 失败 0 / 共 45」——分母全是假的，看不出 43 个站从未被试过。
+            Log($"jar 预加载：{ok} 成功 / {fail} 失败 / {yield} 让路 / {skipped} 超时掐掉 / 共 {sites.Count}（{sw.ElapsedMilliseconds}ms）");
         }
         catch (Exception ex)
         {
@@ -894,7 +947,13 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 _ = Task.Run(ReadLoopAsync);
                 // 多桥（2026-10-04）：主桥连上后，把第 2..N 个桥也连上（CATCLAW_BRIDGES>1 时）。
                 // 失败不影响主桥 —— AcquireSlot 返回 null 就全部走主桥，行为同单桥。
-                if (art.BridgeCount > 1) _ = Task.Run(() => ConnectSideBridgesAsync(art));
+                // ★ Round58 常驻补连：副桥掉线/没起来时不再靠“下次主桥重连”碰运气，
+                // 后台每 60s 补齐一次缺失副桥（幂等：已连的跳过）。主桥每次连上只起一个 keeper。
+                if (art.BridgeCount > 1)
+                {
+                    _ = Task.Run(() => ConnectSideBridgesAsync(art));
+                    StartSideBridgeKeeper(art);
+                }
                 break;
             }
 
@@ -1048,7 +1107,11 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     /// <summary>握手：ping 通了才算就绪，然后把宿主 proxy 端口下发给桥。</summary>
     private async Task HandshakeAsync(CancellationToken ct)
     {
-        var pong = await RoundTripAsync(new JsonObject { ["id"] = 0, ["op"] = "ping" }, TimeSpan.FromSeconds(15), ct);
+        // ⚠ ping 是桥健康探针，**不是用户请求**：握手按 fromPreload=true 走 RoundTripAsync，
+    //   不计入 UserRequestsInFlight，否则每次 EnsureBridgeAsync（预加载里每站都调）都会
+    //   把同轮预热全判成「用户在操作」⇒ 43 让路。ping/setProxyPort 属基础设施流量。
+    var pong = await RoundTripAsync(new JsonObject { ["id"] = 0, ["op"] = "ping" }, TimeSpan.FromSeconds(15), ct,
+        fromPreload: true);
         if (!pong.ContainsKey("ok") || pong["ok"]?.GetValue<bool>() != true)
             throw new InvalidOperationException("Java 桥握手失败");
         Log("ART guest 里的桥就绪");
@@ -1061,14 +1124,17 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         if (port > 0)
         {
             var pp = await RoundTripAsync(new JsonObject { ["id"] = 0, ["op"] = "setProxyPort", ["port"] = port },
-                TimeSpan.FromSeconds(10), ct);
+                TimeSpan.FromSeconds(10), ct, fromPreload: true);
             Log(pp["ok"]?.GetValue<bool>() == true ? $"已下发 proxy 端口 {port}" : $"proxy 端口下发失败: {pp["error"]}");
         }
 
         // x86 guest：Guard 解密服务（18481）——jar 的 FishConfig 扫码链路探测并调用它
         //（aarch64 架构下由 App 的 Guard VM 提供；x86 模式无 Guard VM，改由本监听
         //  桥接到 guest 内桥的 guard-decrypt op——壳内转译 SO 进程内解密）。
-        if (_guestArchOverride == CatClaw.Qemu.GuestArch.X86_64)
+        // ★ 单例守卫（2026-10-06 Round24）：HandshakeAsync 每次新桥都跑一次，
+        // 此前每次都 Task.Run 起监听 → 第二次绑 18481 必失败（日志“只允许使用一次”）。
+        if (_guestArchOverride == CatClaw.Qemu.GuestArch.X86_64
+            && Interlocked.CompareExchange(ref _guardSvcStarted, 1, 0) == 0)
         {
             _ = Task.Run(() => GuardSvcLoopAsync(ct), ct);
             Log("Guard 解密服务监听已启动（18481 → guest 内解密）");
@@ -1150,12 +1216,165 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     /// <summary>Guard 解密服务的监听引用（Dispose 时停）。</summary>
     private TcpListener? _guardSvcListener;
 
+    /// <summary>Guard 监听启动标记（0=未起，1=已起）：HandshakeAsync 每次新桥都跑，监听只起一次。</summary>
+    private int _guardSvcStarted;
+
     /// <summary>桥上行 UI 事件（ui-dialog/ui-dismiss/ui-toast）；宿主 MAUI 层订阅渲染。</summary>
     public Action<JsonObject>? UiEvent { get; set; }
 
     /// <summary>响应分发表：RoundTripAsync 注册、读循环按 id 完成之。</summary>
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonObject>> _pendingResponses = new();
     private readonly SemaphoreSlim _stdinLock = new(1, 1);   // 仅保护 stdin 写
+
+    /// <summary>
+    /// 已超时但仍可能收到响应的请求（迟到回收窗口内继续等）。
+    /// <para>为什么需要它（2026-10-10 实测）：宿主给单站 25s 预算，而桥侧 load/call 是
+    /// <c>lane.submit(...)</c> 异步执行、可能远超预算才 emit。旧实现超时即从
+    /// <see cref="_pendingResponses"/> 移除 waiter，迟到的 <c>{"ok":true,...}</c> 抵达读循环时
+    /// 已无对应等待者 → 走进「未匹配响应」分支被<b>静默丢弃</b>。现场表现是日志刷屏
+    /// <c>桥上行未匹配响应 id=536: {"result":"loaded"}</c>，站点其实早已加载成功却拿不到结果；
+    /// 而恰好在超时边界抵达的 id=595（内容 <c>{"list":[],...}</c>）也被丢掉——
+    /// 这正是「数据源加载出空 list」的直接原因，与爬虫本身返回空无关。
+    /// </summary>
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonObject>> _lateResponses = new();
+
+    /// <summary>
+    /// 在飞的**用户**请求数（预加载自己的请求不计入）。
+    /// <para>为什么单列（2026-10-11）：预热与交互共用 <see cref="_pendingResponses"/>，
+    /// 预加载任务的「让路判断」看这个总数就会把自己算成用户请求 —— 同轮 43 个兄弟站
+    /// 全部让路（一轮 45 站只跑过 2 个）。</para>
+    /// </summary>
+    private int _userRequestsInFlight;
+
+    private int UserRequestsInFlight() => Volatile.Read(ref _userRequestsInFlight);
+
+    /// <summary>
+    /// 「系统探测」在飞计数（2026-10-11 六修）：首页自动探测（ProbeSitesAsync）一次要试
+    /// 几十个站、跑上几分钟——它本质是**系统自检**，不该被算成用户交互，否则：
+    /// ① 预加载的让路判据（InFlight&gt;0）持续成立 ⇒ 一轮 97 站 81 个让路（14:02 boot 实测）；
+    /// ② 预热整轮被顶掉，搜索时 42 站未装载，首轮搜索被迫现场装载。
+    /// HomeViewModel 探测窗口内 Enter/Exit 成对调用；CallAsync 里计数&gt;0 时视同 fromPreload。
+    /// </summary>
+    private static int _systemProbeDepth;
+    public static IDisposable BeginSystemProbe() => new SystemProbeScope();
+    private sealed class SystemProbeScope : IDisposable
+    {
+        public SystemProbeScope() { Interlocked.Increment(ref _systemProbeDepth); }
+        public void Dispose() { Interlocked.Decrement(ref _systemProbeDepth); }
+    }
+    private static bool SystemProbeActive => Volatile.Read(ref _systemProbeDepth) > 0;
+
+    /// <summary>
+    /// 用户活跃窗口（2026-10-11 三修）：用户请求进入装载/调用队列的瞬间（还在等锁、
+    /// 尚未发出桥请求）就置 UtcNow+3s，桥请求发出后由每次 RoundTrip 续期。
+    /// <para>为什么需要：_userRequestsInFlight 在 RoundTripAsync 才计数 —— 用户请求排在
+    /// 同 jar 装载锁后面时计数是 0，预加载看不见「有人在等」就继续灌站（实测「夸克网盘」
+    /// 排队 60s：预热的 长泽/云岫/zhiqiu 各 10s 超时轮番插队）。有了这个窗口，预热在
+    /// **等锁前**就能看到用户活跃并让路。</para>
+    /// </summary>
+    private long _userBusyUntil;
+
+    /// <summary>用户最近 3 秒内有动作（含「还在排队等锁」）即视为活跃。</summary>
+    private bool UserRecentlyActive() => Environment.TickCount64 < Volatile.Read(ref _userBusyUntil);
+
+    private void MarkUserBusy()
+    {
+        // TickCount64 毫秒；+3000 = 未来 3 秒内视为活跃
+        Volatile.Write(ref _userBusyUntil, Environment.TickCount64 + 3000);
+    }
+
+    /// <summary>正在跑的那一轮预加载的取消源（无预加载在跑时为 null）。</summary>
+    private CancellationTokenSource? _preloadCts;
+
+    /// <summary>
+    /// 预加载站点主动让路（2026-10-11 三修）：用户活跃窗口内，预加载的 load 不进同 jar
+    /// 装载锁排队，立刻抛此异常由 PreloadSitesAsync 计入「让路」。仅预加载路径使用。
+    /// </summary>
+    private sealed class PreloadYieldException : Exception
+    {
+        public PreloadYieldException() : base("预加载让路（用户活跃）") { }
+    }
+
+    /// <summary>
+    /// 用户请求到来时给预加载发「停车信号」（2026-10-11 二修，取代旧的取消式抢占）。
+    /// <para>旧 TryCancelPreload 会掐掉整轮：但桥没有取消回执，宿主单方面取消只会把桥里
+    /// **已开建**的 load 变成孤儿（占着装载锁直到超时），且抢占路径曾连带触发
+    /// 「同 jar 装载 12s 超时」——用户点「夸克网盘」转圈的帮凶之一。现在改为：
+    /// 未起跑的站让路（PreloadSitesAsync 每站查 UserRequestsInFlight），在飞的 load
+    /// 让它自然跑完（≤10s），用户请求排队其后。整轮唯一的硬取消仍是 240s 封顶。</para>
+    /// </summary>
+    private void NudgePreloadToPark()
+    {
+        if (Volatile.Read(ref _preloadCts) is null) return;
+        if (Interlocked.Exchange(ref _preloadParkAnnounced, 1) == 0)
+            Log("用户请求到来 → 预加载让路：未起跑的站停车，在飞的 load 跑完即让（不再掐轮）");
+    }
+
+    /// <summary>迟到 waiter 的宽限到期时刻（仅当该id 下确有 waiter 时有条目）。</summary>
+    private readonly ConcurrentDictionary<int, DateTime> _lateDeadline = new();
+
+    /// <summary>
+    /// 迟到响应宽限窗口的**下限**（秒）。超时只是宿主不再阻塞等它——桥侧可能随后把
+    /// 有效结果送回来；这段时间内抵达就回收记账，避免响应凭空消失。
+    /// </summary>
+    private const int LateResponseGraceFloorSeconds = 45;
+
+    /// <summary>宽限窗口上限（秒）：再慢的站也不无限等，否则过期 waiter 会无限堆积。</summary>
+    private const int LateResponseGraceCeilingSeconds = 180;
+
+    /// <summary>
+    /// 窗口按**实测最慢的桥端耗时**自适应，而不是写死。
+    /// <para>为什么必须自适应（2026-10-10 实测）：固定 45s 仍然会漏。Libvio 站的
+    /// <c>load</c> 宿主 10s 就超时，而桥侧实耗 <b>65.9s</b>（<c>spider Libvio init 完成 (65890ms)</c>）——
+    /// 迟到 58s 才回来，远超 45s 窗口，照样被丢成「未匹配响应 id=179」。
+    /// 这类慢站的主因是壳类 init 要做重活：<c>FishCrypto SO load failed</c> 反复重试、
+    /// <c>svccheck</c> 全表扫描、4.3MB jar 重新取回+ DexClassLoader 重建。</para>
+    /// </summary>
+    private int _lateGraceSeconds = LateResponseGraceFloorSeconds;
+
+    /// <summary>记录一次成功应答的耗时，让宽限窗口跟着桥的真实速度走（只在变慢时抬升）。</summary>
+    private void NoteBridgeLatency(long elapsedMs)
+    {
+        if (elapsedMs <= 0) return;
+        var seconds = (int)Math.Clamp(elapsedMs / 1000 + LateResponseGraceFloorSeconds,
+            LateResponseGraceFloorSeconds, LateResponseGraceCeilingSeconds);
+        if (seconds > Volatile.Read(ref _lateGraceSeconds))
+            Volatile.Write(ref _lateGraceSeconds, seconds);
+    }
+
+    /// <summary>迟到达成的响应数（排障用：持续大于 0 说明预算普遍偏紧该调预算，而不是抓 id）。</summary>
+    private int _lateCompleted;
+
+    /// <summary>
+    /// 超时后是否保留迟到回收窗口。握手类短 op（ping/setProxyPort 等）响应必定即时到达，
+    /// 超时说明桥本身有问题，保留窗口只会让陈旧 waiter 堆积；load/call 等重活才需要。
+    /// </summary>
+    private static bool KeepLateResponseWindow(string op) => !LateWindowExemptOps.Contains(op);
+
+    /// <summary>不参与迟到回收的 op：这些超时应立刻按「桥有问题」处理。</summary>
+    private static readonly HashSet<string> LateWindowExemptOps = new(StringComparer.Ordinal)
+    {
+        "ping", "setProxyPort", "exit", "probe", "netstat",
+    };
+
+    /// <summary>
+    /// 宽限窗口到期即回收 waiter，防止 _lateResponses 随超时次数无限增长。
+    /// 由读循环驱动（读循环是唯一能观察「再也没人来领」的时刻）。
+    /// </summary>
+    private void ReapLateResponses()
+    {
+        if (_lateResponses.IsEmpty) return;
+        foreach (var key in _lateDeadline.Keys)
+        {
+            if (_lateDeadline.TryGetValue(key, out var due) && DateTime.UtcNow >= due
+                && _lateResponses.TryRemove(key, out var stale))
+            {
+                _lateDeadline.TryRemove(key, out _);
+                _pendingMeta.TryRemove(key, out _);
+                _ = stale.TrySetResult(null!);   // null = 宽限到期无人来领，作废
+            }
+        }
+    }
 
     /// <summary>
     /// 桥正在重置（上一次调用没回来）。1 = 重置中。
@@ -1189,7 +1408,8 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private int _rrCursor;      // 轮转游标
     private int _multiReady;     // 副桥全部连上时置 1
 
-    private bool MultiBridgeReady => Volatile.Read(ref _multiReady) != 0 && !_slots.IsEmpty;
+    /// <summary>多桥是否已就绪（≥1 座副桥活着）。搜索页据此在单桥退化期降并发（15:10 冻结教训）。</summary>
+    public bool MultiBridgeReady => Volatile.Read(ref _multiReady) != 0 && !_slots.IsEmpty;
 
     private sealed class BridgeSlot
     {
@@ -1218,12 +1438,25 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         catch { return "jar:" + jarPath; }
     }
 
+    /// <summary>高危 jar（转译层反复撞崩桥）：钉到最后一座桥上隔离，崩只死那一座，主桥不受影响。
+    /// ★ Round45：ce647a 家族在单桥上来一个崩一次，主桥 2s 重启期间所有站全灭。
+    /// 有副桥时把它钉到末桥（Index 最大），没副桥时返回 null（走主桥，行为不变）。</summary>
+    private static bool IsQuarantineJar(string siteKey)
+        => siteKey.StartsWith("jar:ce647a", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
     /// 给站点挑桥：已绑定且活着 → 沿用；绑定已死 → 解绑重选；否则按「轮转起点 + 最闲优先」挑一个。
     /// 没有可用副桥时返回 null（调用方走主桥 _stdin，行为同单桥）。
     /// </summary>
     private BridgeSlot? AcquireSlot(string siteKey)
     {
+        // ★ Round93 改钉主桥：ce647a 家族固定走主桥（返回 null），不上任何副桥。
+        // 背景：FishNative.loadAndRegister 走转译链 System.load，so 句柄是进程级单例 ——
+        // 主副桥是两个独立 ART 进程，同时 load 同一个 so 就在转译层抢句柄（QiutongTY 返回后
+        // 100ms 内观澜撞崩，PC=fb17 实锤）。旧逻辑钉末桥，末桥崩后替补又把它打散到别的桥，
+        // 等于换个进程再抢一次。钉死主桥 ⇒ 转译层同一时刻只有一个 ART 进程碰这个 so。
+        // 代价：ce647a 全串行（本来也被 _jarLoadGates 串行了，无额外损失）；崩了主桥 2s 重启。
+        if (IsQuarantineJar(siteKey)) return null;
         if (!MultiBridgeReady) return null;
         if (_siteBridge.TryGetValue(siteKey, out var bound))
         {
@@ -1245,7 +1478,10 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         return best;
     }
 
-    /// <summary>副桥断开：摘槽位 + 解绑其上所有站点（下次调用重新分配 ⇒ 其它桥替补）。</summary>
+    /// <summary>副桥断开：摘槽位 + 解绑其上所有站点（下次调用重新分配 ⇒ 其它桥替补）。
+    /// ★ Round76：副桥崩溃也要归因熔断 —— 在飞请求 hang 到 10s 超时才报，用户以为“站慢”，
+    /// 实际是桥死了（Bili 在副桥 18601 上撞崩，主桥请求 10s 超时实锤）。
+    /// 副桥的在飞请求按 id 快照归因，与 FailAllPending 同一熔断规则（站点 2 次/同 jar 2 次）。</summary>
     private void DropSlot(int index)
     {
         if (!_slots.TryRemove(index, out var s)) return;
@@ -1257,16 +1493,105 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             if (_siteBridge.TryRemove(key, out _)) freed++;
         if (_slots.IsEmpty) Volatile.Write(ref _multiReady, 0);
         Log($"桥 #{index} 断开 → 解绑其上 {freed} 个站点，下次调用重新分配到活着的桥（多桥替补）");
+        // ★ 先归因（读在飞快照），再让该桥的在飞请求快速失败（否则 hang 到超时才报“站慢”）。
+        QuarantineCrashedSuspects($"副桥 #{index} 崩溃退出", index);
+        foreach (var kv in _pendingResponses)
+        {
+            if (_pendingMeta.TryGetValue(kv.Key, out var meta) && meta.Slot == index)
+            {
+                if (_pendingResponses.TryRemove(kv.Key, out var tcs))
+                    _ = tcs.TrySetException(new InvalidOperationException($"副桥 #{index} 崩溃退出，该桥在飞请求已失败——请稍后重试"));
+                _pendingMeta.TryRemove(kv.Key, out _);
+            }
+        }
     }
 
-    /// <summary>连上第 2..N 个桥（CATCLAW_BRIDGES&gt;1 时才做）。任一副桥连不上就只启用已连上的。</summary>
+    /// <summary>崩溃归因熔断（FailAllPending 与 DropSlot 共用）：在飞请求按 id 快照归因，
+    /// 嫌疑站 strike+1（第 2 次整会话隔离）；同 jar 第 2 次撞崩则家族 90s 冷却。
+    /// ★ Round76 按桥过滤：slotIndex==-1（主桥）/>=0（副桥编号）只归因死的那座桥上的请求 ——
+    /// 主桥崩不再连坐副桥的在飞站（反之亦然）。不传（FailAllPending 调用时传 null）= 全归因（旧行为）。</summary>
+    private void QuarantineCrashedSuspects(string why, int? slotIndex = null)
+    {
+        var suspects = new HashSet<string>();
+        foreach (var kv in _pendingResponses)
+            if (_pendingMeta.TryGetValue(kv.Key, out var meta) && meta.Site.Length > 0
+                && (slotIndex is null || meta.Slot == slotIndex))
+                suspects.Add(meta.Site);
+        foreach (var site in suspects)
+        {
+            var n = _crashStrikes.AddOrUpdate(site, 1, (_, c) => c + 1);
+            var jarKey = "";
+            if (_convertedJars.TryGetValue(site, out var jarPath)) jarKey = JarKeyOf(jarPath);
+            var jn = jarKey.Length > 0 ? _jarStrikes.AddOrUpdate(jarKey, 1, (_, c) => c + 1) : 0;
+            if (n >= 2)
+            {
+                _loadFailedSites[site] = ($"该站两次在飞期间桥崩溃（转译层 SIGSEGV 嫌疑），本会话已隔离不再重试：{why}", null);
+                Log($"崩溃熔断隔离：{site}（第 {n} 次在飞撞崩）整会话跳过，其它站不受影响");
+            }
+            else if (jn >= 2)
+            {
+                var family = new List<string> { site };
+                foreach (var kv in _convertedJars)
+                    if (kv.Key != site && JarKeyOf(kv.Value) == jarKey)
+                        family.Add(kv.Key);
+                foreach (var k in family)
+                    _loadFailedSites[k] = ($"同 jar {jarKey} 多次撞崩桥（转译层 SIGSEGV），家族冷却 90s 后可重试：{why}", DateTime.UtcNow.AddSeconds(90));
+                Log($"同 jar 熔断冷却：{string.Join(",", family)}（{jarKey} 第 {jn} 次撞崩）90s 内跳过，其它 jar 站不受影响");
+            }
+            else
+            {
+                _loadFailedSites[site] = ($"该站在飞期间桥崩溃（第 1 次，90s 内跳过；再崩一次即整会话隔离）：{why}", DateTime.UtcNow.AddSeconds(90));
+                Log($"崩溃嫌疑冷却：{site}（第 1 次在飞撞崩）90s 内跳过");
+            }
+        }
+    }
+
+    /// <summary>副桥常驻 keeper 启动标记（0=未起，1=已起）：主桥每次连上都会调，只起一个常驻后台。</summary>
+    private int _sideKeeperStarted;
+
+    /// <summary>副桥常驻补连：每 60s 补齐缺失副桥（幂等）。主桥重连/VM 重启后副桥全掉就靠它回来，
+    /// 不再等“下次主桥重连”碰运气。代际变化即退出（旧 VM 的 keeper 不碰新会话）。</summary>
+    private void StartSideBridgeKeeper(CatClaw.Qemu.QemuArtGuest art)
+    {
+        if (Interlocked.CompareExchange(ref _sideKeeperStarted, 1, 0) != 0) return;
+        var epoch = Volatile.Read(ref _bridgeEpoch);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (epoch == Volatile.Read(ref _bridgeEpoch))
+                {
+                    // 60s→25s（2026-10-11）：guest 错峰后副桥就绪最晚 ~90s；keeper 60s 才首补会留
+                    // 两分钟单桥真空（15:31 boot：15:33:05 报未就绪、15:34:01 才多桥就绪）。
+                    try { await Task.Delay(TimeSpan.FromSeconds(25)).ConfigureAwait(false); } catch { break; }
+                    if (epoch != Volatile.Read(ref _bridgeEpoch)) break;
+                    if (!IsBridgeReady) continue;
+                    var want = Math.Max(0, (art.BridgeCount - 1) - _slots.Count);
+                    if (want <= 0) continue;
+                    Log($"副桥 keeper：缺 {want} 座副桥，补连一次");
+                    try { await ConnectSideBridgesAsync(art).ConfigureAwait(false); } catch { }
+                }
+            }
+            catch { }
+            finally { Volatile.Write(ref _sideKeeperStarted, 0); }
+        });
+    }
+
+    /// <summary>连上第 2..N 个桥（CATCLAW_BRIDGES&gt;1 时才做）。任一副桥连不上就只启用已连上的。
+    /// ★ Round47：guest 侧错峰 8s 逐个起桥，主桥就绪时副桥还没监听 —— 先等 20s 让副桥起来，
+    /// 否则 45s 探针全耗在“桥还没出生”上（实锤：02:38:03/14 两次“副桥一个都没连上”后，
+    /// 02:38:31/38 副桥自己起来了但宿主已不再连）。</summary>
     private async Task ConnectSideBridgesAsync(CatClaw.Qemu.QemuArtGuest art)
     {
         var count = art.BridgeCount;
         if (count <= 1) return;
+        try { await Task.Delay(TimeSpan.FromSeconds(20)).ConfigureAwait(false); } catch { }
         var ok = 0;
         for (var i = 1; i < count; i++)
         {
+            // ★ Round49：跳过已连的副桥，只补缺失的。主桥每次重连都会再调一次本方法
+            // （VM 重启/主桥被撞崩后），已连的不重连、掉线的补上 —— 副桥池常满。
+            if (_slots.TryGetValue(i, out var ex) && ex.Alive) { ok++; continue; }
             if (await art.ConnectBridgeAsync(i).ConfigureAwait(false) is not { } link) continue;
             var slot = new BridgeSlot { Index = i, Stdin = link.Stdin, Stdout = link.Stdout };
             _slots[i] = slot;
@@ -1300,8 +1625,10 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Why, DateTime? Until)>
         _loadFailedSites = new();
 
-    /// <summary>这一站现在是否仍被负缓存挡住（超时类到期即放行）。</summary>
-    private bool LoadLatched(string key) =>
+    /// <summary>这一站现在是否仍被负缓存挡住（超时类到期即放行）。
+    /// ★ Round87 公开给首页探测排序：冷却中/隔离中的站排到队尾，健康站先上 ——
+    /// 否则 45s 窗口全耗在 ce647a 旋转门里（实试 49 站失败 49，实锤）。</summary>
+    public bool LoadLatched(string key) =>
         _loadFailedSites.TryGetValue(key, out var v) && (v.Until is null || v.Until > DateTime.UtcNow);
 
 
@@ -1322,7 +1649,13 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             {
                 Shutdown();
                 _loadedSites.Clear();
-                _loadFailedSites.Clear();
+                // ★ 隔离跨崩保留（2026-10-06 Round36，Round89 收窄到只清已过期）：
+                // 永久隔离（Until==null）+ 未到期的 90s 崩溃冷却都保留 —— 否则 ce647a 家族
+                // 每次崩都被放出来再崩一次，名单越滚越长但永远记不住（旋转门实锤）。
+                // 只清已过期的超时项（Until<=now），让探测排序 LoadLatched 有料可用。
+                var now2 = DateTime.UtcNow;
+                foreach (var k in _loadFailedSites.Where(x => x.Value.Until is not null && x.Value.Until <= now2).Select(x => x.Key).ToList())
+                    _loadFailedSites.TryRemove(k, out _);
                 _lastGuardSiteKey = null;
                 Log("爬虫引擎已重置，下一次调用会重新起桥（ART guest 约 15s）");
             }
@@ -1356,6 +1689,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 var raw = await rd.ReadLineAsync();
                 if (raw == null) break;
                 var line = raw.Trim();
+                ReapLateResponses();   // 宽限到期的 waiter 在这里回收，避免无限堆积
                 if (line.Length == 0) continue;
                 JsonObject? obj;
                 try { obj = JsonNode.Parse(line)!.AsObject(); }
@@ -1408,7 +1742,27 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
 
                 var id = obj["id"]?.GetValue<int>() ?? int.MinValue;
                 if (_pendingResponses.TryRemove(id, out var tcs))
+                {
+                    // 端到端耗时（发出→抵达）：喂给自适应宽限，让窗口跟着桥的真实速度走。
+                    if (_pendingMeta.TryRemove(id, out var meta))
+                        NoteBridgeLatency(Environment.TickCount64 - meta.SentAt);
                     _ = tcs.TrySetResult(obj);
+                }
+                else if (_lateResponses.TryRemove(id, out var lateTcs))
+                {
+                    // 迟到但在宽限窗口内：请求方早已按超时返回，这里只记账+回收，
+                    // 不把结果抛给已放弃的调用者（2026-10-10 实测：96 站探测刷屏
+                    // 「未匹配响应 id=…{"result":"loaded"}」即此因，边界抵达的 {"list":[]}
+                    // 被丢 = 首页空数据源）。
+                    //
+                    // ⚠ 耗时照记：迟到本身正是「桥比宿主预算慢」的度量，不记的话窗口永远抬不起来，
+                    //   下一个同样慢的站还会被丢（Libvio 实测迟到 58s > 固定 45s 窗口）。
+                    if (_pendingMeta.TryRemove(id, out var lateMeta))
+                        NoteBridgeLatency(Environment.TickCount64 - lateMeta.SentAt);
+                    _lateDeadline.TryRemove(id, out _);
+                    Interlocked.Increment(ref _lateCompleted);
+                    _ = lateTcs.TrySetResult(obj);
+                }
                 else
                     Log($"桥上行未匹配响应 id={id}: {line[..Math.Min(line.Length, 120)]}");
             }
@@ -1434,6 +1788,11 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     /// 会按指数退避（2s→4s→…→30s 封顶）<b>在 guest 内原地重启桥</b>，
     /// 恢复从 ~20s 降到 ~2s，且 /data（持久盘上的网盘 Cookie / 登录态）不动、无需重新登录。</para>
     ///
+    /// <para><b>2026-10-10 补漏</b>：上面那条「不杀 VM」此前只做了一半 —— 本方法仍把
+    /// <c>_art</c> 摘成 null，而 <see cref="EnsureBridgeAsync"/> 的 <c>_art ??= CreateArtGuest()</c>
+    /// 只看字段是否为空，于是兜底线程第一轮就新建实例（= 起新 VM），把「~2s 恢复」又变回
+    /// 15~16s（实测端口 18601→18606 跳变）。现在只摘 socket 流、保留 <c>_art</c>：
+    /// <c>ConnectAsync</c> 见 <c>_vm.IsRunning</c> 为真就不会重启 VM，只重连 guest 内的新桥。</para>
     /// <para>为什么必须清 pending（2026-09-27 实测）：壳真实类初始化 SIGSEGV 会带走整个桥，
     /// load 的应答永远不会来 —— 不清的话上层干等 60s 超时 + 4s 生死探针才报「不可用」，
     /// UI 是一分钟白屏；清了之后秒级报错。</para>
@@ -1441,30 +1800,75 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     /// <para>ART 链路的 IsUp 只看 socket.Connected 与 VM 进程，桥崩后两者仍真、不会自动
     /// 重连，故这里把 _art/_stdin/_stdout 摘成 null —— 让下一次调用走 EnsureBridgeAsync
     /// 重新探到新桥（_bridgeEpoch 不递增：本次不换 VM，只是同代内换了桥）。</para></summary>
+    /// <summary>在飞请求的归因快照（id → 站点 + op + 发出时刻）：桥死时还没收到应答的请求就是嫌疑人。
+    /// Round31 重做：旧单变量在并发 load 下被后启动者覆盖导致误伤（AppUn 崩却隔离了 TuXiaoBei），
+    /// 又按 jar 全隔离一次崩误伤 21 站。现按 id 精确归因 + 两次熔断，不再用单变量。
+    /// <para><c>SentAt</c>（2026-10-10 新增）：应答抵达时算端到端耗时，喂给
+    /// <see cref="NoteBridgeLatency"/> 让迟到宽限窗口跟着桥的真实速度自适应。</para></summary>
+    private readonly ConcurrentDictionary<int, (string Site, string Op, int Slot, long SentAt)> _pendingMeta = new();
+    /// <summary>崩溃熔断计数（站点 → 在飞撞崩次数）：第 2 次才整会话隔离，首次只冷却 90s。跨桥崩保留。</summary>
+    private readonly ConcurrentDictionary<string, int> _crashStrikes = new();
+    /// <summary>同 jar 熔断计数（jarKey → 该 jar 家族在飞撞崩次数）：同 jar 第 2 次撞崩（哪怕换了个站，
+    /// 如 ce647a 家族 Wogg→bili→Local 连环崩）即隔离整个 jar 家族，止住“换站再 load 又崩”的旋转门。</summary>
+    private readonly ConcurrentDictionary<string, int> _jarStrikes = new();
+
     private void FailAllPending(string why)
     {
+        // ★ 崩溃归因（Round31 重做，Round76 与 DropSlot 共用 QuarantineCrashedSuspects）：
+        // 桥死时还没收到应答的在飞请求 = 嫌疑人（按 id 精确快照）。
+        // 熔断规则：嫌疑站 strike+1；第 1 次只冷却 90s（下面补记后仍可重试），第 2 次才整会话隔离。
+        // Round30/31 的单变量 + 同 jar 全隔离已证明误伤（TuXiaoBei/21 站连坐），本轮删掉不再用。
+        // ★ Round77 顺序修正：先归因（读 _pendingMeta 快照），再清 pending/meta。
+        // 旧顺序先清 meta → QuarantineCrashedSuspects 读到空集 → 崩后无熔断行（03:28:18 实锤）。
+        QuarantineCrashedSuspects(why, -1);
         foreach (var kv in _pendingResponses)
+        {
             if (_pendingResponses.TryRemove(kv.Key, out var tcs))
                 _ = tcs.TrySetException(new InvalidOperationException(why));
+            _pendingMeta.TryRemove(kv.Key, out _);
+        }
+        // 桥已死：迟到 waiter 等的是这条旧桥的响应，永远不会来——立即作废，
+        // 否则它们要挂满宽限窗口才被回收（换桥后 id 会复用，留着还会误领新桥的应答）。
+        foreach (var key in _lateResponses.Keys)
+        {
+            if (_lateResponses.TryRemove(key, out var orphan))
+                _ = orphan.TrySetResult(null!);
+            _lateDeadline.TryRemove(key, out _);
+            _pendingMeta.TryRemove(key, out _);
+        }
 
-        // 摘会话引用（不 Dispose：VM 与 guest 里的 /init 监督器都要留着）
-        Interlocked.Exchange(ref _art, null);
+        // ★ 摘会话引用 —— 只摘 socket 流，**保留 _art 实例**（VM 还在跑）。
+        //
+        // 【2026-10-10 修复：桥崩不再连带杀 VM】
+        // 旧写法把 _art 也摘成 null，注释还写着「不 Dispose：VM 与 guest 里的 /init 监督器都要留着」，
+        // 但 EnsureBridgeAsync 里的 "_art ??= CreateArtGuest()" 只认字段为 null 就新建实例
+        //   ⇒ ScheduleBridgeRecoverFallback 的 5s 轮询第一次就启了一个**新 VM**，
+        //   端口从 18601 跳到 18606，桥崩后的恢复代价从 ~2s 变成 15~16s。
+        // 实测时间线（原行为，home-debug.log）：
+        //   15:11:41.885 桥读循环退出 → 15:11:58.238 qemu 进程退出（VM 被杀）
+        //   → 15:11:58.246 已启动 pid=41088 媒体口=18606 → 15:12:10.803 桥就绪（16.3s）
+        // 而 guest 的 /init 监督器本来能在 ~2s 内原地重启桥（见 [init] 2s 后重启桥(18600)）。
+        //
+        // 保留 _art 后：ConnectAsync 见 _vm.IsRunning=true ⇒ StartVmLockedAsync 直接返回，
+        //   探针循环只是去连 guest 内已重生的桥。VM 与 /data（网盘登录态）全程不动。
+        // _art 只在真正要换 VM 时才清：ResetBridge 的 Shutdown 路径。
         Interlocked.Exchange(ref _stdin, null);
         _stdout = null;
 
         lock (_loadedSites) { _loadedSites.Clear(); }
-        lock (_loadFailedSites) { _loadFailedSites.Clear(); }
+        // ★ Round89 修正：只清已过期的超时项，未到期的崩溃冷却（90s）跨桥崩保留 ——
+        // 旧条件 Until!=null 全清，把 Quarantine 刚写的 90s 冷却也一起清掉，探测排序时
+        // LoadLatched 全返回 false 等于没排（03:40:05 实试 39 站失败 39 实锤）。永久隔离
+        // （Until==null）照旧保留。
+        var now1 = DateTime.UtcNow;
+        foreach (var k in _loadFailedSites.Where(x => x.Value.Until is not null && x.Value.Until <= now1).Select(x => x.Key).ToList())
+            _loadFailedSites.TryRemove(k, out _);
         _lastGuardSiteKey = null;
 
-        // 多桥（2026-10-04）：主桥也断了 ⇒ 副桥没有意义（它们在同一 VM 里，VM 重启会一起没），
-        // 整池下线并清空绑定。下次调用会重新走 EnsureBridgeAsync → ConnectSideBridgesAsync 重建。
-        if (!_slots.IsEmpty)
-        {
-            foreach (var idx in _slots.Keys.ToList()) DropSlot(idx);
-            _siteBridge.Clear();
-            Volatile.Write(ref _multiReady, 0);
-            Log("多桥池已清空（主桥断开）");
-        }
+        // ★ Round47：主桥断开不再清空副桥池。副桥是独立 ART 进程，主桥被 ce647a 撞崩时
+        // 副桥大概率还活着（实锤：主桥 139 后副桥照常 pong）。清空等于把健康副桥一起丢掉，
+        // 下次调用又得 45s 重连。只解绑主桥（siteBridge 里指向已死主桥的条目自然失效），
+        // 副桥保留、其余站照常走副桥。下次 EnsureBridgeAsync 会补连主桥。
 
         Log($"桥会话断开（{why}）→ 已丢弃会话，等待 guest 内 /init 重启桥（约 2s；" +
             "VM 与 /data 不动，网盘登录态保留）。下一次调用会自动连上新桥。");
@@ -1495,9 +1899,18 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 var deadline = DateTime.UtcNow.AddSeconds(BridgeRecoverGraceSeconds);
                 while (DateTime.UtcNow < deadline)
                 {
-                    await Task.Delay(2000).ConfigureAwait(false);
-                    if (epoch != Volatile.Read(ref _bridgeEpoch)) return;   // 已被别的路径重置
-                    if (IsBridgeReady) return;                              // 新桥已接上，保险丝解除
+                    await Task.Delay(5000).ConfigureAwait(false);
+                    if (epoch != Volatile.Read(ref _bridgeEpoch)) return;
+                    if (IsBridgeReady) return;
+                    try { await EnsureBridgeAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+                    if (IsBridgeReady)
+                    {
+                        Log("桥断开后兜底重连成功（guest 内新桥已接管）");
+                        // ★ Round49：主桥回来后补连缺失的副桥（VM 重启后副桥全掉，只连主桥等于退化单桥）。
+                        var a = _art;
+                        if (a is not null && a.BridgeCount > 1) _ = Task.Run(() => ConnectSideBridgesAsync(a));
+                        return;
+                    }
                 }
                 if (IsBridgeReady || epoch != Volatile.Read(ref _bridgeEpoch)) return;
                 Log($"桥断开后 {BridgeRecoverGraceSeconds}s 仍未恢复 → 退化为杀 VM 重来（兜底路径）");
@@ -1532,7 +1945,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         {
             await EnsureBridgeAsync(CancellationToken.None).ConfigureAwait(false);
             var resp = await RoundTripAsync(new JsonObject { ["id"] = Interlocked.Increment(ref _id), ["op"] = "get-prefs" },
-                TimeSpan.FromSeconds(10), CancellationToken.None).ConfigureAwait(false);
+                TimeSpan.FromSeconds(10), CancellationToken.None, fromPreload: true).ConfigureAwait(false);
             if (resp["ok"]?.GetValue<bool>() != true) return null;
             return resp["result"]?.GetValue<string>() is { } s ? JsonNode.Parse(s) as JsonArray : null;
         }
@@ -1548,7 +1961,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     /// 非 null 时发到该副桥（多桥，见 <see cref="AcquireSlot"/>）。
     /// </summary>
     private async Task<JsonObject> RoundTripAsync(JsonObject req, TimeSpan timeout, CancellationToken ct,
-        bool resetOnTimeout = true, BridgeSlot? slot = null)
+        bool resetOnTimeout = true, BridgeSlot? slot = null, bool fromPreload = false)
     {
         var expectId = req["id"]?.GetValue<int>()
             ?? throw new InvalidOperationException("桥请求缺少 id");
@@ -1556,17 +1969,47 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             throw new InvalidOperationException("爬虫引擎正在重置（上一次调用无响应），请稍后重试");
         var tcs = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingResponses[expectId] = tcs;
+        // ★ 归因快照（Round31）：记下这条请求的站点 + op；应答回来即清，桥死时剩下的就是嫌疑人。
+        _pendingMeta[expectId] = (req["site"]?.GetValue<string>() ?? "", req["op"]?.GetValue<string>() ?? "", slot?.Index ?? -1, Environment.TickCount64);
 
-        // 用户请求来了 → 立刻打断预热（2026-10-04：加了预热后「扫码变得很卡」）。
-        // 预热只是优化；点扫码/播放这类交互必须立刻优先，否则请求要排在预热后面等。
-        Volatile.Write(ref _preloadGate, 1);
+        // 用户请求计数（2026-10-04 起才有）：预热每站起跑前看 UserRequestsInFlight，
+        // 大于 0 就让路 —— 用户请求优先于「还没开始」的预热站。
+        //
+        // ⚠ 2026-10-11 修的自锁：此前预加载自己的请求也走这里，第一个 load 一发出就算成
+        //   用户请求，后面 43 个站全部判定「用户在操作」而让路——实测一轮预加载 45 站
+        //   只跑过 2 个，日志却报「成功 2 / 失败 0 / 共 45」（分母是假的）。
+        //   现在只有**用户**请求（fromPreload=false）才计数。
+        if (!fromPreload && !SystemProbeActive)
+        {
+            Interlocked.Increment(ref _userRequestsInFlight);
+            MarkUserBusy();   // 请求发出即续期活跃窗口（长调用期间预热持续让路）
+            // ★ 2026-10-11 二修（排队不抢占）：用户请求到来只发「停车信号」——还没起跑的
+            //   预热站让路（PreloadSitesAsync 每站检查）；**已经在飞**的 load 不再掐断。
+            //   旧 TryCancelPreload 的取消路径已删：桥没有取消回执，宿主单方面取消只会把
+            //   桥里已开建的 load 变成孤儿，且抢占曾连带 12s 装载锁超时（点「夸克网盘」
+            //   转圈的帮凶）。用户请求与在飞 load 在 _jarLoadGates 上排队，≤10s 自让。
+            NudgePreloadToPark();
+        }
         try
         {
             // 先注册再写（响应可能在写返回前就到）——读循环按 id 完成之
             //
             // 多桥（2026-10-04）：slot 为 null 走主桥（共用 _stdin + _stdinLock）；
             // 否则写到该副桥自己的流 + 自己的写锁（各桥独立，互不排队）。
+            // ★ Round79 空引用修复：AcquireSlot 与真正写入之间副桥可能刚死（DropSlot 已 Dispose 流）——
+            // 写前复检 Alive/流非空，死了即回落主桥（03:28:04/03:30:26 首选第一次 NullReferenceException 实锤）。
+            if (slot is not null && (!slot.Alive || slot.Stdin is null))
+            {
+                Log($"副桥 #{slot.Index} 在写入前已死 → 回落主桥");
+                slot = null;
+                _pendingMeta[expectId] = (req["site"]?.GetValue<string>() ?? "", req["op"]?.GetValue<string>() ?? "", -1, Environment.TickCount64);
+            }
+            // ★ Round80 主桥空引用修复：FailAllPending 会把 _stdin 摘成 null（主桥刚崩），
+            // 此时 EnsureBridgeAsync 已返回、在飞请求进来写空流 → NRE（03:33:28 首选第一次实锤）。
+            // 写前复检：主桥流没了就报明确异常走正常重置路径，不再抛裸 NRE。
             var w = slot is null ? _stdin : slot.Stdin;
+            if (w is null)
+                throw new InvalidOperationException("桥会话已断开（主桥刚崩溃，正在重建）——请稍后重试该站点");
             var wlock = slot is null ? _stdinLock : slot.WriteLock;
             if (slot is not null) slot.Pending++;
             await wlock.WaitAsync(ct).ConfigureAwait(false);
@@ -1586,8 +2029,20 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             try { return await tcs.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false); }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                // 握手那条 ping 不触发重置：它本来就是"桥还没起来"的信号，交给连接流程自己收尾。
+                // ⚠ 超时不等于「桥白跑了」：桥侧 load/call 是 lane.submit 异步执行，可能远晚于
+                // 本预算才emit。旧实现在这里靠 finally 的TryRemove 立即丢弃 waiter，迟到响应
+                // 随后无主被丢（2026-10-10 实测：96 站探测刷出整屏
+                // 「未匹配响应 id=…{"result":"loaded"}」，边界抵达的 {"list":[]} 被丢
+                //   ⇒ 首页空数据源）。故先把 waiter 转交 _lateResponses 继续等一段。
                 var op = req["op"]?.GetValue<string>() ?? "";
+                if (KeepLateResponseWindow(op))
+                {
+                    _lateResponses[expectId] = tcs;
+                    _lateDeadline[expectId] = DateTime.UtcNow
+                        .AddSeconds(Volatile.Read(ref _lateGraceSeconds));
+                }
+
+                // 握手那条 ping 不触发重置：它本来就是"桥还没起来"的信号，交给连接流程自己收尾。
                 if (op != "ping" && op != "exit" && resetOnTimeout)
                 {
                     // 先探桥生死再决定重置：call 已异步化（CALL_POOL），ping 能穿透慢 call——
@@ -1595,20 +2050,39 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                     // 杀桥重置（15s 起桥 + 全站重载）纯属双输；探针也无应答才是真死，走重置。
                     if (await PingBridgeAliveAsync(TimeSpan.FromSeconds(4)).ConfigureAwait(false))
                     {
-                        // InFlightTag 自己带括号，别再套一层（实测症状：给用户看的原文写成
-                        // 「线路爬虫（（玩偶.playerContent））」，空的时候还剩一对空括号）。
-                        var who = _inFlight.Length > 0 ? $"线路爬虫（{_inFlight}）" : "线路爬虫";
+                        // ★ 2026-10-11 八修：归因改用 _pendingMeta（本请求自己的 site/op 快照）。
+                        //   并行调用后 _inFlight 是共享字段，超时报的常是**别人的名字**
+                        //   （13:47 实测：片单精选超时报成「马猴影视.searchContent」）。
+                        var (metaSite, metaOp) = _pendingMeta.TryGetValue(expectId, out var mm)
+                            ? (mm.Site, mm.Op.Length > 0 ? mm.Op : op)
+                            : ("", op);
+                        var who = metaSite.Length > 0 ? $"线路爬虫（{metaSite}.{metaOp}）" : "线路爬虫";
                         throw new TimeoutException(
                             $"{who} {timeout.TotalSeconds:F0}s 无响应，但桥仍存活"
                             + "——该线路服务端极慢或已挂起；" + DriveLoginHint + "也可先换其它线路（"
-                            + $"id={expectId}）");
+                            + $"id={expectId}）");   // who 已按请求快照归因
                     }
                     ResetBridge($"op={op} id={expectId}{InFlightTag} 在 {timeout.TotalSeconds:F0}s 内没回来且探针无应答");
                 }
                 throw new TimeoutException(BuildTimeoutMessage(op, timeout, expectId));
             }
         }
-        finally { _pendingResponses.TryRemove(expectId, out _); }
+        finally
+        {
+            // 移除在飞登记。注意 tcs：若它**仍未完成**（调用方取消 ct 的路径不会进上面的
+            // 超时 catch，2026-10-10 实测：init 只要 2ms 的站也刷「未匹配响应 id=39」），
+            // 说明响应已经在路上/刚到但已无人等 —— 同样转交迟到表，别让有效结果凭空消失。
+            if (_pendingResponses.TryRemove(expectId, out var orphan) && !orphan.Task.IsCompleted
+                && KeepLateResponseWindow(req["op"]?.GetValue<string>() ?? ""))
+            {
+                _lateResponses[expectId] = orphan;
+                _lateDeadline[expectId] = DateTime.UtcNow
+                    .AddSeconds(Volatile.Read(ref _lateGraceSeconds));
+            }
+            _pendingMeta.TryRemove(expectId, out _);
+            // 预加载让路判断只看**用户**请求（见 _userRequestsInFlight 注释）——这里配对递减。
+            if (!fromPreload && !SystemProbeActive) Interlocked.Decrement(ref _userRequestsInFlight);
+        }
     }
 
     /// <summary>正在桥上执行的调用（site.method）：超时/重置日志能直接指出卡死的是谁。
@@ -1643,6 +2117,12 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private async Task<string> CallAsync(VodSiteInfo site, string method, JsonArray args, CancellationToken ct,
         TimeSpan? timeout = null, bool resetOnTimeout = true)
     {
+        // 本次调用内「site not loaded」自愈的次数闸门：只自愈一次，避免桥彻底不认
+        // 这个站时把 load 重装载+调用重试变成死循环（见下面自愈分支的注释）。
+        var selfHealed = false;
+        // 用户请求标记（2026-10-11 三修）：进入即置活跃窗口，预热在等锁前就能看到。
+        // 系统探测（六修）不算用户交互，不置窗口。
+        if (!SystemProbeActive) MarkUserBusy();
         await EnsureBridgeAsync(ct);
         var jar = await EnsureConvertedJarAsync(site, ct);
         // 多桥（2026-10-04）：**按 jar** 而不是按站点绑定桥。
@@ -1656,10 +2136,37 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         //   · 不同 jar 分布到不同桥，真正并行（96 个站里只有 2 个 jar ⇒ 最多 2 路并行，
         //     收益有限但符合语义；等 jar 种类变多时自动扩展）。
         //   · 站点自身仍会「首次 load 后复用」（_loadedSites），不会每搜一次重载。
-        var slot = AcquireSlot(JarKeyOf(jar));
-        await EnsureSiteLoadedAsync(site, jar, ct, slot: slot);
+        // ★ 2026-10-11 五修：按**站点**挑桥（原来按 jar 挑——97 站同一个 jar 全被钉在第一座
+        //   空闲桥上，另外两座桥全程闲置）。桥内并发约束由桥自己的 SITE_LOCKS（按站串行）与
+        //   CALL_POOL（多线程）承担；装载顺序约束由下面的按桥装载锁承担。ce647a 高危族仍钉主桥。
+        var slot = AcquireSlot(site.Key);
+        // ★ 2026-10-11 四修（搜索提速的核心）：load 与 call 拆开——
+        //   Round96 把 load+call 包进同一把 per-jar 锁（当时防「转译层同刻只容一个 load」），
+        //   但在「订阅只有 1 个 jar、97 个站全认这一个 jar」的现网，这把锁把 **97 个站的
+        //   load+search 全串成一条队**：每站 load 0.7~3s，97 站 ≈ 5 分钟串行；搜索页每站
+        //   12s 预算在**排队等锁**时就烧光（13:36:43 一批 OperationCanceledException 全是
+        //   等锁超时，桥侧实际只跑了 2 次 searchContent）→ 97 站只出 7 个结果。
+        //   现在：锁只包 **op=load**（转译层约束本来就只针对 DexClassLoader 并发装载）；
+        //   已装载站点的 searchContent 直接并行打桥——桥侧 CALL_POOL 不限线程，
+        //   同站串行由桥内 SITE_LOCKS 保证，语义不变、并发恢复 16 路。
+        // ★ 2026-10-11 五修：装载锁按**桥**而不是按 jar——转译层「同刻只容一个 load」的约束
+        //   作用域是**单桥**（每个桥是独立 ART VM，各自有 DexClassLoader 与转译句柄）。
+        //   按 jar 上锁时，3 座桥里 2 座的装载能力被闲置，97 站的 init 在 1 座桥上 3s/站串行
+        //   （13:47 实测 AppUn 族 5 站 12s 才推进 5 个）；按桥上锁后 3 座桥并行消化，
+        //   吞吐 ×3，且同桥内仍是严格串行（约束不破）。
+        var loadGate = _jarLoadGates.GetOrAdd("slot#" + (slot?.Index.ToString() ?? "main"), _ => new SemaphoreSlim(1, 1));
+        if (!_loadedSites.TryGetValue(site.Key, out _) || Volatile.Read(ref _resetting) != 0)
+        {
+            await loadGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                // 双检：排队期间可能已被别的请求装载好（首次搜索 16 路并发，同站只 load 一次）
+                if (!_loadedSites.TryGetValue(site.Key, out _))
+                    await EnsureSiteLoadedCoreAsync(site, jar, ct, false, slot).ConfigureAwait(false);
+            }
+            finally { loadGate.Release(); }
+        }
         _lastSite = site;   // spider 稍后发起的 /proxy 回调不带 siteKey，靠它定位
-
         _inFlight = $"{site.Key}.{method}";
         try
         {
@@ -1677,11 +2184,32 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 var why = resp["error"]?.GetValue<string>() ?? "";
                 // 自愈（2026-09-30）：桥侧 tryLock 到点说明这个站被上一条**无响应的网盘调用**占住
                 // （壳的 okhttp 没有读超时，那条线程中断不了）。不处理的话用户只能重启应用才能恢复。
-                // force 重装载会换掉桥侧站点锁 + 新建壳实例（实测 ~3.4s），然后重试一次这一次调用。
                 if (why.Contains("上一次调用仍未结束"))
                 {
                     Log($"{site.Key}: 桥侧报该站被无响应调用占住 → force 重装载自愈，重试 {method}");
-                    await EnsureSiteLoadedAsync(site, jar, ct, force: true, slot).ConfigureAwait(false);
+                    // ★ 2026-10-11 五修：force 重装载走**按桥**的装载锁（loadGate）。
+                    await loadGate.WaitAsync(ct).ConfigureAwait(false);
+                    try { await EnsureSiteLoadedCoreAsync(site, jar, ct, true, slot).ConfigureAwait(false); }
+                    finally { loadGate.Release(); }
+                    req["id"] = Interlocked.Increment(ref _id);
+                    resp = await RoundTripAsync(req, timeout ?? TimeSpan.FromSeconds(90), ct, resetOnTimeout, slot);
+                    why = resp["ok"]?.GetValue<bool>() == true ? "" : (resp["error"]?.GetValue<string>() ?? "");
+                    if (why.Length > 0) throw new InvalidOperationException($"spider {site.Key}.{method}: {why}");
+                    return resp["result"]?.GetValue<string>() ?? "{}";
+                }
+                // ★ 自愈（2026-10-11，修「点夸克网盘一直加载」）：guest 桥 VM 冷启后，桥侧
+                //   Server.SPIDERS（artlaunch 进程私有的 ConcurrentHashMap）被清空，而宿主的
+                //   _loadedSites 仍记着「已装载」→ 跳过 op=load 就发 op=call；桥侧 SPIDERS.get(site)
+                //   为 null，2~7ms 回 `IllegalStateException: site not loaded: <站名>`（纯本地判断）。
+                //   处置：作废失效的装载记忆 → force 重装载（走按桥装载锁 loadGate）→ 重试一次。只自愈一次。
+                if (why.Contains("site not loaded") && !selfHealed)
+                {
+                    selfHealed = true;
+                    Log($"{site.Key}: 桥侧报 site not loaded（疑似桥 VM 冷启清空 SPIDERS）→ 作废装载记忆并 force 重装载，重试 {method}");
+                    _loadedSites.TryRemove(site.Key, out _);
+                    await loadGate.WaitAsync(ct).ConfigureAwait(false);
+                    try { await EnsureSiteLoadedCoreAsync(site, jar, ct, true, slot).ConfigureAwait(false); }
+                    finally { loadGate.Release(); }
                     req["id"] = Interlocked.Increment(ref _id);
                     resp = await RoundTripAsync(req, timeout ?? TimeSpan.FromSeconds(90), ct, resetOnTimeout, slot);
                     why = resp["ok"]?.GetValue<bool>() == true ? "" : (resp["error"]?.GetValue<string>() ?? "");
@@ -1847,10 +2375,39 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
         site.Api.StartsWith("csp_", StringComparison.OrdinalIgnoreCase) &&
         site.Api.EndsWith("Guard", StringComparison.OrdinalIgnoreCase) && site.Api.Length > 6;
 
+    /// <summary>同 jar load 串行入口（Round66）：ce647a 家族并发 load 在转译层抢 so 句柄
+    /// （一个 init 走通、下个 init 把桥撞崩）。同 jar 一次只进一个，不同 jar 仍并行。</summary>
     private async Task EnsureSiteLoadedAsync(VodSiteInfo site, string jarPath, CancellationToken ct,
-        bool force = false, BridgeSlot? slot = null)
+        bool force = false, BridgeSlot? slot = null, bool fromPreload = false)
+    {
+        // ★ 2026-10-11 二修（排队不抢占）：用户 load 不再掐掉预加载，而是在同 jar 的装载锁上
+        //   排队——预加载在飞的 load ≤10s 自然让出，用户随后上车。旧「抢占点前移」整段删除：
+        //   抢占取消曾把桥里已开建的 load 变孤儿、把用户堵在 12s 装载锁超时上（01:27:54
+        //   点「夸克网盘」转圈的直接帮凶）。
+        // ★ 2026-10-11 七修：预加载站进锁前查活跃窗口——用户忙时**降速**（等 1.2s 后照常
+        //   排队装载），不再抛 PreloadYieldException 整站报废。搜索一轮 56s 在飞时旧逻辑
+        //   会把整轮 97 站全让光，搜索被迫现场装载几十个站（14:45 boot 实测）。
+        if (fromPreload && (UserRequestsInFlight() > 0 || UserRecentlyActive()))
+            await Task.Delay(1200, ct).ConfigureAwait(false);
+        var gate = _jarLoadGates.GetOrAdd(JarKeyOf(jarPath), _ => new SemaphoreSlim(1, 1));
+        // 排队上限 12s → 60s：抢占已删，「锁永不释放」的前提不再成立（在飞 load 最长 10s
+        // 超时必然 release）。60s 只作桥真异常时的兜底，配合上层重试而不是静默卡住。
+        if (!await gate.WaitAsync(TimeSpan.FromSeconds(60), ct).ConfigureAwait(false))
+            throw new TimeoutException(
+                "同 jar 的其它站点装载 60s 未让出（疑似桥异常），请稍后重试该站点");
+        try { await EnsureSiteLoadedCoreAsync(site, jarPath, ct, force, slot, fromPreload).ConfigureAwait(false); }
+        finally { gate.Release(); }
+    }
+
+    // （占位已清理）
+
+    private async Task EnsureSiteLoadedCoreAsync(VodSiteInfo site, string jarPath, CancellationToken ct,
+        bool force = false, BridgeSlot? slot = null, bool fromPreload = false)
     {
         if (_loadedSites.TryGetValue(site.Key, out _) && !force) return;
+        // ★ Round43：入口 jar 熔断已删除（曾永久封杀主力 ce647a → 首页 97 站全灭）。
+        // 旋转门由上面的家族 90s 冷却兜住：新站无家族名单也能进 guest 试一次，崩了即冷却，
+        // 不再“一崩永封”。force（用户点名）照常穿透。
         // 负缓存（策略见 _loadFailedSites 注释）：结构性失败整会话跳过（实测 Wogg/Douban 每轮
         // 搜索白跑 5~7s）；超时只冷却 90 秒，且 force（用户点名要这一站，如播放）时立刻放行重试。
         if (_loadFailedSites.TryGetValue(site.Key, out var latch))
@@ -1886,19 +2443,20 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
         var url = _jarServer.UrlFor(Path.GetFileName(serve).Replace("raw-", "").Replace(".jar", ""), serve);
         req["jars"] = new JsonArray(url);
         req["rawJar"] = url;
-        Log($"{site.Name}: ART guest 取 jar ← {url}");
-        // load 超时 60s → 25s（2026-10-04）。实测 48 个站的 init 中位数只有 8ms，但个别源
-        // （TingShijie 30s / TingYou 12s / Tiu6 / JSo 各 10.5s）会把 60s 满额耗死 ——
-        // 搜索是「广撒网」，这些站本轮失败即可，不该让整轮 96 个站陪着等。
-        // 25s 与 SearchContentAsync 的搜索超时对齐（同一批站、同一量级）。
-        //
-        // 超时也进负缓存，但**只冷却 90 秒**（策略与依据见 _loadFailedSites 注释）：
-        // 完全不记的话，下一次搜索又对这个站重新 load、再耗 25s（实测「TingShijie 30s」
-        // 反复出现 5 次就是这么来的）；记成整会话的话就会把排队的健康站判死（2026-10-05 误伤）。
+        // 2026-10-11 归因：源名错位取证。预加载并发下「取 jar」与「已加载」曾出现对不上的
+        // 现象（豆豆┃片单发请求、点我切源报成功），桥侧 SPIDERS 里却没有后者 ⇒ site not loaded。
+        // 这里把 site.Key / 请求 id / 桥 slot 一起打出来，响应回来后就能一一对上。
+        Log($"[req#{req["id"]}] {site.Name}（key={site.Key}）取 jar ← {url}");
+        // load 超时 10s → 25s（2026-10-11 五修）：同桥上 load 是**串行**的（转译层约束），
+        // 前面排着 AppUn 族这类 init 2~3s 的站时，轮到自己时桥可能还在忙别人的 init——
+        // 10s 熔断会误杀正常排队的站（13:47 实测 12 站连排 10s 超时，其中多半是排队时间）。
+        // 25s 给足单站 init 余量；「广撒网不让整轮陪等」的语义由上层站点预算与 90s 冷却兜住。
         JsonObject resp;
         try
         {
-            resp = await RoundTripAsync(req, TimeSpan.FromSeconds(25), ct, resetOnTimeout: false, slot);
+            // 用户 load 可能吃满 25s：发出前续期活跃窗口，防止预热在 load 进行中判定「空闲」抢跑
+            if (!fromPreload && !SystemProbeActive) MarkUserBusy();
+            resp = await RoundTripAsync(req, TimeSpan.FromSeconds(25), ct, resetOnTimeout: false, slot, fromPreload);
         }
         catch (TimeoutException)
         {
@@ -1919,7 +2477,7 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
         // Guard 家族装载次序跟踪（端口抢占守卫用，见 _lastGuardSiteKey 注释）：
         // 只有带 Guard 后缀的壳类名才占 6678；降级到真实类（无 Guard）的不算。
         if (className.EndsWith("Guard", StringComparison.Ordinal)) _lastGuardSiteKey = site.Key;
-        Log($"站点 {site.Key} 已加载");
+        Log($"[resp#{req["id"]}] 站点 {site.Key} 已加载");
     }
 
     // ═══════════ jar 转换管线 ═══════════
