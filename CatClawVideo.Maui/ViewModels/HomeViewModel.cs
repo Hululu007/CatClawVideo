@@ -56,6 +56,22 @@ public partial class HomeViewModel : ObservableObject
     /// <summary>首屏条目缓存上限（超出全部作废；会话缓存不求精准淘汰）。</summary>
     private const int MaxFirstPageCache = 24;
 
+    /// <summary>
+    /// 状态栏一行放得下的失败原因。旧文案恒定写「桥繁忙或站点未就绪」，把 ClassNotFoundException、
+    /// 负缓存跳过、订阅为空一律说成"桥忙"，排查时被带偏（16:46:54 FishConfig 的真实原因是
+    /// ClassNotFoundException，UI 却报"桥繁忙"）。改成按原因分文案，异常原文截断保留。
+    /// </summary>
+    private static string ShortReason(string? err)
+    {
+        if (string.IsNullOrEmpty(err)) return "加载失败（桥繁忙或站点未就绪，稍后重试）";
+        if (err.Contains("此前加载失败", StringComparison.Ordinal))
+            return "加载失败（该源上次加载出错，已进入冷却，稍后自动重试）";
+        if (err.Contains("ClassNotFoundException", StringComparison.Ordinal))
+            return "加载失败（爬虫类未找到，稍后重试）";
+        var s = err.Contains('\n') ? err[..err.IndexOf('\n')] : err;   // ClassNotFound 的堆栈很长，只留首行
+        return s.Length <= 40 ? $"加载失败：{s}" : $"加载失败：{s[..40]}…";
+    }
+
     private string FirstPageKey(VodSiteInfo site, VodCategory category)
     {
         var filter = _filter.Count == 0 ? ""
@@ -704,6 +720,7 @@ public partial class HomeViewModel : ObservableObject
         // 坏调用再打一遍——01:27:50 实测 cat-select 失败 7ms 后 loadmore 立刻挂住转圈），
         // 并把失败原因亮在状态栏而不是伪装成「暂无影片」。
         var fetchFailed = false;
+        string? fetchError = null;
         if (CurrentSite != null)
         {
             var cacheKey = FirstPageKey(CurrentSite, category);
@@ -726,6 +743,7 @@ public partial class HomeViewModel : ObservableObject
                 catch (Exception ex)
                 {
                     fetchFailed = true;
+                    fetchError = ex.Message;
                     DiagLog.Write($"[cat-select] 拉取失败: {ex.Message}");
                 }
             }
@@ -735,7 +753,7 @@ public partial class HomeViewModel : ObservableObject
         CoverResolver.Attach(_covers, items);   // 列表先出，封面异步补齐（失败 → 占位海报）
         DiagLog.Write($"[cat-select] 完成 cat={category.Name} items={items.Count} 耗时={sw.ElapsedMilliseconds}ms{(fromCache ? "（缓存）" : "")}");
         HomeStatus = fetchFailed
-            ? $"{CurrentSite?.Name ?? "当前源"} · {category.Name} · 加载失败（桥繁忙或站点未就绪，稍后重试）"
+            ? $"{CurrentSite?.Name ?? "当前源"} · {category.Name} · {ShortReason(fetchError)}"
             : Items.Count == 0
             ? $"{CurrentSite?.Name ?? "当前源"} · {category.Name} · 暂无影片"
             : $"{CurrentSite!.Name} · {category.Name} · 已加载 {Items.Count} 部";

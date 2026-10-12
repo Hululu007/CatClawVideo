@@ -180,13 +180,15 @@ if (-not (Test-Path "$publishDir\CatClawVideo.Maui.exe")) {
 
 # [1.45/2] x86 mini guest 随包检查：initrd 不入库（>100MB），构建机缺件 = 安装包没有可用的
 #          jar 爬虫运行时（x86 唯一、无回落）—— 显式告警，不静默出废包。
-$x86Initrd = "$publishDir\QemuGuest\x86guest\art_initrd_x64.gz"
-if (Test-Path $x86Initrd) {
-    $x86mb = [math]::Round((Get-Item $x86Initrd).Length / 1MB, 1)
-    Write-Msg "  x86 mini guest：x86guest\ 运行时已随包（initrd $x86mb MB）" -Color Green
+# ★ 2026-10-11：QEMU ART guest 已**彻底退役** —— jar 爬虫/迅雷/Guard 解密/网盘取流
+#   全部由外置 Android 桥（com.catclaw.bridge，见 .shot/bridgeapk）承担，宿主侧不再需要
+#   QemuGuest\（1606MB，占旧包 89%）。csproj 已在 Release 下 Content Remove。
+#   运行前提变为：本机有 Android SDK + 一个 arm64-capable 的 AVD（默认 catclaw_gapi36，
+#   必须带 libndk_translation 的 google_apis 镜像；AOSP/default 镜像没有 native bridge，不可用）。
+if (Test-Path "$publishDir\QemuGuest") {
+    Write-Msg "  ⚠ 发布目录里仍有 QemuGuest\ —— Release 应当已排除它（检查 csproj 的 Content Remove）。" -Color Yellow
 } else {
-    Write-Msg "  ⚠⚠ x86 mini guest 资产缺失（QemuGuest\x86guest\art_initrd_x64.gz）：x86 是唯一运行时，此包 jar 爬虫链路整体不可用！" -Color Yellow
-    Write-Msg "     （x86guest\ 资产不入库，需在构建机 QemuGuest\x86guest\ 就位：vmlinuz-6.1.0-50-amd64 + art_initrd_x64.gz）" -Color Yellow
+    Write-Msg "  QEMU guest 已退役（包内不含 QemuGuest\，爬虫走外置 Android 桥）" -Color Green
 }
 
 # [1.5/2] 生成 resources.pri（.NET 11 下 MakePri 不会自动把应用 PRI 写进 publish 目录，
@@ -215,12 +217,61 @@ if (-not $makepri -or -not (Test-Path $priconfig)) {
     }
 }
 
+# [1.8/2] 随包 Android 环境校验（0.2.5 起安装包自带模拟器 + 系统镜像 + adb）
+# 这一步只做「在不在」的硬校验，不做任何拷贝 —— ISCC 直接按绝对路径收件。
+Write-Msg ""
+Write-Msg "[1.8/2] 校验随包 Android 环境..." -Color Yellow
+$SdkRoot = ""
+foreach ($c in @($env:CATCLAW_ANDROID_SDK, $env:ANDROID_SDK_ROOT, $env:ANDROID_HOME,
+                 (Join-Path $env:LOCALAPPDATA "Android\Sdk"))) {
+    if ($c -and (Test-Path (Join-Path $c "emulator\emulator.exe"))) { $SdkRoot = $c; break }
+}
+if (-not $SdkRoot) {
+    Write-Msg "  未找到可用的 Android SDK（缺 emulator\emulator.exe）。" -Color Red
+    Write-Msg "  设 CATCLAW_ANDROID_SDK 或 ANDROID_SDK_ROOT 指向 SDK 根后重试。" -Color Red
+    Pause-And-Exit 1
+}
+
+# 必需件清单。⚠ system.img 与 VerifiedBootParams.textproto 必须**成对**：
+#   前者被精简并重签过（vbmeta 摘要随之改变），后者带着配套的
+#   androidboot.vbmeta.{size,hash_alg,digest}；只换其一 ⇒ init 报
+#   "vbmeta digest error isn't allowed" ⇒ 模拟器根本起不来。
+$ImgDir = Join-Path $SdkRoot "system-images\android-36\google_apis_playstore\x86_64"
+$required = @(
+    @{ p = (Join-Path $SdkRoot "emulator\emulator.exe");                        what = "模拟器主程序" },
+    @{ p = (Join-Path $SdkRoot "platform-tools\adb.exe");                       what = "adb" },
+    @{ p = (Join-Path $ImgDir  "system.img");                                    what = "系统镜像" },
+    @{ p = (Join-Path $ImgDir  "VerifiedBootParams.textproto");                  what = "AVB 校验参数（与 system.img 成对）" },
+    @{ p = (Join-Path $ImgDir  "vendor.img");                                    what = "vendor 镜像" },
+    @{ p = (Join-Path $ImgDir  "kernel-ranchu");                                 what = "内核" },
+    @{ p = (Join-Path $ImgDir  "ramdisk.img");                                   what = "ramdisk" }
+)
+$missing = @()
+foreach ($r in $required) { if (-not (Test-Path $r.p)) { $missing += ("    ✗ {0}  ({1})" -f $r.p, $r.what) } }
+if ($missing.Count -gt 0) {
+    Write-Msg "  随包环境缺件，拒绝出废包：" -Color Red
+    foreach ($m in $missing) { Write-Msg $m -Color Red }
+    Pause-And-Exit 1
+}
+# digest 自检：textproto 里必须有 androidboot.vbmeta.digest —— 少了它模拟器起不来
+$tp = Get-Content (Join-Path $ImgDir "VerifiedBootParams.textproto") -Raw -EA SilentlyContinue
+if ($tp -notmatch 'androidboot\.vbmeta\.digest=') {
+    Write-Msg "  VerifiedBootParams.textproto 里没有 androidboot.vbmeta.digest ⇒ 镜像与它对不上。" -Color Red
+    Pause-And-Exit 1
+}
+$szImg = [math]::Round((Get-Item (Join-Path $ImgDir "system.img")).Length / 1MB)
+$szEmu = [math]::Round(((Get-ChildItem (Join-Path $SdkRoot "emulator") -Recurse -File |
+          Measure-Object Length -Sum).Sum) / 1MB)
+Write-Msg ("  SDK: {0}" -f $SdkRoot) -Color Green
+Write-Msg ("  system.img {0} MB（已精简+重签，digest 参数在案）；emulator {1} MB" -f $szImg, $szEmu) -Color Green
+
 # [2/2] 编译安装程序
 Write-Msg ""
 Write-Msg "[2/2] 编译安装程序（Inno Setup）..." -Color Yellow
 $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
 $isccExit = Invoke-Native -FilePath $IsccPath -Arguments @(
-    "/DMyAppVersion=$ver", "/DMyPublishDir=CatClawVideo.Maui\$OutDir\publish", $IssFile
+    "/DMyAppVersion=$ver", "/DMyPublishDir=CatClawVideo.Maui\$OutDir\publish",
+    "/DMyAndroidSdk=$SdkRoot", $IssFile
 ) -Label "ISCC 编译"
 if ($isccExit -ne 0) {
     Pause-And-Exit $isccExit

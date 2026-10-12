@@ -137,9 +137,10 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
 
     // ═══════════ 启动环境检测（Windows）═══════════
     //
-    // 引擎预热这 40 秒里用户只能干等，正好用来把「为什么磁力不能播 / 杜比视界发灰 /
-    // 引擎慢得离谱」的根因摆出来：WHPX 是否可用、QemuGuest 载荷是否到位、mpv 是否在、
-    // 数据目录能不能写、磁盘/内存够不够。全部本地探测，不联网、不启子进程。
+    // 模拟器冷启这 1 分多钟里用户只能干等，正好用来把「装完为什么起不来 / 慢得离谱」
+    // 的根因摆出来：随包 Android 环境是否就位、WHPX 硬件加速是否可用、系统镜像与
+    // AVB 参数是否成对、爬虫桥 APK 在不在、磁盘/内存够不够。
+    // 全部本地探测，不联网（只有 -accel-check 启一次子进程，秒级返回）。
 
     /// <summary>后台跑一遍环境检测，就绪后在遮罩里逐条渲染（非 Windows 返回空表 → 面板不显示）。</summary>
     private async Task RunEnvCheckAsync() => await RefreshEnvChecksAsync();
@@ -295,13 +296,10 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
             case "enable-whpx": _ = EnableWhpxAsync(); break;
             case "howto-whpx": _ = AlertAsync(WhpxHowTo); break;
             case "open-optional-features": OpenOptionalFeatures(); break;
-            case "fetch-assets": _ = FetchAssetsAsync(); break;
-            case "open-release-vm":
-                _ = Launcher.OpenAsync("https://github.com/kankejiang/CatClaw.Qemu/releases/tag/vm-assets-v1");
-                break;
-            case "open-release-mpv":
-                _ = Launcher.OpenAsync("https://github.com/kankejiang/CatClawVideo/releases/tag/assets-v1");
-                break;
+            // 2026-10-12：原先的 fetch-assets / open-release-vm 两个处置已删 ——
+            // 它们指向的是已退役的 QEMU ART guest 取件（CatClaw.Qemu 的 vm-assets 发布页），
+            // 而新版自检（Services/StartupEnvCheck）不再产生这两个 id：运行环境现在随包，
+            // 缺失只可能是安装不完整，正确处置是重装而不是去下别的包。
             case "open-datadir": OpenDataDir(); break;
         }
     }
@@ -330,8 +328,8 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
         "· 「任务管理器显示虚拟化已启用」「Hyper-V 全开」都不代表 WHPX 可用——WHPX 要的是\n" +
         "  WinHvPlatform.dll，它由「虚拟机监控程序平台」这个功能提供。\n" +
         "· 与 VMware/VirtualBox 老版本、部分反作弊驱动的虚拟化占用冲突时，也可能一直起不来。\n" +
-        "· 不开 WHPX 时**不使用该运行时**（刻意不做软件模拟——慢一个数量级，体验太差）：\n" +
-        "  磁力自动回落内置 BT（照样能下载/播放），但 jar 爬虫与 Guard 解密的网盘源不可用。";
+        "· 不开 WHPX 时模拟器会回落到软件模拟：冷启从 1 分多钟变成十几分钟，且操作严重卡顿。\n" +
+        "  可以这样跑，但体验很差，建议按上面几步开启后重启电脑。";
 
     /// <summary>提权启用「虚拟机监控程序平台」（WHPX 的宿主前置功能），重启后生效。</summary>
     private async Task EnableWhpxAsync()
@@ -388,48 +386,6 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
     }
 
     /// <summary>
-    /// 取件：优先跑仓库里的 tools/fetch-assets.ps1（源码运行场景），找不到脚本就打开下载页（安装版场景）。
-    /// </summary>
-    private async Task FetchAssetsAsync()
-    {
-#if WINDOWS
-        var script = FindFetchAssetsScript();
-        if (script is not null)
-        {
-            try
-            {
-                var root = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(script)!, ".."));
-                var q = (char)34;   // 双引号：避免在源码里写转义引号
-                var args = "-NoProfile -ExecutionPolicy Bypass -File " + q + script + q + " -Dest " + q + root + q;
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("powershell.exe", args)
-                {
-                    UseShellExecute = true,
-                    WorkingDirectory = root,
-                });
-                await AlertAsync("已在新窗口开始取件（本地缓存 + SHA256 校验）。下载完成后重启本应用。");
-                return;
-            }
-            catch (Exception ex)
-            {
-                DiagLog.Write("[envcheck] 取件脚本启动失败：" + ex.Message);
-            }
-        }
-#endif
-        await Launcher.OpenAsync("https://github.com/kankejiang/CatClaw.Qemu/releases/tag/vm-assets-v1");
-    }
-
-    /// <summary>从输出目录逐级向上找 tools/fetch-assets.ps1（源码运行时才有）。</summary>
-    private static string? FindFetchAssetsScript()
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        for (var i = 0; i < 6 && dir is not null; i++, dir = dir.Parent)
-        {
-            var p = Path.Combine(dir.FullName, "tools", "fetch-assets.ps1");
-            if (File.Exists(p)) return p;
-        }
-        return null;
-    }
-
     /// <summary>打开数据目录（排障用：看日志/镜像/缓存，或手动清理腾空间）。</summary>
     private void OpenDataDir()
     {
@@ -504,17 +460,19 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
         var siteCount = SiteRegistry.Playable.Count();
         var elapsed = (DateTime.UtcNow - _coldStartUtc).TotalSeconds;
 
-        // ── 进度条 + 百分比（分段锚定实测阶段，冷启动各段耗时来自 108/本机日志）──
-        // · 0~8s   内核解包 + init（快）：        5% → 30%（用户要的前段「0 1 2 3 4 10 20」快推）
-        // · 8~45s  ART boot（36s 大头，慢）：    30% → 80%
-        // · >45s   桥收尾/站点加载：              80% → 97% 极慢爬（每秒 ~0.35%，观感仍在推进）
-        // · 数据上屏（分类就绪）：                 瞬间 100% → 淡出
-        // 是假进度（无真实百分比信号），但各段与实测一致，不会 40s 卡在同一个数上。
+        // ── 进度条 + 百分比（分段锚定实测阶段）──
+        // 2026-10-12 重新标定：运行时由 QEMU ART guest 换成**随包 Android 模拟器**，
+        // 冷启实测（无 AVD 的全新安装）到桥就绪 = 76s，故慢段锚点由 45s 改到 80s。
+        // · 0~8s   拉起模拟器进程 + 镜像挂载（快）： 5% → 30%（前段快推，别让人以为卡死）
+        // · 8~80s  客机 boot + adb 就绪（大头，慢）：30% → 80%
+        // · >80s   桥服务/站点加载收尾：            80% → 97% 极慢爬（每秒 ~0.35%，观感仍在推进）
+        // · 数据上屏（分类就绪）：                   瞬间 100% → 淡出
+        // 是假进度（无真实百分比信号），但各段与实测一致，不会 1 分钟卡在同一个数上。
         double p;
         if (siteCount == 0) p = 5;
         else if (elapsed <= 8) p = 5 + elapsed / 8.0 * 25;
-        else if (elapsed <= 45) p = 30 + (elapsed - 8) / 37.0 * 50;
-        else p = Math.Min(97, 80 + (elapsed - 45) * 0.35);
+        else if (elapsed <= 80) p = 30 + (elapsed - 8) / 72.0 * 50;
+        else p = Math.Min(97, 80 + (elapsed - 80) * 0.35);
 
         if (_vm.Categories.Count > 0) p = 100;
         p = Math.Round(p, 0, MidpointRounding.AwayFromZero);
@@ -530,8 +488,10 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
 #else
                 ? elapsed switch
                 {
-                    < 8 => "正在启动视频引擎（解包内核与根镜像）…",
-                    < 45 => "正在启动视频引擎（Android 13 运行时，约 40 秒）…",
+                    // 文案随方案更新（2026-10-12）：运行时是**随包 Android 模拟器**，
+                    // 不再是 QEMU 解包内核+根镜像那套。冷启实测约 76s，故慢段阈值取 80s。
+                    < 8 => "正在启动 Android 运行环境（准备模拟器与系统镜像）…",
+                    < 80 => "正在启动 Android 运行环境（首次冷启约 1 分钟）…",
                     _ => "正在加载首页数据…",
                 }
 #endif

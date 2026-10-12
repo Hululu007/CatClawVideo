@@ -867,6 +867,12 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private async Task<string> CallAsync(VodSiteInfo site, string method, JsonArray args, CancellationToken ct,
         TimeSpan? timeout = null, bool resetOnTimeout = true)
     {
+        // Guard 加固源（csp_*Guard）优先走**外部 Android 桥**：壳解密器是 arm64 ELF，
+        // 本进程（宿主 x86_64 / guest TCG）都不如真 Android + libndk_translation 稳。
+        // 桥不可达时返回 null，正常回落到下面的 ART guest 路径 —— 行为不劣化。
+        if (await SpiderBridgeClient.TryCallAsync(site, method, args, ct).ConfigureAwait(false) is { } bridged)
+            return bridged;
+
         await EnsureBridgeAsync(ct);
         var jar = await EnsureConvertedJarAsync(site, ct);
         await EnsureSiteLoadedAsync(site, jar, ct);

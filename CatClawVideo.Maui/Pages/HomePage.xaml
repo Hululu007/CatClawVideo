@@ -225,7 +225,8 @@
             </CollectionView.ItemTemplate>
         </CollectionView>
 
-        <!-- 冷启动遮罩：引擎冷启动实测 41~46 秒（解包内核与根镜像 + Android 13 运行时启动）
+        <!-- 冷启动遮罩：随包 Android 模拟器冷启实测 76 秒（全新安装、无 AVD 时：拉起模拟器
+             → 客机 boot → adb 就绪 → 桥服务起来；2026-10-12 由 QEMU ART guest 换过来后重新标定）
              + 订阅恢复期间，海报墙全空、只有一行小字，体感如同卡死。这里用全屏遮罩分阶段显示
              真实进度（恢复订阅 → 引擎冷启动 → 首页数据），首页数据就绪后淡出进主界面。
              覆盖三行（RowSpan=3）+ 不透明背景，避免底下空海报墙透出。
@@ -290,7 +291,7 @@
                     </VerticalStackLayout>
                 </Border>
 
-                <Label Text="冷启动仅发生在每次开机后的首次访问，之后秒开" FontSize="11" Opacity="0.6"
+                <Label Text="模拟器启动后会常驻，再开本应用可直接连上；首次冷启约 1 分钟" FontSize="11" Opacity="0.6"
                        HorizontalOptions="Center" HorizontalTextAlignment="Center"
                        TextColor="{DynamicResource TextHintColor}" />
             </VerticalStackLayout>

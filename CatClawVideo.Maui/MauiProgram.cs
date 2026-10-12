@@ -97,6 +97,12 @@ public static class MauiProgram
 
         // spider 运行时：JS（drpy2，Jint 纯托管，双端可用）+ jar/dex（Android DexClassLoader，仅 Android）
         services.AddSingleton<CatClawVideo.Core.Interfaces.IJsRuntimeService, CatClawVideo.Core.Services.JsRuntimeService>();
+        // ★★ 尽早宣告「外置 Android 桥接管 jar 源」（2026-10-11）：必须在**任何**后台
+        //    预加载/预热之前 —— JavaSpiderRuntime 的 jar 预加载会逐站 EnsureBridgeAsync，
+        //    它只看本类桥状态、不知道外置桥存在，晚一步就把 QEMU ART guest 拉起来了。
+        //    外置桥随后若证明不可用且允许 QEMU，会把它复位 false 走回退。
+        CatClawVideo.Core.Providers.JavaSpiderRuntime.AttachExternalBridge();
+
         var jsRuntime = new CatClawVideo.Core.Providers.DrpyJsSpiderRuntime(
             new CatClawVideo.Core.Services.JsRuntimeService(),
             cacheDir: CatClawVideo.Core.AppPaths.LocalSub("drpy2"),
@@ -128,26 +134,19 @@ public static class MauiProgram
         BtFileLog.Write($"[缓存] 上限 {CatClaw.Qemu.StreamCachePrefs.CapGb}GB（设置页可调）");
         // 套件引擎不认识应用接口 → 经 QemuMagnetEngine 适配成 IPreferredMagnetEngine 后再挂链
         //（后续 ThunderPanEngine 兜底，全部失败回落内置 BT）。
+        // ★ 迅雷已搬到外置 Android 桥（com.catclaw.bridge，arm64-only + libndk_translation）：
+        //   libxl_thunder_sdk.so / libxl_stat.so 只有 arm64，主程序 x86_64 命名空间不 bridged
+        //   加载不了；原来靠宿主 QEMU 里再套 qemu-aarch64-static 跑 harness，白背 ~2.5GB。
+        //   桥放链首 → 成功时下面的 QemuMagnetEngine **一次都不会被调到**（预热也据此跳过）。
+        var bridgeThunder = new CatClawVideo.Core.Providers.BridgeThunderEngine(BtFileLog.Write);
         CatClawVideo.Core.Interfaces.MagnetEngines.Thunder = new CatClawVideo.Core.Providers.ChainedMagnetEngine(
+            bridgeThunder,
             new CatClawVideo.Core.Providers.QemuMagnetEngine(qemuThunder),
             new CatClawVideo.Core.Providers.ThunderPanEngine());
         // 磁力下载也走同一个迅雷引擎（下载管理页的磁力任务：引擎独占下载 → 媒体口导出本机）
         magnetDownloadEngine = qemuThunder;
 
-        // ★ VM 预热：QEMU 冷启动实测 11s（39.4s 起进程 → 50.5s 就绪），而它发生在**用户点开
-        //   磁力片的那一刻**，直接叠进「海报 → 选集」的等待里。放到启动后的后台线程先跑起来，
-        //   用户浏览首页/找片的时间足够 VM 就绪，点磁力时省掉这 11s。
-        //   延迟 3s 起，避让启动首屏的 UI 与订阅解析；失败无害（首次播放时仍会懒启动重试）。
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-                await qemuThunder.EnsureReadyAsync().ConfigureAwait(false);
-                BtFileLog.Write("[qemu] 预热完成（VM 已就绪，磁力点播无需冷启动等待）");
-            }
-            catch (Exception ex) { BtFileLog.Write($"[qemu] 预热失败（不影响后续懒启动）：{ex.Message}"); }
-        });
+        // （统一引导已移到 jarRuntime 声明之后 —— 它要用到 jarRuntime）
 
         // Guard 解密 VM 已退役为回退开关（单VM合并：x86 走桥内 guard-decrypt op → 宿主
         // :18481 GuardSvcLoop → 壳内转译 SO 进程内解密，无独立 QEMU；实测 QemuGuardEngine
@@ -240,6 +239,24 @@ public static class MauiProgram
         // 桌面桥（2026-09-29 JRE 全退役）：JavaBridge 目录只用于部署完整性检查，
         // 桥唯一跑在 ART guest 里（guest 里真 ART，不需要宿主任何 Java）。
         // ⚠ 不能因缺 JavaBridge 换 NullSpiderRuntime——那会把 ART 桥一起顶掉（jar 源全灭）。
+        // Guard 加固源的外置 Android 桥（com.catclaw.bridge，arm64-only + libndk_translation）。
+        // 见 SpiderBridgeClient 注释：壳解密器是 arm64 ELF，必须在命名空间被 native bridge
+        // 接管的进程里装载，故拆到独立 APK，桌面经 adb forward 用同一套协议驱动。
+        CatClawVideo.Core.Providers.SpiderBridgeClient.Log = msg =>
+        {
+            System.Diagnostics.Debug.WriteLine(msg);
+            DiagLog.Write(msg);
+        };
+        // 宿主 proxy 端口下发给桥（Guard 系网盘源靠 SpiderApi.getAddress/getPort 拼数据端点）
+        try { CatClawVideo.Core.Providers.SpiderBridgeClient.HostProxyPort = spiderProxy.Port; } catch { }
+        // AVD 名：装过发行版（自带 AndroidSdk\）就用随包的那个（catclaw_play36，
+        // 镜像与它配套、首次运行由客户端自动登记）；开发机没有随包环境，仍用本机的 catclaw_gapi36。
+        CatClawVideo.Core.Providers.SpiderBridgeClient.Avd ??=
+            Environment.GetEnvironmentVariable("CATCLAW_ANDROID_AVD")
+            ?? (Directory.Exists(Path.Combine(AppContext.BaseDirectory, "AndroidSdk", "emulator"))
+                ? CatClawVideo.Core.Providers.SpiderBridgeClient.BundledAvdName
+                : "catclaw_gapi36");
+
         var bridgeDir = CatClawVideo.Core.Providers.JavaSpiderRuntime.FindBridgeDir();
         CatClawVideo.Core.Interfaces.ISpiderRuntime jarRuntime = bridgeDir != null
             ? new CatClawVideo.Core.Providers.JavaSpiderRuntime(bridgeDir, m =>
@@ -254,11 +271,64 @@ public static class MauiProgram
             proxyPort: () => spiderProxy.Port)
             : new CatClawVideo.Core.Providers.NullSpiderRuntime("jvm-dex");
 
+        // ★★ 统一引导（2026-10-11）：**先桥，后 QEMU**，只此一条路径。
+        //   为什么必须合并成一条：原来「迅雷 VM 预热」延迟 3s、「爬虫 VM 预热」延迟 6s，
+        //   而外置 Android 桥要 ~5s 才好 —— 3s 那次先跑，看到桥还没好就回落 QEMU，
+        //   guest 照样被拉起来（实测 22:19:17 起了 2.6GB，用户看到的正是它）。
+        //   合并后：**桥可用 ⇒ 两个预热一律不做**，QEMU ART guest 一次都不会被拉起。
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+                for (var i = 0; i < 30; i++)   // 等订阅解析出站点（最多 30s）
+                {
+                    if (CatClawVideo.Core.Models.SiteRegistry.Sites.Count > 0) break;
+                    await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                }
+
+                // ① 先试外置 Android 桥。EnsureReadyAsync 自带「没设备就按 CATCLAW_ANDROID_AVD
+                //    （默认 catclaw_gapi36）拉起模拟器 → 起桥服务 → adb forward/reverse」。
+                if (await CatClawVideo.Core.Providers.SpiderBridgeClient.EnsureReadyAsync().ConfigureAwait(false)
+                    && await bridgeThunder.EnsureReadyAsync().ConfigureAwait(false))
+                {
+                    CatClawVideo.Core.Models.SiteRegistry.JarSpiderAvailable = true;
+                    BtFileLog.Write("[桥] 外置 Android 桥就绪（爬虫 + 迅雷都在桥里）→ 不启动 QEMU ART guest（省 ~2.5GB）");
+                    return;
+                }
+
+                // ② 桥不可用才回落 QEMU（迅雷 VM + 爬虫 VM）
+                //    CATCLAW_NO_QEMU=1 ⇒ **彻底切断**：宁可 jar 源不可用，也不起 QEMU guest。
+                if (Environment.GetEnvironmentVariable("CATCLAW_NO_QEMU") == "1")
+                {
+                    BtFileLog.Write("[桥] 桥不可用，且 CATCLAW_NO_QEMU=1 → 不启动 QEMU ART guest（jar 源暂不可用）");
+                    return;
+                }
+                BtFileLog.Write("[桥] 外置 Android 桥不可用 → 回落 QEMU ART guest");
+                try { await qemuThunder.EnsureReadyAsync().ConfigureAwait(false); }
+                catch (Exception ex) { BtFileLog.Write($"[qemu] 迅雷 VM 预热失败（不影响懒启动）：{ex.Message}"); }
+                if (jarRuntime is CatClawVideo.Core.Providers.JavaSpiderRuntime desktopWarm)
+                {
+                    try { await desktopWarm.WarmUpAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { BtFileLog.Write($"[qemu] 爬虫 VM 预热失败（不影响懒启动）：{ex.Message}"); }
+                }
+            }
+            catch (Exception ex) { BtFileLog.Write($"[桥] 引导异常：{ex.Message}"); }
+        });
+
         // 桥爬虫 UI 事件 → MAUI 对话框/二维码（对齐 TVBox：点「登入自己网盘」弹
         // 「已登录+启用中」列表 + 扫码登录，而非回落网页）
         if (jarRuntime is CatClawVideo.Core.Providers.JavaSpiderRuntime desktopJar)
         {
             CatClawVideo.Maui.Services.SpiderUiHost.Attach(desktopJar);
+
+            // ★ 外置 Android 桥接管时，Guard 解密服务（18481）也必须供上：
+            //   jar 的扫码链路探测 10.0.2.2:18481。此前它只在 QEMU guest 握手时启动，
+            //   切断 QEMU 后没人供 ⇒ 扫码链路拿不到解密（2026-10-11）。
+            CatClawVideo.Core.Providers.JavaSpiderRuntime.ExternalBridgeAttached =
+                () => desktopJar.StartGuardSvcIfNeeded(CancellationToken.None);
+            if (CatClawVideo.Core.Providers.JavaSpiderRuntime.ExternalBridgeOwnsSpiders)
+                desktopJar.StartGuardSvcIfNeeded(CancellationToken.None);
 
             // ★ 迅雷引擎合并（2026-09-27 §6.9；2026-09-29 扩展 x86）：aarch64 看
             //   art_initrd_merged.gz；x86 看 x86guest\art_initrd_x64.gz（注入器已把迅雷资产
@@ -315,24 +385,8 @@ public static class MauiProgram
         //   ⚠ 桌面专属：引用 JavaSpiderRuntime.WarmUpAsync（ART guest 桥的预热）；
         //   Android 的 DexSpiderRuntime 是进程内 Dex 桥、无 VM 冷启动，无需预热
         //   （is 模式检查对 Android 的 var 具体类型是 CS8121 编译错误）。
-#if !ANDROID
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                for (var i = 0; i < 30; i++)   // 等订阅解析出站点（最多 30s），再决定要不要预热
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(i == 0 ? 6 : 1)).ConfigureAwait(false);
-                    if (CatClawVideo.Core.Models.SiteRegistry.Sites.Count > 0) break;
-                }
-                if (!CatClawVideo.Core.Models.SiteRegistry.Playable
-                        .Any(s => s.SpiderKind == CatClawVideo.Core.Models.VodSpiderKind.Jar)) return;
-                if (jarRuntime is CatClawVideo.Core.Providers.JavaSpiderRuntime desktop)
-                    await desktop.WarmUpAsync().ConfigureAwait(false);
-            }
-            catch { /* 预热失败交给首次调用懒启动 */ }
-        });
-#endif
+        // （爬虫 VM 预热已并入上面的「统一引导」——两处分开写会因时序互相打架，
+        //   导致桥还没好就先起了 QEMU guest。这里不再单独预热。）
 
         // js2Proxy 回环代理路由：按 siteKey 查站点 → 按 SpiderKind 分派 JS/Java 爬虫运行时
         spiderProxy.JsProxyHandler = (query, ct) =>

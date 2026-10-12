@@ -1278,6 +1278,9 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         DiagLog.Write($"[drag→] 退出开始 keepPlaying={keepPlaying} fullscreen={_isFullscreen}");
         if (!keepPlaying)
         {
+            // ★ 复位「正在播放」标志：后台预热（PreloadSitesAsync）据此完全停车，
+            //   不再与播放/扫码抢同一座桥（2026-10-11 用户反馈「预热让我播放卡顿」）。
+            Core.Services.PlaybackContext.Clear();
             if (_isFullscreen) { DiagLog.Write("[drag→] SetFullscreen(false) 前"); SetFullscreen(false); DiagLog.Write("[drag→] SetFullscreen(false) 后"); }
             DiagLog.Write("[drag→] Player.Pause() 前");
             Player.Pause();

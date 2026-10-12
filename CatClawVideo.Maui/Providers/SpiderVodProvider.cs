@@ -127,7 +127,14 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
         List<VodPlaySource> sources;
         try
         {
-            sources = SpiderJsonParser.ParsePlaySources(await rt.DetailContentAsync(site, item.Id, ct));
+            var rawDetail = await rt.DetailContentAsync(site, item.Id, ct);
+            // ★ 诊断（2026-10-11）：6V 从「站点推荐」进入时播放源退化成 1 条兜底，
+            //   而同一份 detailContent 用协议直连返回 5 条线路 —— 需要看清 app 实际拿到的字节。
+            _log?.Invoke($"[播放源] {site.Key}.detail({item.Id}) → {rawDetail.Length}B "
+                + $"head={(rawDetail.Length > 200 ? rawDetail[..200] : rawDetail)}");
+            sources = SpiderJsonParser.ParsePlaySources(rawDetail);
+            _log?.Invoke($"[播放源] {site.Key} → 线路 {sources.Count} 条"
+                + (sources.Count > 0 ? $"，首条 flag={sources[0].Name} 集数={sources[0].Episodes.Count} url={sources[0].Episodes[0].Url?[..Math.Min(70, sources[0].Episodes[0].Url?.Length ?? 0)]}" : "（将走兜底 Url=item.Id）"));
         }
         catch (Exception ex) when (IsDriveConfigEntry(site, item))
         {
@@ -220,6 +227,20 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
         // 绝不能进 playerContent（spider 会再炸一次）。
         if (IsHtmlConfigPage(episode.Url ?? ""))
             return new PlayRequest { Title = episode.Name, Url = episode.Url, IsHtmlPage = true };
+
+        // ★ 磁力系必须先于 playerContent 判定（对齐 TVBox SourceViewModel.checkThunder:624-660）：
+        //   TVBox 在 **detailContent 阶段**就把磁力集换成引擎的文件列表，之后每集 url 已是本地流地址，
+        //   所以它永远不会对磁力调 playerContent。我们保留磁力集原样，就必须在这里补一道。
+        //   ⚠ 实测（2026-10-11）踩过的坑：判定若放在 playerContent **之后**，磁力集拿到的是垃圾 ——
+        //     🔋6V┆磁力 → "https%3A%2F%2Ftr-rh-zhuqiy.dgj055.icu%2Fannounce\">01-04….mp4"（tracker+文件名）
+        //     🧲荐片┆磁力 → "564655"（一个纯 ID）
+        //   两者既不是磁力也不是 URL，TryOpenBtAsync 查 play.Url 时全落空 →
+        //   最终落到「不是完整网址（相对路径或缺少协议头）」。
+        if (IsThunderUrl(episode.Url ?? ""))
+        {
+            var btDirect = await TryOpenBtAsync(new PlayRequest { Url = episode.Url }, episode, ct).ConfigureAwait(false);
+            if (btDirect is not null) return btDirect;
+        }
 
         var json = await rt.PlayerContentAsync(site, flag: episode.Flag ?? "", id: episode.Url, ct);
         _log?.Invoke($"[解析] {site.Key}.playerContent(flag={episode.Flag},id={episode.Url}) → {json}");

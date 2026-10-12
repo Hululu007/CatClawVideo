@@ -1243,11 +1243,15 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
         }
 
         _searching = true;
+        // ★ 发起新搜索前**作废桥内在飞的那一批**：否则旧批次的 24 路还在跑，
+        //   与新搜索、与随后的详情/播放抢站方（表现「加载半天」）。
+        _ = CatClawVideo.Core.Providers.SpiderBridgeClient.CancelBatchSearchAsync();
         var gen = ++_searchGen;      // 本轮代际：finally 里只有代际仍相同才允许清 _searching
         ((Command)SearchCommand).ChangeCanExecute();
 
         PushHistory(kw);
-        _searchCts?.Cancel();
+_searchCts?.Cancel();
+            _ = CatClawVideo.Core.Providers.SpiderBridgeClient.CancelBatchSearchAsync();   // 离开搜索页：作废桥内在飞批次
         _searchCts = new CancellationTokenSource();
 
         // 切到结果态（结果铺满整宽：键盘列宽归零）
@@ -1357,8 +1361,16 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
             // 冷启后副桥未就绪（MultiBridgeReady=false）时全部流量压向单桥 ART——恰逢 guest 还在起副桥 ART，
             // 24 路 load 并发轰一座桥 → guest 整体冻结（console 断流、TCP 活但 ART 死）→ 全站被隔离 24h。
             // 副桥没就绪就降 8 路起步；多桥就绪后自动全速。
+            // ★★ 外置 Android 桥模式：并发直接给 24（对齐 TVBox 的「几十路一起打」）。
+            //    QEMU 时代限制并发是因为「load 阶段」要塞进 guest 逐站串行推进（间隔 0.6~0.8s），
+            //    并发位一多只在宿主侧排队；现在 load 由桥并行处理、且启动已预热，
+            //    瓶颈只剩 jar 自己的网络耗时 ⇒ 并发位越多总时长越短（97 站 ×2.2s：8 路 ≈27s，
+            //    24 路 ≈9s）。桥侧 load/call 共用不限线程的 CALL_POOL，24 路实测稳定。
+            var externalBridge = CatClawVideo.Core.Providers.JavaSpiderRuntime.ExternalBridgeOwnsSpiders;
             var multiReady = CatClawVideo.Core.Providers.JavaSpiderRuntime.Current?.MultiBridgeReady == true;
-            var SearchConcurrency = multiReady ? 24 : 8;   // 非 const：随多桥就绪状态变化
+            // ⚠ 并发不再提高：瓶颈是各家 jar 的后端，提高并发只会同时压更多站方
+            //   （也更容易被限流），而**感知速度**由上面的「停滞即收工」决定。
+            var SearchConcurrency = multiReady ? 16 : 8;
             var searchGate = new SemaphoreSlim(SearchConcurrency);
 
             // ⚠ 必须用**本次搜索**的令牌（_searchCts）：用户退出页面 / 重新搜索时应当立即停止
@@ -1367,13 +1379,17 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
 
             // ★ 桥内聚合搜索（2026-10-11）：jar 站一次 op 进桥，桥内并发逐站流式回推；
             // 未装载站在桥内就地 loadFull。聚合失败（旧 gb.dex/超时）自动回落下面的逐站路径。
+            // ★★ 外置 Android 桥模式：**全部 jar 站一次 op 进桥**，桥内 24 路并发、结果流式回推。
+            //    这是 TVBox 的模型 —— 搜索在爬虫所在进程内跑，没有宿主↔桥的逐站往返，
+            //    也没有宿主侧 8 路闸门的排队。实测 14 站 7.6s 全跑完（宿主逐站路径：97 站 63s 只跑 37 个）。
+            //    ⚠ 与旧路径的区别：jar 用 site.Jar（订阅给的 URL），**不再要求宿主侧 jar 缓存**
+            //      （CachedJarPathOf 在桥模式下恒为 null，旧路径因此只捞到 1 个站）。
             var jrBatch = CatClawVideo.Core.Providers.JavaSpiderRuntime.Current;
-            if (jrBatch is not null && jrBatch.SupportsBatchSearch)
+            if (CatClawVideo.Core.Providers.JavaSpiderRuntime.ExternalBridgeOwnsSpiders)
             {
-                var jarSites = sites.Where(x => x.SpiderKind == CatClawVideo.Core.Models.VodSpiderKind.Jar)
-                    .Select(x => (Site: x, Jar: jrBatch.CachedJarPathOf(x.Key), ClassName: jrBatch.ClassNameFor(x.Key, x), Ext: (string?)null))
-                    .Where(x => x.Jar is not null)
-                    .Select(x => (x.Site, Jar: x.Jar!, ClassName: x.ClassName, Ext: x.Ext))
+                var jarSites = sites.Where(x => x.SpiderKind == CatClawVideo.Core.Models.VodSpiderKind.Jar
+                                             && !string.IsNullOrEmpty(x.Jar))
+                    .Select(x => (Site: x, Jar: x.Jar!.Split(";md5;")[0], ClassName: x.Api, Ext: x.Ext))
                     .ToList();
                 if (jarSites.Count > 0)
                 {
@@ -1385,24 +1401,49 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
                     {
                         var batchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                         batchCts.CancelAfter(TimeSpan.FromSeconds(150));
-                        var finished = await jrBatch.BatchSearchAsync(kw, jarSites,
-                            (site, resultJson) =>
+                        // 事件流：桥按站回推 ev=search，全部结束回 ev=search-done
+                        var siteByKey = jarSites.ToDictionary(x => x.Site.Key, x => x.Site);
+                        var doneTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        var okSites = 0;
+                        Action<System.Text.Json.Nodes.JsonObject> onEv = ev =>
+                        {
+                            var evName = ev["ev"]?.GetValue<string>() ?? "";
+                            if (evName == "search-done") { doneTcs.TrySetResult(true); return; }
+                            if (evName != "search") return;
+                            var k = ev["site"]?.GetValue<string>() ?? "";
+                            if (!siteByKey.TryGetValue(k, out var site)) return;
+                            if (ev["error"] is not null) return;   // 该站失败：不产生结果，也不影响别的站
+                            var resultJson = ev["result"]?.GetValue<string>() ?? "";
+                            if (resultJson.Length == 0) return;
+                            var items = CatClawVideo.Core.Providers.SpiderJsonParser.ParseItems(resultJson, k);
+                            if (items.Count == 0) return;
+                            System.Threading.Interlocked.Increment(ref okSites);
+                            foreach (var it in items) { it.SiteName = site.Name; it.Category ??= site.Name; }
+                            List<VodItem> addedBatch;
+                            lock (gate) { foreach (var it in items) _sourceResults.Add(it); addedBatch = items; }
+                            MainThread.BeginInvokeOnMainThread(() =>
                             {
-                                var items = CatClawVideo.Core.Providers.SpiderJsonParser.ParseItems(resultJson, site.Key);
-                                if (items.Count == 0) return Task.CompletedTask;
-                                foreach (var it in items) { it.SiteName = site.Name; it.Category ??= site.Name; }
-                                List<VodItem> addedBatch;
-                                lock (gate) { foreach (var it in items) _sourceResults.Add(it); addedBatch = items; }
-                                MainThread.BeginInvokeOnMainThread(() =>
-                                {
-                                    ApplySiteFilter();
-                                    StatusLabel.Text = $"「{kw}」已找到 {_sourceResults.Count} 个结果…（{site.Name} +{items.Count}）";
-                                    CoverResolver.Attach(_covers, addedBatch);
-                                });
-                                return Task.CompletedTask;
-                            }, batchCts.Token);
-                        batchOk = finished >= 0;
-                        DiagLog.Write($"[搜索] 桥内聚合完成：{finished} 站（ok={batchOk}）");
+                                ApplySiteFilter();
+                                StatusLabel.Text = $"「{kw}」已找到 {_sourceResults.Count} 个结果…（{site.Name} +{items.Count}）";
+                                CoverResolver.Attach(_covers, addedBatch);
+                            });
+                        };
+                        CatClawVideo.Core.Providers.SpiderBridgeClient.SearchEvent = onEv;
+                        try
+                        {
+                            var started = await CatClawVideo.Core.Providers.SpiderBridgeClient
+                                .StartBatchSearchAsync(kw, jarSites.Select(x => (x.Site.Key, x.ClassName, x.Ext, x.Jar)), 24, ct);
+                            if (started)
+                            {
+                                // 桥侧单站 25s 熔断 ⇒ 40s 内必然收尾；到点也收工（结果早已流式上屏）
+                                // 20s 收工：结果早已流式上屏，没必要等满（桥侧单站 25s 熔断，
+                                // 但用户此刻多半已经在看结果了；剩余站点的结果仍会到达并上屏）。
+                                var doneTask = await Task.WhenAny(doneTcs.Task, Task.Delay(20000, ct));
+                                batchOk = true;
+                                DiagLog.Write($"[搜索] 桥内聚合完成：{jarSites.Count} 站提交，{okSites} 站有结果（done={doneTcs.Task.IsCompleted}）");
+                            }
+                        }
+                        finally { CatClawVideo.Core.Providers.SpiderBridgeClient.SearchEvent = null; }
                     }
                     catch (Exception bex)
                     {
@@ -1554,12 +1595,25 @@ public partial class SearchPage : ContentPage, IRemoteKeyHandler
             var totalBudgetMs = (int)Math.Clamp(
                 avgSiteMs * sites.Count / SearchConcurrency * 1.4 + serialFloorMs, 30000, 120000);
             var waited = 0;
+            // ★★ 结果停滞即收工（2026-10-11）：原来要等 Task.WhenAll —— **最慢的那个站**
+            //    （KZN 10s、花卷 13s、撞 25s 超时的）才收工，用户体感就是干等 50s+。
+            //    结果本身是**流式上屏**的，所以这里改成：连续 5s 没有新站完成 ⇒ 认为剩下的
+            //    都是慢站/死站，立刻收工（**不取消**在飞任务，它们回来照样上屏，对齐 TVBox
+            //    「边搜边出、先给用户看」的语义）。
+            var lastDone = -1;
+            var stallMs = 0;
             DiagLog.Write($"[搜索] 「{kw}」共 {sites.Count} 个站点，并发 {SearchConcurrency}，" +
                          $"等待预算 {totalBudgetMs / 1000}s（实测均摊 {avgSiteMs}ms/站）");
             while (!all.IsCompleted && doneCount < sites.Count && waited < totalBudgetMs)
             {
                 await Task.Delay(500);
                 waited += 500;
+                if (doneCount != lastDone) { lastDone = doneCount; stallMs = 0; }
+                else stallMs += 500;
+                // ⚠ 2026-10-11 撤销「5s 停滞即收工」：并发 8、单站 10~25s 时「5s 无新站完成」
+                //   是常态，实测把它当收工条件后只试了 4/97 个站、结果全空。
+                //   停滞判据要么给足（≥20s）要么根本不用 —— 见下方「桥内聚合搜索」才是正解。
+                if (stallMs >= 20000 && doneCount > 0) break;
             }
             if (!all.IsCompleted)
                 DiagLog.Write($"[搜索] 「{kw}」等待预算 {totalBudgetMs / 1000}s 用尽，" +

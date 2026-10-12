@@ -13,6 +13,8 @@ public static class SpiderUiHost
     private static readonly Dictionary<int, Page> Windows = new();
     /// <summary>QEMU Guard VM 弹出的对话框 seq（用户操作经 GuardRuntime 回传 guest，而非桥 stdin）。</summary>
     private static readonly HashSet<int> QemuSeqs = new();
+    /// <summary>外置 Android 桥（com.catclaw.bridge）弹的对话框 seq（用户操作回传该桥的 socket）。</summary>
+    private static readonly HashSet<int> BridgeSeqs = new();
     private static CatClawVideo.Core.Providers.JavaSpiderRuntime? _rt;
 
     /// <summary>桌面 JVM 桥运行时（未 Attach 时为 null——Android/无桥平台）。</summary>
@@ -25,6 +27,14 @@ public static class SpiderUiHost
         // Guard VM（QEMU）的 UI 事件走同一条渲染管线（src=qemu 已标注，用户操作路由回 guest）
         CatClaw.Qemu.GuardRuntime.UiEvent += ev =>
             MainThread.BeginInvokeOnMainThread(() => _ = HandleAsync(ev));
+        // 外置 Android bridge APK 的 UI 桩事件（csp_*Guard 走桥那条路）：同一套渲染管线。
+        // seq 记进 BridgeSeqs，用户点击时才知道该把 ui-result 回给桥而不是 QEMU/guest。
+        CatClawVideo.Core.Providers.SpiderBridgeClient.UiEvent = ev =>
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                if (ev["seq"] is JsonValue sv && sv.TryGetValue<int>(out var sq) && sq > 0) BridgeSeqs.Add(sq);
+                _ = HandleAsync(ev);
+            });
     }
 
     private static async Task HandleAsync(JsonObject ev)
@@ -100,6 +110,11 @@ public static class SpiderUiHost
             CatClaw.Qemu.GuardRuntime.Engine?.SendUiResult(seq, which);
             QemuSeqs.Remove(seq);
             return Task.CompletedTask;
+        }
+        if (BridgeSeqs.Contains(seq))
+        {
+            BridgeSeqs.Remove(seq);
+            return CatClawVideo.Core.Providers.SpiderBridgeClient.SendUiResultAsync(seq, which);
         }
         return _rt?.SendUiResultAsync(seq, which) ?? Task.CompletedTask;
     }

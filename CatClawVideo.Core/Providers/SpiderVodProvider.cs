@@ -209,6 +209,20 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
         if (IsHtmlConfigPage(episode.Url ?? ""))
             return new PlayRequest { Title = episode.Name, Url = episode.Url, IsHtmlPage = true };
 
+        // ★ 磁力系必须先于 playerContent 判定（对齐 TVBox SourceViewModel.checkThunder）：
+        //   TVBox 在 **detailContent 阶段**就把磁力集换成引擎的文件列表，之后每集 url 已是本地流地址，
+        //   所以它永远不会对磁力调 playerContent。我们保留磁力集原样，就必须在这里补一道。
+        //   ⚠ 实测（2026-10-11）踩过的坑：把判定放在 playerContent **之后**时，磁力集拿到的是垃圾 ——
+        //     🔋6V┆磁力 → "https%3A%2F%2Ftr-rh-zhuqiy.dgj055.icu%2Fannounce\">01-04….mp4"（tracker+文件名）
+        //     🧲荐片┆磁力 → "564655"（一个纯 ID）
+        //   这两个都既不是磁力也不是 URL，TryOpenBtAsync 检查 play.Url 时全部落空 →
+        //   最终落到「不是完整网址（相对路径或缺少协议头）」。
+        if (IsThunderUrl(episode.Url ?? ""))
+        {
+            var btDirect = await TryOpenBtAsync(new PlayRequest { Url = episode.Url }, episode, ct).ConfigureAwait(false);
+            if (btDirect is not null) return btDirect;
+        }
+
         var json = await rt.PlayerContentAsync(site, flag: episode.Flag ?? "", id: episode.Url, ct);
         _log?.Invoke($"[解析] {site.Key}.playerContent(flag={episode.Flag},id={episode.Url}) → {json}");
         var play = SpiderJsonParser.ParsePlayRequest(json, episode.Name);

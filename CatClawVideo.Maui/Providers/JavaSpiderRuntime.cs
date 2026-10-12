@@ -70,8 +70,26 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private CatClaw.Qemu.ArtJarServer? _jarServer;
     private int _id;
 
-    private readonly ConcurrentDictionary<string, bool> _loadedSites = new();
+    /// <summary>
+    /// 已装载站点：键 = (桥索引, 站点键)。<b>必须按桥分桶</b> —— 每座桥是独立 ART 进程，
+    /// SPIDERS 是进程私有的；不分桶就会踩「16:45:21 在主桥装好的 FishConfig，16:46:30 副桥
+    /// 上线后 AcquireSlot 把它派给一座新桥，宿主却仍记着已装载」⇒ 桥侧 site not loaded
+    /// （16:46:31 实锤）。副桥下线/换绑时对应桶作废，见 <see cref="DropSlot"/>。
+    /// 主桥索引恒为 0（副桥 1..N-1，见 <see cref="_slots"/>）。
+    /// </summary>
+    private readonly ConcurrentDictionary<(int Slot, string Site), bool> _loadedSites = new();
     private readonly ConcurrentDictionary<string, string> _convertedJars = new();
+
+    /// <summary>装载记忆的键：站点 + 它当前绑定的桥（无副桥时走主桥 0）。</summary>
+    private static (int Slot, string Site) LoadKey(string siteKey, BridgeSlot? slot)
+        => (slot?.Index ?? 0, siteKey);
+
+    /// <summary>作废某站在**所有桥**上的装载记忆（换桥/自愈时用：旧桥的「已装载」不能顺延到新桥）。</summary>
+    private void ForgetSiteEverywhere(string siteKey)
+    {
+        foreach (var k in _loadedSites.Keys.Where(k => k.Site == siteKey).ToList())
+            _loadedSites.TryRemove(k, out _);
+    }
 
     /// <summary>同 jar load 串行锁（jarKey → 1 许可）：ce647a 家族并发 load 会在转译层抢 so 句柄
     /// （一个 init 走通、下个 init 把桥撞崩，Round65/66 实锤）。同 jar 一次只进一个 load，
@@ -82,7 +100,8 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     public static JavaSpiderRuntime? Current { get; private set; }
 
     /// <summary>该站是否已在桥内装载（已 load 即搜时只剩 searchContent，毫秒级）。</summary>
-    public bool IsSiteLoaded(string siteKey) => _loadedSites.ContainsKey(siteKey);
+    public bool IsSiteLoaded(string siteKey)
+        => _loadedSites.Keys.Any(k => k.Site == siteKey);   // 任一桥上已装载即可（搜索排序只关心"要不要 load"）
 
     /// <summary>最近装载成功的 Guard 家族站点键（<c>csp_*Guard</c>）。
     /// csp_*Guard 同 jar 家族的多个源共享壳内部的约定流服务端口（6678）——任何兄弟源在本源
@@ -782,7 +801,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             var sites = CatClawVideo.Core.Models.SiteRegistry.Playable
                 .Where(s => s.SpiderKind == CatClawVideo.Core.Models.VodSpiderKind.Jar
                          && !string.IsNullOrEmpty(s.Api)
-                         && !_loadedSites.ContainsKey(s.Key)      // 已 loaded 的跳过 ⇒ 换源后只补新增的
+                         && !IsSiteLoaded(s.Key)                  // 任一桥已 loaded 的跳过 ⇒ 换源后只补新增的
                          && !LoadLatched(s.Key)) // 已知失败的跳过（负缓存；超时类到期就再给机会）
                 .Take(120).ToList();
             if (sites.Count == 0) return;
@@ -830,6 +849,16 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 {
                     await gate.WaitAsync(preloadCts.Token).ConfigureAwait(false);
                     entered = true;
+                    // ★★ 正在播放 ⇒ **完全停车**（不是降速）：预热与播放抢同一座桥，
+                    //   预热在飞时播放/取流请求排在后面 —— 表现为播放卡顿/起播慢
+                    //   （2026-10-04 扫码变卡、2026-10-11 播放卡顿，两次都是它）。
+                    //   播放页退出时 PlaybackContext.Clear() 复位，预热自动续跑。
+                    while (CatClawVideo.Core.Services.PlaybackContext.Active
+                           && !preloadCts.IsCancellationRequested)
+                    {
+                        Interlocked.Increment(ref yield);
+                        await Task.Delay(2000, preloadCts.Token).ConfigureAwait(false);
+                    }
                     await WaitIdleAsync().ConfigureAwait(false);      // ★ 让路给用户操作
                     if (preloadCts.IsCancellationRequested) return;
                     // ★ 2026-10-11 修判据失真：旧 _preloadGate 是「一次性置位、永不复位」，
@@ -849,6 +878,19 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                     // ★ 2026-10-11：名额要到了才排队等 jar 转换。此前 WaitIdleAsync 之后才取名额，
                     //   队尾任务在 gate 上把 240s 预算白等光（实测 45 站只有 2 个真跑过）。
                     //   提前到取名额**之前**判一次预算：被掐掉的直接记账走人，不占名额。
+                    // ★★ 外置 Android 桥模式：装载走**桥的 load op**（对齐 TVBox 的 jar 站点预热）。
+                    //    QEMU 时代这里是 EnsureConvertedJarAsync + EnsureSiteLoadedAsync（都走 guest 的
+                    //    _stdin），切到桥后它们必然失败 ⇒ 整轮预热**空转** ⇒ 每次搜索都要现场付
+                    //    0.8~1.4s/站的冷 load（实测「63s 预算只跑完 37/97 个站」的真因，2026-10-11）。
+                    if (ExternalBridgeOwnsSpiders)
+                    {
+                        if (await CatClawVideo.Core.Providers.SpiderBridgeClient
+                                .PreloadSiteAsync(s, preloadCts.Token).ConfigureAwait(false))
+                            Interlocked.Increment(ref ok);
+                        else
+                            Interlocked.Increment(ref fail);
+                        return;
+                    }
                     if (!IsBridgeReady) await EnsureBridgeAsync(preloadCts.Token).ConfigureAwait(false);
                     var jar = await EnsureConvertedJarAsync(s, preloadCts.Token).ConfigureAwait(false);
                     await EnsureSiteLoadedAsync(s, jar, preloadCts.Token, fromPreload: true).ConfigureAwait(false);
@@ -878,14 +920,47 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private readonly SemaphoreSlim _bridgeGate = new(1, 1);
 
     /// <summary>桥是否已就绪（不必重连）。快路径无锁检查。</summary>
-    private bool IsBridgeReady => _art is { IsUp: true } && _stdin is not null;
+    private bool IsBridgeReady =>
+        ExternalBridgeOwnsSpiders || (_art is { IsUp: true } && _stdin is not null);
 
     /// <summary>
     /// 确保桥可用。桥唯一跑在 ART guest 里（QEMU 里真 ART，行协议走 TCP）；
     /// 握手在 <see cref="HandshakeAsync"/> 里。
     /// </summary>
+    /// <summary>★ 外置 Android 桥（com.catclaw.bridge）已接管全部 jar 源时置 true：
+    /// <para>此时**不再启动 QEMU ART guest** —— <see cref="IsBridgeReady"/> 直接为 true、
+    /// <see cref="EnsureBridgeAsync"/> 是 no-op。Android 侧 arm64 .so 只能在 bridged
+    /// 命名空间里加载，QEMU guest 已完全被它取代（省 ~2.5GB 常驻内存）。</para>
+    /// <para>⚠ 为什么必须在这里挡：启动后的「jar 预加载」会逐站调
+    /// <c>if (!IsBridgeReady) EnsureBridgeAsync()</c> —— 它只看本类的桥状态，
+    /// 不知道外置桥的存在，于是照样把 guest 拉起来（2026-10-11 实测 2.9GB，
+    /// 用户看到的「说好的切断呢」就是它）。</para></summary>
+    public static bool ExternalBridgeOwnsSpiders;
+
+    /// <summary>置位方（MauiProgram）注入的「外置桥接管时顺带起 Guard 解密服务」回调。
+    /// <para>⚠ 为什么不能只靠 EnsureBridgeAsync 里那处启动：置位后 <see cref="IsBridgeReady"/>
+    /// 恒为 true，所有 <c>if (!IsBridgeReady) EnsureBridgeAsync()</c> 全部跳过 ⇒
+    /// EnsureBridgeAsync 再也不被调用 ⇒ 18481 永远不起（2026-10-11 实测「18481 没有监听」）。</para></summary>
+    public static Action? ExternalBridgeAttached;
+
+    /// <summary>置位（幂等）。置位即触发一次 Guard 服务启动。</summary>
+    public static void AttachExternalBridge()
+    {
+        ExternalBridgeOwnsSpiders = true;
+        try { ExternalBridgeAttached?.Invoke(); } catch { }
+    }
+
     private async Task EnsureBridgeAsync(CancellationToken ct)
     {
+        if (ExternalBridgeOwnsSpiders)
+        {
+            // ★ 外置桥接管时**也必须**供 Guard 解密服务（18481）：jar 的 FishConfig 扫码链路
+            //   探测 10.0.2.2:18481 拿解密结果，此前它只在 QEMU guest 握手（HandshakeAsync）
+            //   里启动 —— 切断 QEMU 后没人供 ⇒ 扫码链路失败 ⇒ 全站回
+            //   {"hostAdmission":"pending"}、设置中心进不去、扫不了码（实测 2026-10-11）。
+            StartGuardSvcIfNeeded(ct);
+            return;
+        }
         if (IsBridgeReady) return;
         // 重置窗口期直接快速失败（避免在 ResetBridge 的 Shutdown 旁边抢旧实例）：
         // 上层调用点拿到这条消息会告诉用户稍后重试，而不是干等一轮冷启动。
@@ -1149,12 +1224,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         //  桥接到 guest 内桥的 guard-decrypt op——壳内转译 SO 进程内解密）。
         // ★ 单例守卫（2026-10-06 Round24）：HandshakeAsync 每次新桥都跑一次，
         // 此前每次都 Task.Run 起监听 → 第二次绑 18481 必失败（日志“只允许使用一次”）。
-        if (_guestArchOverride == CatClaw.Qemu.GuestArch.X86_64
-            && Interlocked.CompareExchange(ref _guardSvcStarted, 1, 0) == 0)
-        {
-            _ = Task.Run(() => GuardSvcLoopAsync(ct), ct);
-            Log("Guard 解密服务监听已启动（18481 → guest 内解密）");
-        }
+        if (_guestArchOverride == CatClaw.Qemu.GuestArch.X86_64) StartGuardSvcIfNeeded(ct);
     }
 
     /// <summary>
@@ -1203,17 +1273,32 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                         string result;
                         try
                         {
-                            var resp = await RoundTripAsync(new JsonObject
+                            var opName = op.Equals("ENCRYPT", StringComparison.OrdinalIgnoreCase) ? "guard-encrypt" : "guard-decrypt";
+                            string? resStr;
+                            if (ExternalBridgeOwnsSpiders)
                             {
-                                ["id"] = Interlocked.Increment(ref _id),
-                                ["op"] = op.Equals("ENCRYPT", StringComparison.OrdinalIgnoreCase) ? "guard-encrypt" : "guard-decrypt",
-                                ["data"] = data,
-                            }, TimeSpan.FromSeconds(30), CancellationToken.None).ConfigureAwait(false);
-                            var resStr = resp["result"] is JsonNode rn && rn.GetValueKind() != System.Text.Json.JsonValueKind.Null ? rn.GetValue<string>() : null;
-                            if (resp["ok"]?.GetValue<bool>() == true && !string.IsNullOrEmpty(resStr))
-                                result = "OK " + resStr;
+                                // 外置 Android 桥模式：直接问桥（桥内壳调 Rc.KJ/encrypt）
+                                resStr = await CatClawVideo.Core.Providers.SpiderBridgeClient
+                                    .GuardCryptoAsync(opName, data).ConfigureAwait(false);
+                                result = string.IsNullOrEmpty(resStr)
+                                    ? "ERR decrypt failed（外置桥返回空）"
+                                    : "OK " + resStr;
+                            }
                             else
-                                result = "ERR decrypt failed | resp=" + resp.ToJsonString()[..Math.Min(240, resp.ToJsonString().Length)];
+                            {
+                                var resp = await RoundTripAsync(new JsonObject
+                                {
+                                    ["id"] = Interlocked.Increment(ref _id),
+                                    ["op"] = opName,
+                                    ["data"] = data,
+                                }, TimeSpan.FromSeconds(30), CancellationToken.None).ConfigureAwait(false);
+                                var rn = resp["result"];
+                                resStr = rn is JsonNode node && node.GetValueKind() != System.Text.Json.JsonValueKind.Null ? node.GetValue<string>() : null;
+                                if (resp["ok"]?.GetValue<bool>() == true && !string.IsNullOrEmpty(resStr))
+                                    result = "OK " + resStr;
+                                else
+                                    result = "ERR decrypt failed | resp=" + resp.ToJsonString()[..Math.Min(240, resp.ToJsonString().Length)];
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -1227,6 +1312,18 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 catch (Exception) { /* 客户端断开属正常 */ }
             }, ct);
         }
+    }
+
+    /// <summary>启动 Guard 解密服务监听（18481，单例）。两种模式共用：
+    /// QEMU guest 模式转发到 guest 内桥的 guard-decrypt op；外置 Android 桥模式转发到
+    /// <see cref="CatClawVideo.Core.Providers.SpiderBridgeClient.GuardCryptoAsync"/>。</summary>
+    public void StartGuardSvcIfNeeded(CancellationToken ct = default)
+    {
+        if (Interlocked.CompareExchange(ref _guardSvcStarted, 1, 0) != 0) return;
+        _ = Task.Run(() => GuardSvcLoopAsync(ct), ct);
+        Log(ExternalBridgeOwnsSpiders
+            ? "Guard 解密服务监听已启动（18481 → 外置 Android 桥）"
+            : "Guard 解密服务监听已启动（18481 → guest 内解密）");
     }
 
     /// <summary>Guard 解密服务的监听引用（Dispose 时停）。</summary>
@@ -1507,8 +1604,13 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         var freed = 0;
         foreach (var key in _siteBridge.Where(x => x.Value == index).Select(x => x.Key).ToList())
             if (_siteBridge.TryRemove(key, out _)) freed++;
+        // ★ 该桥的装载记忆同步作废：SPIDERS 随进程一起没了，残留的"已装载"会让替补桥
+        //   跳过 op=load 直接收 site not loaded。
+        var dropped = 0;
+        foreach (var k in _loadedSites.Keys.Where(k => k.Slot == index).ToList())
+            if (_loadedSites.TryRemove(k, out _)) dropped++;
         if (_slots.IsEmpty) Volatile.Write(ref _multiReady, 0);
-        Log($"桥 #{index} 断开 → 解绑其上 {freed} 个站点，下次调用重新分配到活着的桥（多桥替补）");
+        Log($"桥 #{index} 断开 → 解绑其上 {freed} 个站点、作废其上 {dropped} 条装载记忆，下次调用重新分配到活着的桥（多桥替补）");
         // ★ 先归因（读在飞快照），再让该桥的在飞请求快速失败（否则 hang 到超时才报“站慢”）。
         QuarantineCrashedSuspects($"副桥 #{index} 崩溃退出", index);
         foreach (var kv in _pendingResponses)
@@ -2213,6 +2315,22 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
     private async Task<string> CallAsync(VodSiteInfo site, string method, JsonArray args, CancellationToken ct,
         TimeSpan? timeout = null, bool resetOnTimeout = true)
     {
+        // Guard 加固源（csp_*Guard）优先走**外部 Android 桥**（com.catclaw.bridge，arm64-only
+        // + libndk_translation）：壳的解密器是 arm64 ELF，本进程（宿主 x86_64 / guest TCG）
+        // 都不如真 Android 稳。桥不可达时返回 null，正常回落到下面的 ART guest 路径。
+        // ★★ 先记「最近站点」：spider 稍后自发的 /proxy 回调（网盘取流 do=proxy&key=…）
+        //    **不带 siteKey**，ProxyAsync/ProxyStreamAsync 靠 _lastSite 定位站点。
+        //    QEMU 时代这行在下面 guest 路径里执行；走外置桥时整段被绕过 ⇒ _lastSite 恒为 null
+        //    ⇒ 「siteKey 缺失且无最近站点」⇒ 502 ⇒ 播放器「源不受支持」（2026-10-11 实测）。
+        _lastSite = site;
+        // ★★ 用户活跃标记**必须在桥分支之前**打：原来它在下面 guest 路径里，桥分支提前 return
+        //    导致 UserRecentlyActive() 恒为假 ⇒ 后台预热从来不用户请求让路 ⇒
+        //    「切换源/进详情要加载半天」（2026-10-11 实测：预热与详情/播放抢同一座桥 + 同一批站点）。
+        if (!SystemProbeActive) MarkUserBusy();
+        if (await CatClawVideo.Core.Providers.SpiderBridgeClient
+                .TryCallAsync(site, method, args, ct).ConfigureAwait(false) is { } bridged)
+            return bridged;
+
         // 本次调用内「site not loaded」自愈的次数闸门：只自愈一次，避免桥彻底不认
         // 这个站时把 load 重装载+调用重试变成死循环（见下面自愈分支的注释）。
         var selfHealed = false;
@@ -2251,13 +2369,13 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         //   （13:47 实测 AppUn 族 5 站 12s 才推进 5 个）；按桥上锁后 3 座桥并行消化，
         //   吞吐 ×3，且同桥内仍是严格串行（约束不破）。
         var loadGate = _jarLoadGates.GetOrAdd("slot#" + (slot?.Index.ToString() ?? "main"), _ => new SemaphoreSlim(1, 1));
-        if (!_loadedSites.TryGetValue(site.Key, out _) || Volatile.Read(ref _resetting) != 0)
+        if (!_loadedSites.ContainsKey(LoadKey(site.Key, slot)) || Volatile.Read(ref _resetting) != 0)
         {
             await loadGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
                 // 双检：排队期间可能已被别的请求装载好（首次搜索 16 路并发，同站只 load 一次）
-                if (!_loadedSites.TryGetValue(site.Key, out _))
+                if (!_loadedSites.ContainsKey(LoadKey(site.Key, slot)))
                     await EnsureSiteLoadedCoreAsync(site, jar, ct, false, slot).ConfigureAwait(false);
             }
             finally { loadGate.Release(); }
@@ -2302,7 +2420,7 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
                 {
                     selfHealed = true;
                     Log($"{site.Key}: 桥侧报 site not loaded（疑似桥 VM 冷启清空 SPIDERS）→ 作废装载记忆并 force 重装载，重试 {method}");
-                    _loadedSites.TryRemove(site.Key, out _);
+                    ForgetSiteEverywhere(site.Key);   // 旧桥的"已装载"不认：它可能已随进程消失
                     await loadGate.WaitAsync(ct).ConfigureAwait(false);
                     try { await EnsureSiteLoadedCoreAsync(site, jar, ct, true, slot).ConfigureAwait(false); }
                     finally { loadGate.Release(); }
@@ -2346,16 +2464,30 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         }
         try
         {
-            await EnsureBridgeAsync(ct).ConfigureAwait(false);
-            var jarPath = await EnsureConvertedJarAsync(site, ct).ConfigureAwait(false);
-            await EnsureSiteLoadedAsync(site, jarPath, ct).ConfigureAwait(false);
+            // ★★ 外置 Android 桥模式**必须跳过**下面这段 guest 前置：EnsureConvertedJarAsync /
+            //    EnsureSiteLoadedAsync 都走 RoundTripAsync（往 guest 的 _stdin 写），没有 guest 时
+            //    _stdin 为 null ⇒ 直接抛「桥会话已断开（主桥刚崩溃，正在重建）」⇒ 502
+            //    ⇒ 播放器「源不受支持」。而这两步在外置桥下**本来就是多余的**：站点由
+            //    CallAsync 的桥分支（SpiderBridgeClient.TryCallAsync→load）负责装载。
+            if (!ExternalBridgeOwnsSpiders)
+            {
+                await EnsureBridgeAsync(ct).ConfigureAwait(false);
+                var jarPath = await EnsureConvertedJarAsync(site, ct).ConfigureAwait(false);
+                await EnsureSiteLoadedAsync(site, jarPath, ct).ConfigureAwait(false);
+            }
 
             // 爬虫自带的 /proxy 就在 guest 里跑着（桥的 Art.serveProxy），宿主经 slirp
             // 隧道直接要字节。（行协议那条 outFile 代理通道随宿主 JRE 桥退役：guest 里的
             // Linux 进程写 Windows 路径宿主本就读不到，2026-09-26 实测。）
-            if (_art?.ProxyBase is not { } tunnel)
+            // ★ 隧道基址：优先 QEMU guest，缺少时回落**外置 Android 桥**的桥内 /proxy 服务
+            //   （设备侧 18601 → adb forward 宿主 18611）。切断 QEMU 后没有 guest，
+            //   若不回落，网盘取流一律 502 ⇒ 播放器「源不受支持」（2026-10-11 实测）。
+            var tunnel = _art?.ProxyBase
+                ?? await CatClawVideo.Core.Providers.SpiderBridgeClient
+                        .EnsureProxyBaseAsync(ct).ConfigureAwait(false);
+            if (tunnel is null)
             {
-                Log("proxy 隧道不可用（ART guest 未连接）");
+                Log("proxy 隧道不可用（ART guest 未连接 且 桥内 proxy 不可达）");
                 return ((int)502, "text/plain", (byte[]?)null);
             }
             return await ProxyViaTunnelAsync(tunnel, site.Key, query, ct).ConfigureAwait(false);
@@ -2399,16 +2531,26 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
         }
         try
         {
-            await EnsureBridgeAsync(ct).ConfigureAwait(false);
-            var jarPath = await EnsureConvertedJarAsync(site, ct).ConfigureAwait(false);
-            await EnsureSiteLoadedAsync(site, jarPath, ct).ConfigureAwait(false);
-            if (_art?.ProxyBase is not { } tunnel)
+            // ★★ 同 ProxyAsync：外置桥模式跳过 guest 前置（否则 _stdin 为 null 直接抛）
+            if (!ExternalBridgeOwnsSpiders)
             {
-                Log("proxy 流：隧道不可用（ART guest 未连接）");
+                await EnsureBridgeAsync(ct).ConfigureAwait(false);
+                var jarPath = await EnsureConvertedJarAsync(site, ct).ConfigureAwait(false);
+                await EnsureSiteLoadedAsync(site, jarPath, ct).ConfigureAwait(false);
+            }
+            var tunnel = _art?.ProxyBase
+                ?? await CatClawVideo.Core.Providers.SpiderBridgeClient
+                        .EnsureProxyBaseAsync(ct).ConfigureAwait(false);
+            if (tunnel is null)
+            {
+                Log("proxy 流：隧道不可用（ART guest 未连接 且 桥内 proxy 不可达）");
                 return null;
             }
 
-            var q = new Dictionary<string, string>(query) { ["site"] = site.Key };
+        // ★ 2026-10-12：必须发 siteKey —— guest 的 Server.java 与桥的 ProxyServer 都按
+        //   siteKey 定位站点；发 site 会被忽略 ⇒ 落到 lastSite() ⇒ 播放时站点错位
+        //   ⇒ jar 回 400 "Missing url" ⇒ 播放器「源不受支持」。site 也一并保留（兼容旧桥）。
+        var q = new Dictionary<string, string>(query) { ["siteKey"] = site.Key, ["site"] = site.Key };
             var range = CatClawVideo.Core.Services.SpiderProxyServer.Header(requestHeaders, "Range");
             if (!string.IsNullOrEmpty(range)) q["range"] = range;   // ★ 壳的 Range 约定走 query
             var url = tunnel + "/proxy?" + string.Join("&",
@@ -2500,7 +2642,7 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
     private async Task EnsureSiteLoadedCoreAsync(VodSiteInfo site, string jarPath, CancellationToken ct,
         bool force = false, BridgeSlot? slot = null, bool fromPreload = false)
     {
-        if (_loadedSites.TryGetValue(site.Key, out _) && !force) return;
+        if (_loadedSites.ContainsKey(LoadKey(site.Key, slot)) && !force) return;
         // ★ Round43：入口 jar 熔断已删除（曾永久封杀主力 ce647a → 首页 97 站全灭）。
         // 旋转门由上面的家族 90s 冷却兜住：新站无家族名单也能进 guest 试一次，崩了即冷却，
         // 不再“一崩永封”。force（用户点名）照常穿透。
@@ -2563,12 +2705,32 @@ Log($"proxy 隧道：{siteKey} do={query.GetValueOrDefault("do")} → {(int)resp
         if (resp["ok"]?.GetValue<bool>() != true)
         {
             // 加载失败必须留痕：此前只 log 成功分支，导致「站点没反应」无从查因
-            Log($"站点 {site.Key} 加载失败（类名 {className}，jar {Path.GetFileName(jarPath)}）: {resp["error"]}");
-            // 结构性失败（桥自己答 ok:false）：重试也不会好 ⇒ Until=null，整会话跳过
-            _loadFailedSites[site.Key] = (resp["error"]?.GetValue<string>() ?? "", null);
+            var why = resp["error"]?.GetValue<string>() ?? "";
+            Log($"站点 {site.Key} 加载失败（类名 {className}，jar {Path.GetFileName(jarPath)}）: {why}");
+            // ★ 2026-10-11 修「一次偶发就把站锁死到重启」：并非所有 ok:false 都是结构性失败。
+            //   ClassNotFoundException 与 site not loaded 都是**瞬态**的：前者是同名 jar 正被
+            //   另一个桥 materialize 截断写（多桥竞态，已在 Art.materialize 用 .part+rename 修），
+            //   后者是桥侧 SPIDERS 刚被清/换桥。旧代码一律 Until=null ⇒ 整会话跳过，
+            //   于是 FishConfig 此后每次点分类都收「此前加载失败，本轮跳过」（16:46:34~16:46:54 实锤，
+            //   而 jar 里 FishConfig 类一直在）。瞬态与超时同档：冷却 90s 自动重试，
+            //   用户点名（force，如播放）立刻穿透。
+            //   真正的结构性失败（类名写错、壳解不开）仍然 Until=null。
+            var transient = why.Contains("ClassNotFoundException", StringComparison.Ordinal)
+                         || why.Contains("site not loaded", StringComparison.OrdinalIgnoreCase)
+                         || why.Contains("DexPathList", StringComparison.Ordinal);
+            if (transient)
+            {
+                _loadFailedSites[site.Key] = ($"{why}（瞬态，冷却 90s 后自动重试）", DateTime.UtcNow.AddSeconds(90));
+                Log($"站点 {site.Key} 判为瞬态装载失败 → 冷却 90s（不是结构性失败，不必重启应用）");
+            }
+            else
+            {
+                // 结构性失败（桥自己答 ok:false）：重试也不会好 ⇒ Until=null，整会话跳过
+                _loadFailedSites[site.Key] = (why, null);
+            }
             throw new InvalidOperationException($"spider {site.Key} 加载失败: {resp["error"]}");
         }
-        _loadedSites[site.Key] = true;
+        _loadedSites[LoadKey(site.Key, slot)] = true;
         _loadFailedSites.TryRemove(site.Key, out _);
         // Guard 家族装载次序跟踪（端口抢占守卫用，见 _lastGuardSiteKey 注释）：
         // 只有带 Guard 后缀的壳类名才占 6678；降级到真实类（无 Guard）的不算。

@@ -16,8 +16,8 @@
 
 		<ApplicationTitle>猫爪影视</ApplicationTitle>
 		<ApplicationId>com.catclaw.video</ApplicationId>
-		<ApplicationDisplayVersion>0.2.1</ApplicationDisplayVersion>
-		<ApplicationVersion>7</ApplicationVersion>
+		<ApplicationDisplayVersion>0.2.5</ApplicationDisplayVersion>
+		<ApplicationVersion>8</ApplicationVersion>
 
 		<!-- Android 打包：禁用快速部署，避免 FastDev 状态冲突（同 CatClawMusic 实测结论） -->
 		<AndroidUseFastDeployment>false</AndroidUseFastDeployment>
@@ -350,5 +350,24 @@
 		<Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)..\tools\fetch-assets.ps1&quot; -Dest &quot;$(MSBuildThisFileDirectory)..&quot;"
 		      ContinueOnError="true" />
 	</Target>
+
+
+  <!-- ★ 外置 Android 桥 APK 随包分发：应用首次启动时 adb install 到模拟器
+       （com.catclaw.bridge，arm64-only，靠 libndk_translation 加载 arm64 .so）。
+       来源：.shot\bridgeapk\signed.apk。Release/Debug 都带上 —— 少了它爬虫链路整体不可用。 -->
+  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)..\..\.shot\bridgeapk\signed.apk')">
+    <Content Include="$(MSBuildThisFileDirectory)..\..\.shot\bridgeapk\signed.apk"
+             Link="BridgeApk\catclaw-bridge.apk"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- ★ 外置 Android 桥接管后，QEMU ART guest 彻底退役：`QemuGuest/` 有 **1606 MB**
+       （占整个输出目录 1812MB 的 89%），而它只在「桥不可用」时才被当回退拉起。
+       发行版不带它 ⇒ 安装包从 ~1.8GB 降到 ~200MB，且从根上不可能回落 QEMU。
+       Debug 仍保留（便于排查），Release 排除。 -->
+  <ItemGroup Condition="'$(Configuration)' == 'Release'">
+    <Content Remove="QemuGuest\**" />
+    <None Remove="QemuGuest\**" />
+  </ItemGroup>
 
 </Project>

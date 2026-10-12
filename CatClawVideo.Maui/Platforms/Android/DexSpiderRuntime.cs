@@ -95,51 +95,75 @@ public class DexSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderActi
 
     // ═══════════ ISpiderRuntime ═══════════
 
-    public Task<string> HomeContentAsync(VodSiteInfo site, CancellationToken ct = default) =>
-        InvokeAsync(site, h => CallSafe(h, h.Home, new Java.Lang.Boolean(true)), ct);
+    public async Task<string> HomeContentAsync(VodSiteInfo site, CancellationToken ct = default)
+    {
+        if (await BridgeSpiderClient.TryCallAsync(site, "homeContent", new[] { "true" }, ct) is { } bridged)
+            return bridged;
+        return await InvokeAsync(site, h => CallSafe(h, h.Home, new Java.Lang.Boolean(true)), ct);
+    }
 
-    public Task<string> CategoryContentAsync(VodSiteInfo site, string tid, string pg,
+    public async Task<string> CategoryContentAsync(VodSiteInfo site, string tid, string pg,
         IReadOnlyDictionary<string, string>? filter = null, CancellationToken ct = default)
     {
         // 协议第 3 参 filter 是「本次是否带筛选条件」，第 4 参才是键值表；
         // 之前恒传 false + 空 map，等于把所有站点的筛选器都关掉了。
-        var map = new HashMap();
         var has = filter is { Count: > 0 };
+        var filterJson = has ? System.Text.Json.JsonSerializer.Serialize(filter) : "";
+        if (await BridgeSpiderClient.TryCallAsync(site, "categoryContent",
+                new[] { tid, pg, has ? "true" : "false", filterJson }, ct) is { } bridged)
+            return bridged;
+        var map = new HashMap();
         if (has)
             foreach (var (k, v) in filter!)
                 map.Put(new Java.Lang.String(k), new Java.Lang.String(v));
-        return InvokeAsync(site, h => CallSafe(h, h.Category,
+        return await InvokeAsync(site, h => CallSafe(h, h.Category,
             new Java.Lang.String(tid), new Java.Lang.String(pg),
             new Java.Lang.Boolean(has), map), ct);
     }
 
-    public Task<string> DetailContentAsync(VodSiteInfo site, string id, CancellationToken ct = default)
+    public async Task<string> DetailContentAsync(VodSiteInfo site, string id, CancellationToken ct = default)
     {
+        if (await BridgeSpiderClient.TryCallAsync(site, "detailContent", new[] { id }, ct) is { } bridged)
+            return bridged;
         var list = new ArrayList();
         list.Add(new Java.Lang.String(id));
-        return InvokeAsync(site, h => CallSafe(h, h.Detail, list), ct);
+        return await InvokeAsync(site, h => CallSafe(h, h.Detail, list), ct);
     }
 
-    public Task<string> SearchContentAsync(VodSiteInfo site, string keyword, string pg, CancellationToken ct = default) =>
-        InvokeAsync(site, h => h.Search3 != null
+    public async Task<string> SearchContentAsync(VodSiteInfo site, string keyword, string pg, CancellationToken ct = default)
+    {
+        if (await BridgeSpiderClient.TryCallAsync(site, "searchContent", new[] { keyword, "false", pg }, ct) is { } bridged)
+            return bridged;
+        return await InvokeAsync(site, h => h.Search3 != null
             ? CallSafe(h, h.Search3, new Java.Lang.String(keyword), new Java.Lang.Boolean(false), new Java.Lang.Integer(pg))
             : CallSafe(h, h.Search2, new Java.Lang.String(keyword), new Java.Lang.Boolean(false)), ct);
+    }
 
-    public Task<string> PlayerContentAsync(VodSiteInfo site, string flag, string id, CancellationToken ct = default)
+    public async Task<string> PlayerContentAsync(VodSiteInfo site, string flag, string id, CancellationToken ct = default)
     {
+        if (await BridgeSpiderClient.TryCallAsync(site, "playerContent", new[] { flag, id, "" }, ct) is { } bridged)
+            return bridged;
         var flags = new ArrayList();
-        return InvokeAsync(site, h => CallSafe(h, h.Player,
+        return await InvokeAsync(site, h => CallSafe(h, h.Player,
             new Java.Lang.String(flag), new Java.Lang.String(id), flags), ct);
     }
 
-    public Task<string> ActionAsync(VodSiteInfo site, string actionJson, CancellationToken ct = default) =>
-        InvokeAsync(site, h => CallSafe(h, h.Action, new Java.Lang.String(actionJson)), ct);
+    public async Task<string> ActionAsync(VodSiteInfo site, string actionJson, CancellationToken ct = default)
+    {
+        if (await BridgeSpiderClient.TryCallAsync(site, "action", new[] { actionJson }, ct) is { } bridged)
+            return bridged;
+        return await InvokeAsync(site, h => CallSafe(h, h.Action, new Java.Lang.String(actionJson)), ct);
+    }
 
     /// <summary>spider 型直播源：<c>liveContent(真实地址)</c> 返回频道列表文本。</summary>
-    public Task<string> LiveContentAsync(VodSiteInfo site, string url, CancellationToken ct = default) =>
-        InvokeAsync(site, h => h.Live is null
+    public async Task<string> LiveContentAsync(VodSiteInfo site, string url, CancellationToken ct = default)
+    {
+        if (await BridgeSpiderClient.TryCallAsync(site, "liveContent", new[] { url }, ct) is { } bridged)
+            return bridged;
+        return await InvokeAsync(site, h => h.Live is null
             ? throw new NotSupportedException($"「{site.Key}」的爬虫未实现 liveContent")
             : CallSafe(h, h.Live, new Java.Lang.String(url)), ct);
+    }
 
     // ═══════════ 装配 ═══════════
 

@@ -7,10 +7,16 @@
 ;       已在系统里装过则跳过（见下方 [Code] VCRedistPresent）。
 #define MyAppName "猫爪影视"
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.3"
+#define MyAppVersion "0.2.5"
 #endif
 #ifndef MyPublishDir
 #define MyPublishDir "CatClawVideo.Maui\bin\Release\net11.0-windows10.0.26100.0\win-x64\publish"
+#endif
+; 随包 Android 运行环境（模拟器 + 系统镜像 + adb）。由 build-win-release.ps1 用
+; /DMyAndroidSdk=<路径> 传入（它会先校验必要文件在不在）；这里的默认值只是让
+; 单独手跑 ISCC 时也有个合理落点。
+#ifndef MyAndroidSdk
+#define MyAndroidSdk "C:\Users\lvjin\AppData\Local\Android\Sdk"
 #endif
 #define MyAppPublisher "CatClawVideo"
 #define MyAppExeName "CatClawVideo.Maui.exe"
@@ -60,6 +66,39 @@ Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdi
 ; VC++ 2015-2022 运行库（x64）。放到 {tmp} 并在装完后删除，不往用户机器上留垃圾文件。
 ; ⚠ 必须是**完整包**（约 24MB），不能是 VS Package Cache 里那种 600KB 的下载器桩（离线装不上）。
 Source: "installer\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
+
+; ═══════════════════════════════════════════════════════════════════════════
+; 随包 Android 运行环境（0.2.5 起）—— 用户机器上不需要装 Android SDK / Android Studio
+;
+; 目录刻意与 Android SDK 同构：
+;   {app}\AndroidSdk\emulator\emulator.exe
+;   {app}\AndroidSdk\platform-tools\adb.exe
+;   {app}\AndroidSdk\system-images\android-36\google_apis_playstore\x86_64\
+; 因为 emulator.exe 把「自己的上一级目录」当作 SDK 根，AVD 里那句相对路径
+; image.sysdir.1 就相对它解析 ⇒ 整包自洽，不碰注册表/环境变量。
+; （2026-10-12 用 junction 复刻该布局冷启实测：76s 开机、native bridge 生效。）
+;
+; ⚠ system.img 与 VerifiedBootParams.textproto 是**强耦合的一对**：
+;   前者被精简并重签过（vbmeta 摘要变了），后者带着配套的
+;   androidboot.vbmeta.{size,hash_alg,digest}。必须同时替换，否则 init 报
+;   "vbmeta digest error isn't allowed" 直接起不来。
+;   ⇒ 既不能只排除其中一个，也绝不能把 *.orig 备份打进包。
+; ═══════════════════════════════════════════════════════════════════════════
+
+; 模拟器本体（已剔除非 x86_64 的 qemu 引擎，1033MB → 663MB）
+Source: "{#MyAndroidSdk}\emulator\*"; DestDir: "{app}\AndroidSdk\emulator"; \
+  Flags: ignoreversion recursesubdirs createallsubdirs; \
+  Excludes: "*.orig,drivers\*,include\*,qsn.exe,emulator-check.exe"
+; adb 三件套（platform-tools 里其余是 fastboot 等，桌面端用不到）
+Source: "{#MyAndroidSdk}\platform-tools\adb.exe"; DestDir: "{app}\AndroidSdk\platform-tools"; Flags: ignoreversion
+Source: "{#MyAndroidSdk}\platform-tools\AdbWinApi.dll"; DestDir: "{app}\AndroidSdk\platform-tools"; Flags: ignoreversion
+Source: "{#MyAndroidSdk}\platform-tools\AdbWinUsbApi.dll"; DestDir: "{app}\AndroidSdk\platform-tools"; Flags: ignoreversion
+; 系统镜像。solidbreak：另起一个 solid 块 —— 它与前面那些 PE/DLL 毫无相似度，
+; 合在一块只会让 ISCC 为了 2.2GB 数据吃光内存而换不来压缩收益。
+Source: "{#MyAndroidSdk}\system-images\android-36\google_apis_playstore\x86_64\*"; \
+  DestDir: "{app}\AndroidSdk\system-images\android-36\google_apis_playstore\x86_64"; \
+  Flags: ignoreversion recursesubdirs createallsubdirs solidbreak; \
+  Excludes: "*.orig"
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
@@ -71,6 +110,10 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; \
 Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}(&R)"; Flags: nowait postinstall skipifsilent
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
+; 随包环境的 AVD 家目录（%LOCALAPPDATA%\CatClawVideo\avd）：模拟器在里面生成
+; ram.img / userdata-qemu.img / cache.img，冷启后约 3.2GB，纯 scratch，删掉可重建。
+; 应用自身的配置与登录态在 %APPDATA%\CatClawVideo，**不动**。
+Type: filesandordirs; Name: "{localappdata}\CatClawVideo\avd"
 
 [Code]
 // ═══════════════════════════════════════════════════════════════════════
