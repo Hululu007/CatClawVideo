@@ -73,12 +73,19 @@ Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdi
 Source: "installer\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 ; ═══════════════════════════════════════════════════════════════════════════
-; 随包 Android 运行环境（0.2.5 起）—— 用户机器上不需要装 Android SDK / Android Studio
+; Android 运行环境（模拟器 + 系统镜像 + adb）
 ;
-; 目录刻意与 Android SDK 同构：
-;   {app}\AndroidSdk\emulator\emulator.exe
-;   {app}\AndroidSdk\platform-tools\adb.exe
-;   {app}\AndroidSdk\system-images\android-36\google_apis_playstore\x86_64\
+; ★ 0.2.6 起默认**不随包**（轻量包 ~130MB）：运行环境发布在
+;     https://github.com/kankejiang/CatClaw.Qemu/releases（tag android-runtime-v1）
+;   首次使用 jar 源时由客户端提示下载解压到 %LOCALAPPDATA%\CatClawVideo\AndroidSdk
+;   （见 Services/RuntimeProvisioner.cs；网页源 / MacCMS / JS 源不受影响）。
+;   要出「完整离线包」（给离线机器/批量部署）时加编译开关：
+;     ISCC /DMyBundleRuntime=1 build-win-setup.iss
+;
+; 目录刻意与 Android SDK 同构（随包/下载两处布局相同）：
+;   ...\AndroidSdk\emulator\emulator.exe
+;   ...\AndroidSdk\platform-tools\adb.exe
+;   ...\AndroidSdk\system-images\android-36\google_apis_playstore\x86_64\
 ; 因为 emulator.exe 把「自己的上一级目录」当作 SDK 根，AVD 里那句相对路径
 ; image.sysdir.1 就相对它解析 ⇒ 整包自洽，不碰注册表/环境变量。
 ; （2026-10-12 用 junction 复刻该布局冷启实测：76s 开机、native bridge 生效。）
@@ -89,6 +96,8 @@ Source: "installer\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinsta
 ;   "vbmeta digest error isn't allowed" 直接起不来。
 ;   ⇒ 既不能只排除其中一个，也绝不能把 *.orig 备份打进包。
 ; ═══════════════════════════════════════════════════════════════════════════
+
+#ifdef MyBundleRuntime
 
 ; 模拟器本体（已剔除非 x86_64 的 qemu 引擎，1033MB → 663MB）
 ; ★ 瘦身批次 2（2026-10-13，实测取证）：应用始终以 -no-window 拉起模拟器，此时**实际跑的是
@@ -118,6 +127,7 @@ Source: "{#MyAndroidSdk}\system-images\android-36\google_apis_playstore\x86_64\*
   DestDir: "{app}\AndroidSdk\system-images\android-36\google_apis_playstore\x86_64"; \
   Flags: ignoreversion recursesubdirs createallsubdirs solidbreak; \
   Excludes: "*.orig"
+#endif   ; MyBundleRuntime
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon

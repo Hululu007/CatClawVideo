@@ -300,7 +300,64 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
             // 它们指向的是已退役的 QEMU ART guest 取件（CatClaw.Qemu 的 vm-assets 发布页），
             // 而新版自检（Services/StartupEnvCheck）不再产生这两个 id：运行环境现在随包，
             // 缺失只可能是安装不完整，正确处置是重装而不是去下别的包。
+            // 2026-10-13：0.2.6 轻量包不再随带 AndroidSdk，运行环境改首运下载 —— 上面的注释
+            // 「随包、缺失=安装不完整」自此失效；download-runtime 成为新的标准处置。
             case "open-datadir": OpenDataDir(); break;
+            case "download-runtime": _ = DownloadRuntimeAsync(); break;
+        }
+    }
+
+    /// <summary>正在下载运行环境（防重入：面板上的按钮连点不叠加任务）。</summary>
+    private bool _provisioningRuntime;
+
+    /// <summary>
+    /// 一键下载 Android 运行环境（模拟器 + 镜像，约 0.9GB）：
+    /// 确认（含磁盘预检文案）→ 下载/解压（进度写进面板汇总行）→ 失败给可读原因并保留断点。
+    /// </summary>
+    private async Task DownloadRuntimeAsync()
+    {
+        if (_provisioningRuntime) return;
+        _provisioningRuntime = true;
+        try
+        {
+            var root = Services.RuntimeProvisioner.TargetRoot;
+            var drive = new DriveInfo(Path.GetPathRoot(root)!);
+            var free = drive.AvailableFreeSpace;
+            var ok = await Shell.Current.DisplayAlertAsync(
+                "下载 Android 运行环境",
+                $"jar 爬虫源与网盘源需要一个 Android 运行环境：\n" +
+                $"· 下载约 {Services.RuntimeProvisioner.AssetBytes / 1024 / 1024} MB（断点续传）\n" +
+                $"· 解压后约 {Services.RuntimeProvisioner.UnpackedBytes / 1024 / 1024 / 1024:0.#} GB，落在本机数据目录\n" +
+                $"· 磁盘 {drive.Name} 可用 {free / 1024.0 / 1024 / 1024:0.#} GB（需约 3.6 GB）\n\n" +
+                $"网页源 / MacCMS / JS 脚本源不受影响，可先跳过。现在开始下载吗？",
+                "开始下载", "以后再说");
+            if (!ok) return;
+
+            var progress = new Progress<double>(p => MainThread.BeginInvokeOnMainThread(() =>
+            {
+                EnvCheckSummary.Text = $"运行环境下载中… {p * 100:0}%";
+                EnvCheckSummary.TextColor = Color.FromArgb("#0A84FF");
+                EnvCheckBadge.BackgroundColor = Color.FromArgb("#0A84FF").WithAlpha(0.16f);
+            }));
+
+            await Task.Run(() => Services.RuntimeProvisioner.ProvisionAsync(
+                progress, stage => DiagLog.Write($"[runtime] {stage}"), CancellationToken.None))
+                .ConfigureAwait(true);
+
+            await RefreshEnvChecksAsync();
+            await Shell.Current.DisplayAlertAsync("运行环境就绪",
+                "Android 运行环境下载完成。首次启动模拟器约需 1 分钟（之后走快照会快很多）。", "好");
+        }
+        catch (Exception ex)
+        {
+            DiagLog.Write($"[runtime] 下载失败：{ex.GetType().Name}: {ex.Message}");
+            await RefreshEnvChecksAsync();
+            await Shell.Current.DisplayAlertAsync("下载失败",
+                ex.Message + "\n\n稍后可在本面板重试（支持从断点续传）。", "知道了");
+        }
+        finally
+        {
+            _provisioningRuntime = false;
         }
     }
 

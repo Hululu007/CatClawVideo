@@ -100,7 +100,7 @@ public static class StartupEnvCheck
     }
 
 #if WINDOWS
-    /// <summary>找可用的 Android SDK 根：优先随包，其次本机。找不到返回 null 并记一条 Fail。</summary>
+    /// <summary>找可用的 Android SDK 根：随包 → 首运下载的 → 本机已装的。都没有返回 null 并记一条 Fail（带一键下载）。</summary>
     private static string? ProbeRuntime(List<EnvCheckItem> items, string baseDir)
     {
         try
@@ -113,18 +113,39 @@ public static class StartupEnvCheck
                 return bundled;
             }
 
+            // 首运下载的运行环境（0.2.6 轻量包：%LOCALAPPDATA%\CatClawVideo\AndroidSdk）
+            if (RuntimeProvisioner.IsProvisioned)
+            {
+                items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Ok, "已下载（本机数据目录）"));
+                return RuntimeProvisioner.TargetRoot;
+            }
+
+            // 有下载痕迹但还没就绪 → 说明上一次下载/解压中断，给出续传提示而不是 Fail
+            if (File.Exists(RuntimeProvisioner.ZipPath) || File.Exists(RuntimeProvisioner.ZipPath + ".part"))
+            {
+                var got = RuntimeProvisioner.ResumedBytes / 1024.0 / 1024;
+                items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Warn,
+                    $"下载未完成（{got:0} / {RuntimeProvisioner.AssetBytes / 1024 / 1024} MB）",
+                    "上次下载中断，继续时会从断点续传",
+                    [new EnvAction("download-runtime", "继续下载")]));
+                return null;
+            }
+
             var home = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Android", "Sdk");
             if (File.Exists(Path.Combine(home, "emulator", "emulator.exe")))
             {
                 items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Info, "本机已装的 Android SDK",
-                    "本安装包自带运行环境；这里用的是机器上已装的那套（模拟器 + AVD 需自行准备）"));
+                    "本安装包不再自带运行环境；这里用的是机器上已装的那套（模拟器 + AVD 需自行准备）。" +
+                    "也可以下载官方配套环境（约 0.9GB）获得开箱即用的体验",
+                    [new EnvAction("download-runtime", "下载配套环境")]));
                 return home;
             }
 
             items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Fail, "未找到",
-                "安装包应当自带「安装目录\\AndroidSdk\\」（模拟器 + 系统镜像 + adb）。" +
-                "缺失说明安装不完整，建议重新运行安装程序"));
+                "jar 爬虫源与网盘源需要一个 Android 运行环境（模拟器 + 系统镜像，约 0.9GB 下载 / 2.6GB 磁盘）。" +
+                "网页源（猫爪源规则）、MacCMS、JS 脚本源不受影响。可先跳过，需要时再来下载",
+                [new EnvAction("download-runtime", "下载运行环境")]));
         }
         catch (Exception ex)
         {

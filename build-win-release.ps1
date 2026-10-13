@@ -219,8 +219,15 @@ if (-not $makepri -or -not (Test-Path $priconfig)) {
 
 # [1.8/2] 随包 Android 环境校验（0.2.5 起安装包自带模拟器 + 系统镜像 + adb）
 # 这一步只做「在不在」的硬校验，不做任何拷贝 —— ISCC 直接按绝对路径收件。
+# ★ 0.2.6 起默认轻量包（运行环境走首运下载，见 build-win-setup.iss 顶部注释）；
+#   只有显式 -BundleRuntime（或环境变量 CATCLAW_BUNDLE_RUNTIME=1）才随包并校验。
 Write-Msg ""
 Write-Msg "[1.8/2] 校验随包 Android 环境..." -Color Yellow
+$BundleRuntime = $env:CATCLAW_BUNDLE_RUNTIME -eq "1"
+if (-not $BundleRuntime) {
+    Write-Msg "  轻量包：运行环境不随包（首运下载）—— 跳过 SDK 校验。要出完整离线包设 CATCLAW_BUNDLE_RUNTIME=1" -Color Cyan
+}
+if ($BundleRuntime) {
 $SdkRoot = ""
 foreach ($c in @($env:CATCLAW_ANDROID_SDK, $env:ANDROID_SDK_ROOT, $env:ANDROID_HOME,
                  (Join-Path $env:LOCALAPPDATA "Android\Sdk"))) {
@@ -264,15 +271,16 @@ $szEmu = [math]::Round(((Get-ChildItem (Join-Path $SdkRoot "emulator") -Recurse 
           Measure-Object Length -Sum).Sum) / 1MB)
 Write-Msg ("  SDK: {0}" -f $SdkRoot) -Color Green
 Write-Msg ("  system.img {0} MB（已精简+重签，digest 参数在案）；emulator {1} MB" -f $szImg, $szEmu) -Color Green
+}   # end: BundleRuntime 校验块
 
 # [2/2] 编译安装程序
 Write-Msg ""
 Write-Msg "[2/2] 编译安装程序（Inno Setup）..." -Color Yellow
 $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
-$isccExit = Invoke-Native -FilePath $IsccPath -Arguments @(
-    "/DMyAppVersion=$ver", "/DMyPublishDir=CatClawVideo.Maui\$OutDir\publish",
-    "/DMyAndroidSdk=$SdkRoot", $IssFile
-) -Label "ISCC 编译"
+$isccArgs = @("/DMyAppVersion=$ver", "/DMyPublishDir=CatClawVideo.Maui\$OutDir\publish")
+if ($BundleRuntime) { $isccArgs += "/DMyAndroidSdk=$SdkRoot"; $isccArgs += "/DMyBundleRuntime=1" }
+$isccArgs += $IssFile
+$isccExit = Invoke-Native -FilePath $IsccPath -Arguments $isccArgs -Label "ISCC 编译"
 if ($isccExit -ne 0) {
     Pause-And-Exit $isccExit
 }

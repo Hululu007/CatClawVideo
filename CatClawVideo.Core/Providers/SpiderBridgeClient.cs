@@ -127,12 +127,25 @@ public static class SpiderBridgeClient
     // image.sysdir.1（相对路径）就是相对它解析的 —— 于是整包自洽，不依赖用户在
     // 机器上装过 Android SDK，也不用改注册表/环境变量（2026-10-12 预检实测）。
 
-    /// <summary>随包 Android SDK 根；未随包（开发机）返回 null，回落本机已装的 SDK。</summary>
+    /// <summary>随包 Android SDK 根；未随包（开发机/轻量包）返回 null，回落本机已装的 SDK。</summary>
     private static string? BundledSdkRoot()
     {
         var d = Path.Combine(AppContext.BaseDirectory, "AndroidSdk");
         return Directory.Exists(Path.Combine(d, "emulator")) ? d : null;
     }
+
+    /// <summary>首运下载的 Android SDK 根（RuntimeProvisioner 解压落点）；未就绪返回 null。
+    /// <para>0.2.6 起安装包不再随带 AndroidSdk，首次使用 jar 源时提示下载到 LOCALAPPDATA ——
+    /// 安装目录（Program Files）普通用户不可写，这里必须跟着 AVD 家目录走。</para></summary>
+    public static string? ProvisionedSdkRoot()
+    {
+        var d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CatClawVideo", "AndroidSdk");
+        return File.Exists(Path.Combine(d, "emulator", "emulator.exe")) ? d : null;
+    }
+
+    /// <summary>实际生效的 Android SDK 根：随包优先，其次首运下载的，null = 都没有（需要引导下载）。</summary>
+    public static string? EffectiveSdkRoot() => BundledSdkRoot() ?? ProvisionedSdkRoot();
 
     /// <summary>随包镜像对应的 AVD 名。刻意与开发用的 catclaw_gapi36 区分开，
     /// 免得装了发行版的用户机器上两个 AVD 撞名、互相覆盖 userdata。</summary>
@@ -228,7 +241,7 @@ public static class SpiderBridgeClient
                 "vm.heapSize = 256M",
             }) + "\r\n", utf8);
 
-            Log?.Invoke("[bridge] 随包环境首次运行：已登记 AVD " + BundledAvdName + " → " + BundledAvdHome());
+            Log?.Invoke("[bridge] 运行环境首次运行：已登记 AVD " + BundledAvdName + " → " + BundledAvdHome());
             return true;
         }
         catch (Exception ex)
@@ -246,6 +259,8 @@ public static class SpiderBridgeClient
         var cands = new List<string?>
         {
             bundledSdk is not null ? Path.Combine(bundledSdk, "platform-tools", "adb.exe") : null,
+            // 首运下载的运行环境（0.2.6 轻量包）：排在随包之后、本机 SDK 之前
+            ProvisionedSdkRoot() is { } pv ? Path.Combine(pv, "platform-tools", "adb.exe") : null,
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "Android", "Sdk", "platform-tools", "adb.exe"),
             Environment.GetEnvironmentVariable("ANDROID_HOME") is { Length: > 0 } h
@@ -305,9 +320,10 @@ public static class SpiderBridgeClient
                 if (serial.Length == 0 && Avd is { Length: > 0 })
                 {
                     // 没设备但有 AVD：拉起模拟器（冷启 ~70s）
-                    // 随包环境优先：emulator.exe 在 {安装目录}\AndroidSdk\emulator\ 下，
-                    // 它的 SDK 根 = 上一级 ⇒ AVD 里那句相对路径 image.sysdir.1 自然指到随包镜像。
-                    var bundled = BundledSdkRoot();
+                    // SDK 根优先级：随包 {安装目录}\AndroidSdk → 首运下载 %LOCALAPPDATA%\CatClawVideo\AndroidSdk
+                    // → 由 adb 路径上溯。emulator.exe 的 SDK 根 = 自己的上一级，AVD 里相对的
+                    // image.sysdir.1 自然指到对应镜像（随包/下载两处布局同构）。
+                    var bundled = EffectiveSdkRoot();
                     var emu = bundled is not null
                         ? Path.Combine(bundled, "emulator", "emulator.exe")
                         : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(adb)!, "..", "emulator", "emulator.exe"));
