@@ -1,4 +1,4 @@
-﻿; 猫爪影视 Windows 安装程序脚本（Inno Setup 6.3+/7）
+; 猫爪影视 Windows 安装程序脚本（Inno Setup 6.3+/7）
 ; 用法: "C:\Users\lvjin\InnoSetup\ISCC.exe" build-win-setup.iss
 ;       或  .\build-win-release.ps1  （一键：publish + 编译安装包）
 ; 打包源: CatClawVideo.Maui\bin\Release\net11.0-windows10.0.26100.0\win-x64\publish（self-contained 绿色目录发布）
@@ -54,7 +54,12 @@ Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescripti
 ;   实测收益：安装包 251.3MB → 238.0MB，**省 13.3MB（5.3%）**。
 ;   ⚠ 另测过再排掉 ThunderRuntime 的 libgtk-3-0/libaom/libSvtAv1Enc-4/libjxl（`-nographic` 看似不用），
 ;     只再多省 7.9MB，而它们在 QEMU 的导入表里、被加载期硬要求，收益不抵风险 ⇒ **不排**。
-Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,*.xml,*.lib,onnxruntime.dll,DirectML.dll,Microsoft.ML.OnnxRuntime.dll,Microsoft.Windows.AI.*"
+; ★ 瘦身批次 2（2026-10-13）：OpenTK.*.dll + Silk.NET.*.dll 是 **libmpv 后端**（GL 上下文 +
+;   D3D11 互操作）的独占依赖，而 mpv-2.dll 自 0.2.5 起已不随包 ⇒ MpvBackendAvailable() 恒为
+;   false，SetSourceWithDetectionAsync 里的 `MpvBackendAvailable() && (...)`
+;   短路求值永远不会走到 DolbyVisionDetector/ActivateMpv。
+;   取证：运行中的宿主进程模块表里**没有**任何 OpenTK/Silk.NET/mpv 条目。原始约 40MB。
+Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pdb,*.xml,*.lib,onnxruntime.dll,DirectML.dll,Microsoft.ML.OnnxRuntime.dll,Microsoft.Windows.AI.*,OpenTK.*.dll,Silk.NET.*.dll"
 ; ★ 瘦身批次 1（2026-09-29，在 csproj 侧 Content Remove，不占本文件 Excludes）：
 ;   QemuGuest\qemu-system-x86_64.exe（24.3MB）——x86 mini guest 实验专用，三件套校验
 ;   本就过不了（x86guest\ 内核+initrd 未随包），运行时安全回落宿主 JRE 桥。
@@ -86,9 +91,23 @@ Source: "installer\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinsta
 ; ═══════════════════════════════════════════════════════════════════════════
 
 ; 模拟器本体（已剔除非 x86_64 的 qemu 引擎，1033MB → 663MB）
+; ★ 瘦身批次 2（2026-10-13，实测取证）：应用始终以 -no-window 拉起模拟器，此时**实际跑的是
+;   qemu-system-x86_64-headless**，整个 Qt UI 栈根本不被加载。取证方法：模拟器起来后 dump
+;   进程模块表 —— emulator.exe + qemu-system-x86_64-headless 一共只加载 132MB，且**没有任何
+;   进程加载过 lib64\qt\ 里的任何一个 DLL**。据此排除下列四项（原始 376MB）：
+;     · lib64\qt\*                        243.0MB  Qt UI（含 116MB 的 Qt6WebEngineCoreAndroidEmu）
+;     · qemu\windows-x86_64\qemu-system-x86_64.exe  62.9MB  只跑 -headless 那个
+;     · lib64\vulkan\libvulkan_lvp.dll     48.4MB  软件 Vulkan（走的是 vk_swiftshader）
+;     · lib64\gles_angle\*                 22.1MB  ANGLE（-gpu swiftshader_indirect 不走它）
+;   裁剪后模拟器目录 663MB → 207MB。**起机实测通过**：用裁掉这四项的树单起一个 AVD，
+;   81 秒 boot_completed=1，ro.dalvik.vm.native.bridge=libndk_translation.so 正常。
+;   ⚠ 刻意**不**排除 netsimd.exe / nimble_bridge.exe（32MB）：它们是模拟 WiFi/BT 的网络仿真，
+;     而 jar 爬虫要在 guest 里真联网取站点数据 —— 为 10MB 上下的压缩收益赌网络栈不划算。
+;   ⚠ 排除项必须靠模块表取证，不能靠"看着像没用"：gles_swiftshader、vk_swiftshader、
+;     libgfxstream_backend、libandroid-emu-* 都在加载表里，动不得。
 Source: "{#MyAndroidSdk}\emulator\*"; DestDir: "{app}\AndroidSdk\emulator"; \
   Flags: ignoreversion recursesubdirs createallsubdirs; \
-  Excludes: "*.orig,drivers\*,include\*,qsn.exe,emulator-check.exe"
+  Excludes: "*.orig,drivers\*,include\*,qsn.exe,emulator-check.exe,lib64\qt\*,lib64\gles_angle\*,lib64\vulkan\libvulkan_lvp.dll,qemu\windows-x86_64\qemu-system-x86_64.exe"
 ; adb 三件套（platform-tools 里其余是 fastboot 等，桌面端用不到）
 Source: "{#MyAndroidSdk}\platform-tools\adb.exe"; DestDir: "{app}\AndroidSdk\platform-tools"; Flags: ignoreversion
 Source: "{#MyAndroidSdk}\platform-tools\AdbWinApi.dll"; DestDir: "{app}\AndroidSdk\platform-tools"; Flags: ignoreversion

@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Diagnostics;
 using System.Security.Cryptography;
@@ -653,14 +653,31 @@ public class JavaSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderAct
             _ = DiagnoseGuestPortsAsync(ct);
             return raw.Replace("127.0.0.1:6678", "127.0.0.1:" + art2.ProxyTunnelPort);
         }
-        // GoProxy（pvideo）流地址（2026-10-03）：playerContent 返回 127.0.0.1:5266/fishplay/…
-        // 与同端口的 fishdanmu 弹幕地址 —— pvideo 在 guest 里只绑回环，宿主播放器直接连必死
-        // （「源不受支持」）。全部换成宿主 GoProxy 隧道端口（hostfwd → guest 25266 → tcpfwd → 5266）。
-        if (ArtGuestMode && raw.Contains("127.0.0.1:5266") && _art is { GoProxyTunnelPort: > 0 } art3)
+        // GoProxy（pvideo）流地址：playerContent 返回 127.0.0.1:5266/fishplay/… 与同端口的
+        // fishdanmu 弹幕地址 —— pvideo 只绑**运行时内部**回环，宿主播放器直连自己的 5266 必死
+        // （tcp -138 → 回落 MF → 「源不受支持」）。隧道有两处来源，按当下实际在役的运行时选：
+        //   ① QEMU ART guest 在役（_art 非空）→ 它的 hostfwd → guest 25266 → tcpfwd → 5266；
+        //   ② 外置 Android 桥接管（_art 为 null）→ adb forward 宿主 18621 → 桥内 5266。
+        // ⚠ 判据必须是 **_art 是否为 null**，不能是 ArtGuestMode：桥接管后 ArtGuestMode 仍为
+        //   true（x86 资产 + WHPX 都在，只是没起 QEMU），用 ArtGuestMode 会整条不触发
+        //   （2026-10-13 实测：兰香如故（臻彩）等夸克原画源因此一直播不了）。
+        if (raw.Contains("127.0.0.1:5266"))
         {
-            Log($"{site.Name}: GoProxy 流地址改写 5266 → {art3.GoProxyTunnelPort}（url+danmaku）");
-            _ = DiagnoseGuestPortsAsync(ct);
-            return raw.Replace("127.0.0.1:5266", "127.0.0.1:" + art3.GoProxyTunnelPort);
+            var qemuGoProxyPort = _art is { GoProxyTunnelPort: > 0 } ? _art.GoProxyTunnelPort : 0;
+            if (qemuGoProxyPort > 0)
+            {
+                Log($"{site.Name}: GoProxy 流地址改写 5266 → {qemuGoProxyPort}（ART guest；url+danmaku）");
+                _ = DiagnoseGuestPortsAsync(ct);
+                return raw.Replace("127.0.0.1:5266", "127.0.0.1:" + qemuGoProxyPort);
+            }
+            var goBase = await CatClawVideo.Core.Providers.SpiderBridgeClient
+                .EnsureGoProxyBaseAsync(ct).ConfigureAwait(false);
+            if (goBase is not null && Uri.TryCreate(goBase, UriKind.Absolute, out var goUri))
+            {
+                Log($"{site.Name}: GoProxy 流地址改写 5266 → {goUri.Port}（外置桥 adb forward；url+danmaku）");
+                return raw.Replace("127.0.0.1:5266", "127.0.0.1:" + goUri.Port);
+            }
+            Log($"{site.Name}: GoProxy 隧道不可用，5266 地址原样返回（播放大概率失败）");
         }
         return raw;
     }

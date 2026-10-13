@@ -372,7 +372,12 @@ public static class SpiderBridgeClient
                     if (File.Exists(apk))
                     {
                         Log?.Invoke("[bridge] 桥 APK 未安装 → 自动安装（" + apk + "）");
-                        var ins = Run(adb, $"-s {serial} install -r \"{apk}\"", 180000);
+                        // ★ -g：安装时一次授予该 APK 声明的**全部运行时权限**。
+                        //   桥声明了 POST_NOTIFICATIONS（前台服务通知用），不加 -g 时
+                        //   发行版首装会弹一次系统权限对话框 —— 而这一步发生在启动流程里
+                        //   （用户还没看到界面），弹窗体验很差。加了 -g 静默通过。
+                        //   （2026-10-13 在 TVBox 上验证过同一套做法的效果。）
+                        var ins = Run(adb, $"-s {serial} install -g -r \"{apk}\"", 180000);
                         Log?.Invoke(ins.Out.Contains("Success", StringComparison.OrdinalIgnoreCase)
                             ? "[bridge] 桥 APK 安装成功"
                             : "[bridge] 桥 APK 安装失败：" + ins.Out.Trim());
@@ -646,6 +651,38 @@ public static class SpiderBridgeClient
         Log?.Invoke($"[bridge] proxy tunnel tcp:{HostProxyTunnelPort} → 桥内 {DeviceProxyPort}");
         ProxyBase = $"http://127.0.0.1:{HostProxyTunnelPort}";
         return ProxyBase;
+    }
+
+    /// <summary>桥内 GoProxy（pvideo）流服务的设备侧端口。
+    /// <para>fish 壳的 <c>playerContent</c> 会把「夸克原画/VIP」这类直连流构造成
+    /// <c>http://127.0.0.1:5266/fishplay/go/…</c>（同端口的 <c>fishdanmu</c> 弹幕亦然）——
+    /// pvideo 只绑**设备内**回环，宿主播放器直连自己的 5266 必死
+    /// （FFmpeg <c>Connection to tcp://127.0.0.1:5266 failed: -138</c> → 回落原生 MF
+    /// → 播放器「源不受支持（视频编码或容器格式不兼容）」）。</para></summary>
+    public const int DeviceGoProxyPort = 5266;
+    /// <summary>宿主侧映射端口（adb forward tcp:18621 → 桥内 5266）。</summary>
+    public const int HostGoProxyTunnelPort = 18621;
+
+    private static string? _goProxyBase;
+
+    /// <summary>确保桥内 GoProxy（5266）流服务可达（adb forward），返回宿主侧基址；失败 null。
+    /// <para>与 <see cref="EnsureProxyBaseAsync"/> 同理：QEMU 时代这条隧道由 guest 内 init 的
+    /// <c>tcpfwd</c>（25266 → 5266）+ 宿主 hostfwd 供；换成外置 Android 桥后必须由 adb 补上。</para></summary>
+    public static async Task<string?> EnsureGoProxyBaseAsync(CancellationToken ct = default)
+    {
+        if (_goProxyBase is not null) return _goProxyBase;
+        if (!await EnsureReadyAsync(ct).ConfigureAwait(false)) return null;
+        var adb = FindAdb();
+        if (adb is null || Serial is null) return null;
+        Run(adb, $"-s {Serial} forward --remove tcp:{HostGoProxyTunnelPort}", 8000);
+        var fr = Run(adb, $"-s {Serial} forward tcp:{HostGoProxyTunnelPort} tcp:{DeviceGoProxyPort}", 8000);
+        if (fr.Code != 0)
+        {
+            Log?.Invoke($"[bridge] GoProxy forward 失败：{fr.Out}");
+            return null;
+        }
+        Log?.Invoke($"[bridge] GoProxy tunnel tcp:{HostGoProxyTunnelPort} → 桥内 {DeviceGoProxyPort}");
+        return _goProxyBase = $"http://127.0.0.1:{HostGoProxyTunnelPort}";
     }
 
     /// <summary>Guard 加解密（op = "guard-decrypt" | "guard-encrypt"）：FishConfig 的扫码链路

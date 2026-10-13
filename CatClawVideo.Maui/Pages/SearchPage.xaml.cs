@@ -1332,6 +1332,20 @@ _searchCts?.Cancel();
             var gate = new object();
             var doneCount = 0;
             var failCount = 0;   // 失败站点计数（用于限流日志）
+            var okCount = 0;     // 成功站点计数（真的有结果回来的站）
+
+            // 站点明细文案（结果行与进度行共用）：
+            //   成功 = 有结果回来；无结果 = 正常应答但 0 条；失败 = 抛异常/超时。
+            // <paramref name="done"/> &lt; 0 表示该路径拿不到「已完成」口径（桥内聚合只回
+            //   「有结果的站」与「出错的站」，0 条的站不发事件）→ 省略无结果/未完成两项。
+            string SiteStats(int total, int ok, int fail, int done)
+            {
+                var text = $"成功 {ok} 站";
+                if (done >= 0) text += $" · 无结果 {Math.Max(0, done - ok - fail)} 站";
+                text += $" · 失败 {fail} 站";
+                if (done >= 0 && done < total) text += $" · 未完成 {total - done} 站";
+                return $"{text}（共 {total} 站）";
+            }
 
             // ── 并发上限 ──
             //
@@ -1397,6 +1411,23 @@ _searchCts?.Cancel();
                     var jarKeys = jarSites.Select(x => x.Site.Key).ToHashSet();
                     var rest = sites.Where(x => !jarKeys.Contains(x.Key)).ToList();
                     var batchOk = false;
+                    // 桥内三口径（要在 try 外可见：汇总行在 catch 之后才拼）：
+                    //   okSites = 有结果回来的站；batchEmpty = 正常回但 0 条的站；batchFail = ev.error 的站。
+                    //   桥侧 BridgeService.searchBatch 对**每个站**必发一条 ev=search（result 或 error），
+                    //   所以三者相加 = 已回报站数，能与「共 N 站」对齐（此前只报 ok/fail，36/98 看着像丢数据）。
+                    var okSites = 0;
+                    var batchEmpty = 0;
+                    var batchFail = 0;
+
+                    // 桥内汇总行（全程统一用它：20s 收工前后文案不跳变，且三档计数是**活的** ——
+                    // 晚到的站回报时「未完成」会自动减少、结果数与站点数一起涨）。
+                    string BatchSummary()
+                    {
+                        var stats = SiteStats(jarSites.Count, okSites, batchFail, okSites + batchEmpty + batchFail);
+                        return _sourceResults.Count > 0
+                            ? $"「{kw}」找到 {_sourceResults.Count} 个结果 · {stats}"
+                            : $"未找到与「{kw}」相关的内容 · {stats}";
+                    }
                     try
                     {
                         var batchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -1404,7 +1435,6 @@ _searchCts?.Cancel();
                         // 事件流：桥按站回推 ev=search，全部结束回 ev=search-done
                         var siteByKey = jarSites.ToDictionary(x => x.Site.Key, x => x.Site);
                         var doneTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                        var okSites = 0;
                         Action<System.Text.Json.Nodes.JsonObject> onEv = ev =>
                         {
                             var evName = ev["ev"]?.GetValue<string>() ?? "";
@@ -1412,11 +1442,24 @@ _searchCts?.Cancel();
                             if (evName != "search") return;
                             var k = ev["site"]?.GetValue<string>() ?? "";
                             if (!siteByKey.TryGetValue(k, out var site)) return;
-                            if (ev["error"] is not null) return;   // 该站失败：不产生结果，也不影响别的站
+                            if (ev["error"] is not null)
+                            {
+                                System.Threading.Interlocked.Increment(ref batchFail);
+                                return;   // 该站失败：不产生结果，也不影响别的站
+                            }
                             var resultJson = ev["result"]?.GetValue<string>() ?? "";
-                            if (resultJson.Length == 0) return;
+                            if (resultJson.Length == 0)
+                            {
+                                System.Threading.Interlocked.Increment(ref batchEmpty);
+                                return;
+                            }
                             var items = CatClawVideo.Core.Providers.SpiderJsonParser.ParseItems(resultJson, k);
-                            if (items.Count == 0) return;
+                            if (items.Count == 0)
+                            {
+                                // 正常应答但 0 条：算「无结果」站（不是失败）——汇总行的三档才加得起来
+                                System.Threading.Interlocked.Increment(ref batchEmpty);
+                                return;
+                            }
                             System.Threading.Interlocked.Increment(ref okSites);
                             foreach (var it in items) { it.SiteName = site.Name; it.Category ??= site.Name; }
                             List<VodItem> addedBatch;
@@ -1424,7 +1467,9 @@ _searchCts?.Cancel();
                             MainThread.BeginInvokeOnMainThread(() =>
                             {
                                 ApplySiteFilter();
-                                StatusLabel.Text = $"「{kw}」已找到 {_sourceResults.Count} 个结果…（{site.Name} +{items.Count}）";
+                                // 统一用汇总 + 「刚补入哪一站」：桥内是流式回推，20s 收工**之后**
+                                // 慢站的结果还会继续走这里上屏，文案格式保持一致就不会看着像"重搜了"。
+                                StatusLabel.Text = BatchSummary() + $" · 刚补入 {site.Name} +{items.Count}";
                                 CoverResolver.Attach(_covers, addedBatch);
                             });
                         };
@@ -1435,15 +1480,27 @@ _searchCts?.Cancel();
                                 .StartBatchSearchAsync(kw, jarSites.Select(x => (x.Site.Key, x.ClassName, x.Ext, x.Jar)), 24, ct);
                             if (started)
                             {
-                                // 桥侧单站 25s 熔断 ⇒ 40s 内必然收尾；到点也收工（结果早已流式上屏）
-                                // 20s 收工：结果早已流式上屏，没必要等满（桥侧单站 25s 熔断，
-                                // 但用户此刻多半已经在看结果了；剩余站点的结果仍会到达并上屏）。
-                                var doneTask = await Task.WhenAny(doneTcs.Task, Task.Delay(20000, ct));
+                                // 20s 只是「先把已有结果交给用户」，**不是**「批次已结束」：
+                                // 实测 20s 到点时桥内 done=False 是常态（98 站 / 24 并发还在跑最后几批）。
+                                // ★ 收工不收线：这里不摘监听，剩余站的结果继续走 onEv 追加到列表；
+                                //   收尾交给 CloseBridgeSearchListenerLaterAsync（search-done / 共 60s / 本次被取消）。
+                                //   （原实现在 finally 里无条件 SearchEvent=null，与注释「剩余站点的结果仍会
+                                //   到达并上屏」相悖 —— 晚到的结果其实全被丢了。）
+                                await Task.WhenAny(doneTcs.Task, Task.Delay(20000, ct));
                                 batchOk = true;
-                                DiagLog.Write($"[搜索] 桥内聚合完成：{jarSites.Count} 站提交，{okSites} 站有结果（done={doneTcs.Task.IsCompleted}）");
+                                DiagLog.Write($"[搜索] 桥内聚合 20s 收工：{jarSites.Count} 站提交，" +
+                                    $"{okSites} 站有结果 / {batchEmpty} 站无结果 / {batchFail} 站失败" +
+                                    $"（桥内跑完={doneTcs.Task.IsCompleted}，其余站继续收）");
+                                _ = CloseBridgeSearchListenerLaterAsync(onEv, doneTcs.Task, ct);
                             }
                         }
-                        finally { CatClawVideo.Core.Providers.SpiderBridgeClient.SearchEvent = null; }
+                        finally
+                        {
+                            // ★ 只在**批次没跑起来**（未启动/抛异常）时摘监听 —— 那种情况要落回下面的
+                            //   逐站路径，留着旧处理器会让两轮结果串台。正常收工走上面的「收工不收线」。
+                            if (!batchOk && ReferenceEquals(CatClawVideo.Core.Providers.SpiderBridgeClient.SearchEvent, onEv))
+                                CatClawVideo.Core.Providers.SpiderBridgeClient.SearchEvent = null;
+                        }
                     }
                     catch (Exception bex)
                     {
@@ -1451,12 +1508,9 @@ _searchCts?.Cancel();
                     }
                     if (batchOk && rest.Count == 0)
                     {
-                        MainThread.BeginInvokeOnMainThread(() =>
-                        {
-                            StatusLabel.Text = _sourceResults.Count > 0
-                                ? $"「{kw}」找到 {_sourceResults.Count} 个结果（{sites.Count} 个站点）"
-                                : $"未找到与「{kw}」相关的内容";
-                        });
+                        // 先按「此刻已回报的站」结一次账（已回报 = 有结果 + 无结果 + 失败，差额报成未完成）。
+                        // ★ 这不是终值：监听还开着，慢站的结果继续补，BatchSummary() 会被 onEv 再刷。
+                        MainThread.BeginInvokeOnMainThread(() => StatusLabel.Text = BatchSummary());
                         return;
                     }
                     // 聚合成功但还有非 jar 站：继续走下面的逐站路径（rest）；聚合失败：全量走逐站（sites）
@@ -1506,6 +1560,7 @@ _searchCts?.Cancel();
                         return;
                     }
                     _slowEmpty.TryRemove(site.Key, out _);
+                    Interlocked.Increment(ref okCount);   // 有结果回来才算「成功站」
 
                     // 跨站聚合：每条结果标出来源站（卡片左下角站点角标，方便同片多站时挑源）
                     foreach (var it in items) { it.SiteName = site.Name; it.Category ??= site.Name; }
@@ -1550,9 +1605,10 @@ _searchCts?.Cancel();
                     MainThread.BeginInvokeOnMainThread(() =>
                     {
                         if (!_searching) return;
+                        var stats = SiteStats(sites.Count, okCount, failCount, n);
                         StatusLabel.Text = _sourceResults.Count > 0
-                            ? $"「{kw}」已找到 {_sourceResults.Count} 个结果 · 已完成 {n}/{sites.Count} 个站点"
-                            : $"正在搜索「{kw}」… {n}/{sites.Count} 个站点已响应";
+                            ? $"「{kw}」已找到 {_sourceResults.Count} 个结果 · {stats}"
+                            : $"正在搜索「{kw}」… {stats}";
                     });
                 }
             }).ToArray();
@@ -1622,9 +1678,10 @@ _searchCts?.Cancel();
 
             MainThread.BeginInvokeOnMainThread(() =>
             {
+                var stats = SiteStats(sites.Count, okCount, failCount, doneCount);
                 StatusLabel.Text = _sourceResults.Count > 0
-                    ? $"「{kw}」找到 {_sourceResults.Count} 个结果（{sites.Count} 个站点）"
-                    : $"未找到与「{kw}」相关的内容";
+                    ? $"「{kw}」找到 {_sourceResults.Count} 个结果 · {stats}"
+                    : $"未找到与「{kw}」相关的内容 · {stats}";
             });
         }
         catch
@@ -1641,6 +1698,31 @@ _searchCts?.Cancel();
                 ((Command)SearchCommand).ChangeCanExecute();
             }
         }
+    }
+
+    /// <summary>
+    /// 桥内聚合的「收工不收线」收尾：20s 早退只是把**已有结果**先交给用户，桥内剩余站还在跑
+    /// （实测 20s 到点时桥内 <c>done=False</c> 是常态），必须继续收它们的 <c>ev=search</c>，
+    /// 晚到的结果才能补上屏 —— 原实现在 finally 里无条件 <c>SearchEvent=null</c>，
+    /// 与注释「剩余站点的结果仍会到达并上屏」相悖，实际上是把慢站结果直接丢了。
+    ///
+    /// <para>结束条件（谁先到算谁）：桥回 <c>search-done</c> / 距本轮开始共 60s（20s + 40s）/
+    /// 本次搜索被取消（离开页面或重新搜索）。</para>
+    ///
+    /// <para>⚠ 只清**自己那个**处理器：新一轮搜索会覆盖 <c>SearchEvent</c>，不能被本轮的后台任务误清。</para>
+    /// </summary>
+    private static async Task CloseBridgeSearchListenerLaterAsync(
+        Action<System.Text.Json.Nodes.JsonObject> handler, Task searchDone, CancellationToken ct)
+    {
+        try
+        {
+            // 20s 已经等过，这里再给慢站 40s（合计 60s 硬顶 —— 桥内单站 25s 熔断，正常早就收完）
+            await Task.WhenAny(searchDone, Task.Delay(TimeSpan.FromSeconds(40), ct))
+                .ConfigureAwait(false);
+        }
+        catch { /* 取消即收线 */ }
+        if (ReferenceEquals(CatClawVideo.Core.Providers.SpiderBridgeClient.SearchEvent, handler))
+            CatClawVideo.Core.Providers.SpiderBridgeClient.SearchEvent = null;
     }
 
     // ═══════════════════════ 站点筛选 ═══════════════════════
