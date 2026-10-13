@@ -36,14 +36,20 @@ public static class RuntimeProvisioner
     /// <summary>下载+解压+AVD 展开的磁盘需求（zip 本体 + 解压内容 + 模拟器首启 scratch 余量）。</summary>
     public static long RequiredFreeBytes => AssetBytes + UnpackedBytes + (2L << 30);
 
-    /// <summary>下载落点与解压目标都在 LOCALAPPDATA 应用目录下。</summary>
-    private static string LocalRoot => CatClawVideo.Core.AppPaths.LocalRoot;
+    /// <summary>下载落点与解压目标都在 LOCALAPPDATA 应用目录下。
+    /// <para>⚠ <b>刻意不跟 AppPaths.LocalRoot 的 Debug 后缀</b>：这是「跨 Debug/Release 共用的一份运行时」，
+    /// 与 AVD 家目录（SpiderBridgeClient.BundledAvdHome 同样是 <c>CatClawVideo</c> 不带后缀）保持一致 ——
+    /// 否则 Debug 包解压到 <c>CatClawVideo.debug\AndroidSdk</c>，而宿主按 <c>CatClawVideo\AndroidSdk</c> 找，
+    /// 下完却用不上；开发时也会白白多下一份 0.9GB。</para></summary>
+    private static string RuntimeRoot => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "CatClawVideo");
 
     /// <summary>下载中的 zip 落点（.part 后缀由本类自己管理，便于断点续传）。</summary>
-    public static string ZipPath => Path.Combine(LocalRoot, "runtime", "catclaw-android-runtime-win64.zip");
+    public static string ZipPath => Path.Combine(RuntimeRoot, "runtime", "catclaw-android-runtime-win64.zip");
 
     /// <summary>解压目标 SDK 根（与 SpiderBridgeClient.ProvisionedSdkRoot 同一处）。</summary>
-    public static string TargetRoot => Path.Combine(LocalRoot, "AndroidSdk");
+    public static string TargetRoot => Path.Combine(RuntimeRoot, "AndroidSdk");
 
     /// <summary>运行环境是否已就绪（随包目录或已下载解压的目录均可）。</summary>
     public static bool IsProvisioned =>
@@ -71,7 +77,7 @@ public static class RuntimeProvisioner
         Directory.CreateDirectory(Path.GetDirectoryName(ZipPath)!);
 
         // ── 磁盘预检：下载 0.94GB + 解压 2.6GB + 模拟器首启 scratch 2GB 余量 ──
-        var drive = new DriveInfo(Path.GetPathRoot(LocalRoot)!);
+        var drive = new DriveInfo(Path.GetPathRoot(RuntimeRoot)!);
         if (drive.AvailableFreeSpace < RequiredFreeBytes)
             throw new IOException($"磁盘空间不足：{drive.AvailableFreeSpace / 1024 / 1024 / 1024:0.#} GB 可用，" +
                                   $"本步骤需要约 {(AssetBytes + UnpackedBytes) / 1024 / 1024 / 1024:0.#} GB（另留模拟器运行余量）");
