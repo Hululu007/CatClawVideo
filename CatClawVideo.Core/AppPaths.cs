@@ -37,6 +37,42 @@ public static class AppPaths
     public static string LocalRoot { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), FolderName);
 
+    /// <summary>
+    /// 运行环境（Android SDK + 下载缓存）的落点：**与程序同目录**
+    /// （<c>{程序目录}\AndroidSdk</c>、<c>{程序目录}\runtime\*.zip</c>）。
+    /// <para>2026-10-15 用户要求：运行环境就在程序旁边一份，**只启动与程序同位置的镜像** ——
+    /// 绿色版/Debug 都是就地一份，整体拷贝或删除即可，也不再去用机器上装的 Android SDK
+    /// （那套曾让程序悄悄跑起 Android Studio 的模拟器）。</para>
+    /// <para>程序目录不可写时（装在 Program Files 且非管理员）退回 <c>%LOCALAPPDATA%\CatClawVideo</c>，
+    /// 此时 <see cref="RuntimeRootIsPortable"/> 为 false，自检会写明实际位置。</para>
+    /// </summary>
+    public static string RuntimeRoot => RuntimeRootProbe.Root;
+
+    /// <summary>运行环境是不是就在程序目录里（false = 程序目录不可写，已退回用户数据目录）。</summary>
+    public static bool RuntimeRootIsPortable => RuntimeRootProbe.Portable;
+
+    private static readonly (string Root, bool Portable) RuntimeRootProbe = ProbeRuntimeRoot();
+
+    private static (string Root, bool Portable) ProbeRuntimeRoot()
+    {
+        var exeDir = AppContext.BaseDirectory.TrimEnd(
+            Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        try
+        {
+            // 写一次探测文件：能写才把 2.6GB 运行环境放在程序目录旁
+            var probe = Path.Combine(exeDir, ".catclaw-write-probe");
+            File.WriteAllText(probe, "1");
+            File.Delete(probe);
+            return (exeDir, true);
+        }
+        catch
+        {
+            return (Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CatClawVideo"), false);
+        }
+    }
+
     /// <summary>旧版本（未按配置隔离）的共享数据目录：<c>%APPDATA%\CatClawVideo</c>，仅用于首次迁移。</summary>
     public static string LegacyDataDir { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CatClawVideo");

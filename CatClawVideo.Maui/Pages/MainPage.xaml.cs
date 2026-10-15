@@ -54,6 +54,12 @@ public partial class MainPage : ContentPage, IRemoteKeyHandler
         _vm.TabChanged += OnTabChanged;
         _theme.Applied += UpdateNavTabs;
 
+        // 启动门禁：运行环境没就绪时禁用顶栏（tab + 搜索）并把人按回首页 ——
+        // 用户要求「没环境就不让启动」。首页自检装好后会自动解禁。
+        Services.StartupGate.Changed += reason =>
+            MainThread.BeginInvokeOnMainThread(() => ApplyStartupGate(reason));
+        ApplyStartupGate(Services.StartupGate.BlockReason);
+
         // 安全区 padding（Android 透明状态栏/手势条下内容避开系统栏）
         ApplySafeAreaPadding();
 
@@ -502,7 +508,30 @@ public partial class MainPage : ContentPage, IRemoteKeyHandler
 
     private void OnTabTapped(object? sender, TappedEventArgs e)
     {
+        if (Services.StartupGate.IsBlocked) return;      // 门禁期间顶栏不可用
         _vm.SelectTab(TabIndexOf(sender));
+    }
+
+    /// <summary>
+    /// 运行环境没就绪 → 顶栏整体禁用（tab 与搜索入口置灰、不可点），并把当前页按回首页。
+    /// <para>配合首页遮罩「不淡出」，效果就是：没环境时进不去任何页面，只有自检面板上的
+    /// 下载/本地安装按钮可用（2026-10-15 用户要求）。装好后自检重跑会自动解禁。</para>
+    /// </summary>
+    private void ApplyStartupGate(string reason)
+    {
+        var blocked = reason.Length > 0;
+        try
+        {
+            NavTabs.IsEnabled = !blocked;
+            NavTabs.Opacity = blocked ? 0.4 : 1.0;
+            TopSearchBox.IsEnabled = !blocked;
+            TopSearchBox.Opacity = blocked ? 0.4 : 1.0;
+            if (blocked && _vm.SelectedTabIndex != 0) _vm.SelectTab(0);
+        }
+        catch (Exception ex)
+        {
+            DiagLog.Write($"[gate] 顶栏门禁应用失败：{ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     /// <summary>顶栏搜索入口 → 搜索页</summary>

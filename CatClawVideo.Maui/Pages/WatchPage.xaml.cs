@@ -2816,6 +2816,9 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         catch { }
     }
 
+    /// <summary>主区上边距的原值（首次进全屏时记下，退出时还原）。</summary>
+    private Thickness? _mainAreaMargin;
+
     /// <summary>选集栏的宿主容器（在「主区右列」与「全屏浮层」之间切换）。</summary>
     private enum SidebarHost { Inline, Overlay }
 
@@ -2883,6 +2886,15 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         RecommendHint.IsVisible = !on;
         ContentStack.Padding = on ? new Thickness(0) : NormalContentPadding;
         ControlBar.IsFullscreen = on;
+
+        // 全屏时把「切换线路」整行**直接隐藏**（2026-10-15 用户要求），并清掉主区上边距：
+        //   ① 它占的那一行会在画面上方留出一条背景色空带，视频顶不到屏幕上沿；
+        //   ② ⚠ 只切"可见性/边距"，**绝不碰播放器宿主树** —— 上一版把这一行搬进 PlayerHost，
+        //      平台视频视图（交换链）在切全屏后沿用旧宽高，画面缩成左上角一小块（已回退）。
+        //   非全屏时它照旧显示（切线路就在那儿）。
+        RouteBar.IsVisible = !on;
+        if (_mainAreaMargin is null) _mainAreaMargin = MainArea.Margin;
+        MainArea.Margin = on ? new Thickness(0) : _mainAreaMargin.Value;
 
         // 全屏时禁用滚动：播放器被撑到整屏高（ApplyPlayerHeight），而它外面套着 ScrollView，
         // 内容高度略超视口时滚轮/手指就能把它滚出去，露出视频以外的空白

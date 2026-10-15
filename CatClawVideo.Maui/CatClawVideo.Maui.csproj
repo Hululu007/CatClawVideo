@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<TargetFrameworks>net11.0-android</TargetFrameworks>
@@ -16,8 +16,8 @@
 
 		<ApplicationTitle>猫爪影视</ApplicationTitle>
 		<ApplicationId>com.catclaw.video</ApplicationId>
-		<ApplicationDisplayVersion>0.2.5</ApplicationDisplayVersion>
-		<ApplicationVersion>8</ApplicationVersion>
+		<ApplicationDisplayVersion>0.3.0</ApplicationDisplayVersion>
+		<ApplicationVersion>10</ApplicationVersion>
 
 		<!-- Android 打包：禁用快速部署，避免 FastDev 状态冲突（同 CatClawMusic 实测结论） -->
 		<AndroidUseFastDeployment>false</AndroidUseFastDeployment>
@@ -361,11 +361,11 @@
              CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
-  <!-- ★ 外置 Android 桥接管后，QEMU ART guest 彻底退役：`QemuGuest/` 有 **1606 MB**
-       （占整个输出目录 1812MB 的 89%），而它只在「桥不可用」时才被当回退拉起。
-       发行版不带它 ⇒ 安装包从 ~1.8GB 降到 ~200MB，且从根上不可能回落 QEMU。
-       Debug 仍保留（便于排查），Release 排除。 -->
-  <ItemGroup Condition="'$(Configuration)' == 'Release'">
+  <!-- ★ QEMU 整线退役（2026-10-15 用户决定：全走「外置 Android 桥 + 随包模拟器」方案）。
+       `QemuGuest/` 有 **1606 MB**（占输出目录 89%），只在「桥不可用」时才被当回退拉起 ——
+       现在 **Debug 也不带**，开发机与发行版同一条链路，不会再出现"外置桥失败偷偷起 QEMU"；
+       Debug 输出因此从 1.8GB 降到 ~200MB。源码目录保留，只是不进任何产物。 -->
+  <ItemGroup>
     <Content Remove="QemuGuest\**" />
     <None Remove="QemuGuest\**" />
   </ItemGroup>

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace CatClawVideo.Maui.Services;
@@ -116,36 +117,58 @@ public static class StartupEnvCheck
             // 首运下载的运行环境（0.2.6 轻量包：%LOCALAPPDATA%\CatClawVideo\AndroidSdk）
             if (RuntimeProvisioner.IsProvisioned)
             {
-                items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Ok, "已下载（本机数据目录）"));
+                items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Ok,
+                    CatClawVideo.Core.AppPaths.RuntimeRootIsPortable ? "与程序同目录" : "已下载（用户数据目录）"));
                 return RuntimeProvisioner.TargetRoot;
             }
 
-            // 有下载痕迹但还没就绪 → 说明上一次下载/解压中断，给出续传提示而不是 Fail
-            if (File.Exists(RuntimeProvisioner.ZipPath) || File.Exists(RuntimeProvisioner.ZipPath + ".part"))
+            // 有下载痕迹但还没就绪 → 上一次下载/解压中断（也可能是用户自己放了份完整包），
+            // 给续传/安装提示而不是 Fail
+            var cachedZip = RuntimeProvisioner.CachedZipBytes;
+            var partZip = RuntimeProvisioner.ResumedBytes;
+            if (cachedZip > 0 || partZip > 0)
             {
-                var got = RuntimeProvisioner.ResumedBytes / 1024.0 / 1024;
-                items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Warn,
-                    $"下载未完成（{got:0} / {RuntimeProvisioner.AssetBytes / 1024 / 1024} MB）",
-                    "上次下载中断，继续时会从断点续传",
-                    [new EnvAction("download-runtime", "继续下载")]));
+                if (cachedZip >= RuntimeProvisioner.AssetBytes)
+                {
+                    items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Warn,
+                        "安装包已就绪，尚未解压",
+                        $"本地已有一份完整安装包（{cachedZip / 1024 / 1024} MB），点「立即安装」解压即可",
+                        [new EnvAction("install-cached-runtime", "立即安装")]));
+                }
+                else if (partZip >= RuntimeProvisioner.AssetBytes)
+                {
+                    // .part 已经 100%：0.2.6 曾在这里死锁（补发 Range 被 416 顶回，且永不落名），
+                    // 现在点一下就能走完收尾，不会重下。
+                    items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Warn,
+                        "安装包已下载完成，待收尾",
+                        $"缓存里那份包已经下满（{partZip / 1024 / 1024} MB），点「继续安装」完成校验与解压即可，不会重新下载",
+                        [new EnvAction("download-runtime", "继续安装")]));
+                }
+                else
+                {
+                    var got = Math.Max(partZip, cachedZip) / 1024.0 / 1024;
+                    items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Warn,
+                        $"下载未完成（{got:0} / {RuntimeProvisioner.AssetBytes / 1024 / 1024} MB）",
+                        "上次下载中断，继续时会从断点续传；自动下载走不通时可以「手动下载」再「本地安装包安装」",
+                        [new EnvAction("download-runtime", "继续下载"),
+                         new EnvAction("manual-download", "手动下载"),
+                         new EnvAction("install-runtime", "本地安装包安装")]));
+                }
                 return null;
             }
 
-            var home = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Android", "Sdk");
-            if (File.Exists(Path.Combine(home, "emulator", "emulator.exe")))
-            {
-                items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Info, "本机已装的 Android SDK",
-                    "本安装包不再自带运行环境；这里用的是机器上已装的那套（模拟器 + AVD 需自行准备）。" +
-                    "也可以下载官方配套环境（约 0.9GB）获得开箱即用的体验",
-                    [new EnvAction("download-runtime", "下载配套环境")]));
-                return home;
-            }
+            // ⚠ 2026-10-15 用户要求：**不再回退到机器上装的 Android SDK**
+            //   （%LOCALAPPDATA%\Android\Sdk）。以前那条会让程序在开发机上悄悄跑起
+            //   Android Studio 的模拟器，用户以为"运行环境还在"。现在只认程序同目录这一处，
+            //   没有就明确报未安装，走下载/本地安装包。
 
             items.Add(new EnvCheckItem("Android 运行环境", EnvCheckLevel.Fail, "未找到",
                 "jar 爬虫源与网盘源需要一个 Android 运行环境（模拟器 + 系统镜像，约 0.9GB 下载 / 2.6GB 磁盘）。" +
-                "网页源（猫爪源规则）、MacCMS、JS 脚本源不受影响。可先跳过，需要时再来下载",
-                [new EnvAction("download-runtime", "下载运行环境")]));
+                "网页源（猫爪源规则）、MacCMS、JS 脚本源不受影响。可先跳过，需要时再来下载；" +
+                "自动下载走不通（代理 / GitHub 不通 / 老断流）时，可「手动下载」再「本地安装包安装」",
+                [new EnvAction("download-runtime", "下载运行环境"),
+                 new EnvAction("manual-download", "手动下载"),
+                 new EnvAction("install-runtime", "本地安装包安装")]));
         }
         catch (Exception ex)
         {
@@ -188,24 +211,74 @@ public static class StartupEnvCheck
                 .ToArray();
             var code = lines.FirstOrDefault(l => l.Length == 1 && char.IsDigit(l[0]));
             var msg = lines.LastOrDefault() ?? "";
+
+            // 随包运行环境没带 emulator-check.exe（-accel-check 是委托它做的），这条路上永远只有
+            // 一句 "can't find the emulator-check executable"。别就此报「未探测」——
+            // 换 Windows 自己的判据（WinHvPlatform.dll），结论一样权威，且不依赖随包文件。
+            if (msg.Contains("emulator-check", StringComparison.OrdinalIgnoreCase))
+                return ProbeWhpxDirect();
             if (code == "0")
                 return new EnvCheckItem("硬件加速", EnvCheckLevel.Ok, msg.Length > 0 ? msg : "已启用");
 
-            var actions = new List<EnvAction>
-            {
-                new("enable-whpx", "一键启用虚拟化"),
-                new("howto-whpx", "详细步骤"),
-                new("open-optional-features", "手动打开 Windows 功能"),
-            };
-            return new EnvCheckItem("硬件加速", EnvCheckLevel.Warn, msg.Length > 0 ? msg : "不可用",
-                "模拟器需要 WHPX（Windows 虚拟机监控程序平台）。未启用时 x86_64 客机会回落到软件模拟，" +
-                "冷启动由 1 分多钟变成十几分钟且操作严重卡顿，建议按提示开启后重启电脑", actions);
+            return WhpxWarn(msg.Length > 0 ? msg : "不可用");
         }
         catch (Exception ex)
         {
+            // 连模拟器都拉不起来（比如 emulator.exe 缺失）时也别只说「失败」：直查一次 WHPX。
+            var whpx = ProbeWhpxDirect();
+            if (whpx.Level == EnvCheckLevel.Ok) return whpx;
             return new EnvCheckItem("硬件加速", EnvCheckLevel.Info, "探测失败：" + ex.GetType().Name);
         }
     }
+
+    /// <summary>
+    /// WHPX 直查：问 Windows 自己有没有可用的 Hyper-V 平台（<c>WinHvPlatform.dll</c> 的
+    /// <c>WHvGetCapability(WHvCapabilityCodeHypervisorPresent)</c>）—— 这正是模拟器内部用的同一个判据。
+    /// <para>比 <c>emulator -accel-check</c> 更可靠：后者把活委托给同目录的 emulator-check.exe，
+    /// 而随包运行环境精简时把它漏掉了（见打包说明），于是那条路在本机永远给不出答案。</para>
+    /// </summary>
+    private static EnvCheckItem ProbeWhpxDirect()
+    {
+        try
+        {
+            var hr = WHvGetCapability(WhvCapabilityCodeHypervisorPresent, out var cap,
+                Marshal.SizeOf<WhvCapability>(), out _);
+            if (hr >= 0 && cap.HypervisorPresent != 0)
+                return new EnvCheckItem("硬件加速", EnvCheckLevel.Ok, "WHPX 已启用（Windows 直查）");
+            return WhpxWarn(hr < 0 ? $"WHvGetCapability 0x{hr:X8}（模拟器内已能跑，可忽略）" : "hypervisor 未就绪");
+        }
+        catch (Exception ex)
+        {
+            return new EnvCheckItem("硬件加速", EnvCheckLevel.Info, "未探测（" + ex.GetType().Name + "）",
+                "本机取不到 WinHvPlatform.dll 的判据（缺该 DLL 或系统过旧）；模拟器仍会照常启动，" +
+                "若冷启明显变慢（十几分钟）再按「详细步骤」排查虚拟化");
+        }
+    }
+
+    /// <summary>WHPX 不可用时的告警项（文案与三个处置按钮只写一处）。</summary>
+    private static EnvCheckItem WhpxWarn(string detail)
+    {
+        var actions = new List<EnvAction>
+        {
+            new("enable-whpx", "一键启用虚拟化"),
+            new("howto-whpx", "详细步骤"),
+            new("open-optional-features", "手动打开 Windows 功能"),
+        };
+        return new EnvCheckItem("硬件加速", EnvCheckLevel.Warn, detail,
+            "模拟器需要 WHPX（Windows 虚拟机监控程序平台）。未启用时 x86_64 客机会回落到软件模拟，" +
+            "冷启动由 1 分多钟变成十几分钟且操作严重卡顿，建议按提示开启后重启电脑", actions);
+    }
+
+    /// <summary>WHvCapabilityCodeHypervisorPresent（WinHvPlatform.h 里第一个枚举值）。</summary>
+    private const int WhvCapabilityCodeHypervisorPresent = 0;
+
+    /// <summary>WHV_CAPABILITY 联合体（只取第一个字段；按 64 字节给足余量）。</summary>
+    [StructLayout(LayoutKind.Sequential, Size = 64)]
+    private struct WhvCapability { public int HypervisorPresent; }
+
+    [DllImport("WinHvPlatform.dll", SetLastError = false)]
+    private static extern int WHvGetCapability(int capabilityCode, out WhvCapability buffer,
+        int bufferSizeInBytes, out int writtenSizeInBytes);
 
     /// <summary>
     /// 系统镜像：从 <c>source.properties</c> 读出真实型号，并校验

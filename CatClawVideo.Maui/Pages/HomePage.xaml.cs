@@ -112,6 +112,62 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
     /// 又不至于把人困住；超时无条件收起——宁可露出错误提示让人操作。</summary>
     private const int ColdStartCapSeconds = 120;
 
+    /// <summary>运行环境未就绪的原因（空串 = 就绪）。由自检结果写入：
+    /// 没装运行环境 / 系统镜像缺件 / 爬虫桥缺件时，冷启动进度条**停住不动**，
+    /// 免得用户看着百分比一直爬、以为"在加载"（2026-10-15 用户要求）。</summary>
+    private string _envBlockedReason = "";
+
+    /// <summary>桥上报的**真实**进度（-1 = 还没有真实里程碑）。每个百分点都对应一个 adb 实测节点：
+    /// 设备出现 0.40 / sys.boot_completed=1 0.70 / 桥 APK 就绪 0.78 / forward 就位 0.85 / ping 通 0.95。</summary>
+    private double _realPct = -1;
+    private string _realStage = "";
+
+    /// <summary>显示用的进度值（0~1）。每个阶段对它做「先快爬、再放缓」的两段式推进。</summary>
+    private double _shownPct = -1;
+
+    /// <summary>当前阶段是从哪个里程碑起的（阶段切换时重置，用于算"本阶段已经爬了多久"）。</summary>
+    private double _segPct = 0.01;
+
+    /// <summary>当前阶段的起始时刻（StartColdStartOverlay 里初始化）。</summary>
+    private DateTime _segStartUtc;
+
+    /// <summary>快爬段时长（秒）：起步 / 每阶段切换后先在这个时间内冲到位。</summary>
+    private const double FastRiseSeconds = 3.5;
+
+    /// <summary>放缓段的时间常数（秒）：快爬结束后按这个速度向"下一档 − 1%"渐近。</summary>
+    private const double SlowTauSeconds = 25;
+
+    /// <summary>桥会上报的里程碑档位（与 SpiderBridgeClient.Report 的取值一一对应）。
+    /// 用来算"下一档" —— 逼近的上限就是它减 1%，所以进度条永远不会抢先宣布到达下一阶段。</summary>
+    private static readonly double[] ProgressLadder =
+    {
+        0.05, 0.10, 0.12, 0.15, 0.40, 0.45, 0.50, 0.60, 0.70, 0.72, 0.78, 0.85, 0.95,
+    };
+
+    /// <summary>
+    /// 一个阶段内的两段式进度（用户要的节奏）：
+    /// <para>① 快爬段：<see cref="FastRiseSeconds"/> 秒内线性冲到本阶段 plateau = 起点 + 75% 余量；</para>
+    /// <para>② 放缓段：之后按 <see cref="SlowTauSeconds"/> 的时间常数向 <paramref name="cap"/> 渐近，
+    /// 而 cap 本身是"下一档 − 1%"，所以永远到不了下一档。</para>
+    /// 观感：起步 1% → 3.5 秒冲到 ~12% → 放缓；下一阶段到了再冲一次，如此重复。
+    /// </summary>
+    private static double StageProgress(double fromPct, double cap, DateTime segStart)
+    {
+        var t = (DateTime.UtcNow - segStart).TotalSeconds;
+        var plateau = fromPct + (cap - fromPct) * 0.75;
+        return t < FastRiseSeconds
+            ? fromPct + (plateau - fromPct) * (t / FastRiseSeconds)
+            : plateau + (cap - plateau) * (1 - Math.Exp(-(t - FastRiseSeconds) / SlowTauSeconds));
+    }
+
+    /// <summary>比 <paramref name="cur"/> 大的最小档位；已经是最高档则返回它自己（不再爬）。</summary>
+    private static double NextMilestone(double cur)
+    {
+        foreach (var v in ProgressLadder)
+            if (v > cur + 1e-9) return v;
+        return cur;
+    }
+
     private void StartColdStartOverlay()
     {
         // ★ 仅 Windows 显示（2026-10-03，用户反馈「安卓端也弹启动画面」）：
@@ -124,6 +180,16 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
         //   Windows 端由本方法负责显示。
         //   2026-10-04 用户反馈「启动画面给你改没了」—— 当时就漏了这一行。
         ColdStartOverlay.IsVisible = true;
+
+        // 真实进度：外置 Android 桥在每个 adb 实测里程碑上报（设备出现 / 系统启动完成 /
+        // 桥 APK 就绪 / forward 就位 / ping 通）。有它就按它走，没有才用起步爬升。
+        CatClawVideo.Core.Providers.SpiderBridgeClient.Progress = (pct, stage) =>
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                if (pct > _realPct) { _realPct = pct; _realStage = stage; }   // 只前进不回退
+            });
+
+        _segStartUtc = _coldStartUtc;      // 第一阶段（起步）从现在开始计时
 
         _coldStartTimer = Dispatcher.CreateTimer();
         _coldStartTimer.Interval = TimeSpan.FromMilliseconds(400);
@@ -178,14 +244,41 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
             EnvCheckSummary.TextColor = tint;
             EnvCheckBadge.BackgroundColor = tint.WithAlpha(0.16f);
 
+            // 环境就绪情况 → 决定冷启动进度条要不要停（只看「模拟器能不能起来」的那几项）
+            _envBlockedReason = EnvBlocker(items);
+            // 同时作为**启动门禁**：没环境就不让进主界面（顶栏禁用 + 遮罩不淡出）
+            Services.StartupGate.Set(_envBlockedReason);
+
             foreach (var it in items) EnvCheckList.Add(BuildEnvRow(it));
             RenderEnvActions(items);
             EnvCheckPanel.IsVisible = true;
+            if (_coldStartTimer is not null) ApplyColdStartStatus();   // 门禁状态立刻反映到遮罩文案
         }
         catch (Exception ex)
         {
             DiagLog.Write($"[envcheck] 渲染失败：{ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// 环境是不是「卡在起点」：返回原因（空串 = 就绪）。
+    /// <para>只看真正决定 jar 源能不能起来的三项 —— Android 运行环境（缺/没装完都算）、
+    /// 系统镜像缺件、爬虫桥缺件。磁盘/内存这类告警**不**冻结进度（照常能跑）。</para>
+    /// </summary>
+    private static string EnvBlocker(IReadOnlyList<Services.EnvCheckItem> items)
+    {
+        foreach (var it in items)
+        {
+            var blocked = it.Title switch
+            {
+                // 未装（Fail）/ 没装完或待解压（Warn）都算没就绪；用本机已装 SDK（Info）算就绪
+                "Android 运行环境" => it.Level is Services.EnvCheckLevel.Fail or Services.EnvCheckLevel.Warn,
+                "系统镜像" or "爬虫桥程序" => it.Level == Services.EnvCheckLevel.Fail,
+                _ => false,
+            };
+            if (blocked) return $"{it.Title}：{it.Detail}";
+        }
+        return "";
     }
 
     /// <summary>
@@ -304,6 +397,12 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
             // 「随包、缺失=安装不完整」自此失效；download-runtime 成为新的标准处置。
             case "open-datadir": OpenDataDir(); break;
             case "download-runtime": _ = DownloadRuntimeAsync(); break;
+            // 2026-10-14：自动下载之外补两条手动路径 ——「手动下载」只把地址给到手（代理/墙/断流时
+            // 用浏览器、迅雷、别的机器都行），「本地安装包安装」把用户下好的 zip 校验+解压+自检；
+            // 「立即安装」是自检发现缓存里已有一份完整包时的直达按钮（不必再选文件）。
+            case "manual-download": _ = ManualDownloadAsync(); break;
+            case "install-runtime": _ = InstallRuntimeAsync(null); break;
+            case "install-cached-runtime": _ = InstallRuntimeAsync(Services.RuntimeProvisioner.ZipPath); break;
         }
     }
 
@@ -327,26 +426,23 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
                 "下载 Android 运行环境",
                 $"jar 爬虫源与网盘源需要一个 Android 运行环境：\n" +
                 $"· 下载约 {Services.RuntimeProvisioner.AssetBytes / 1024 / 1024} MB（断点续传）\n" +
-                $"· 解压后约 {Services.RuntimeProvisioner.UnpackedBytes / 1024 / 1024 / 1024:0.#} GB，落在本机数据目录\n" +
+                $"· 解压后约 {Services.RuntimeProvisioner.UnpackedBytes / 1024 / 1024 / 1024:0.#} GB，" +
+                (Services.RuntimeProvisioner.IsPortable
+                    ? "落在**程序同目录**（随程序一起拷贝/删除）\n"
+                    : "程序目录不可写，落在用户数据目录\n") +
                 $"· 磁盘 {drive.Name} 可用 {free / 1024.0 / 1024 / 1024:0.#} GB（需约 3.6 GB）\n\n" +
                 $"网页源 / MacCMS / JS 脚本源不受影响，可先跳过。现在开始下载吗？",
                 "开始下载", "以后再说");
             if (!ok) return;
 
-            var progress = new Progress<double>(p => MainThread.BeginInvokeOnMainThread(() =>
-            {
-                EnvCheckSummary.Text = $"运行环境下载中… {p * 100:0}%";
-                EnvCheckSummary.TextColor = Color.FromArgb("#0A84FF");
-                EnvCheckBadge.BackgroundColor = Color.FromArgb("#0A84FF").WithAlpha(0.16f);
-            }));
-
             await Task.Run(() => Services.RuntimeProvisioner.ProvisionAsync(
-                progress, stage => DiagLog.Write($"[runtime] {stage}"), CancellationToken.None))
+                RuntimeProgress("运行环境下载中…", showSpeed: true), RuntimeStage, CancellationToken.None))
                 .ConfigureAwait(true);
 
             await RefreshEnvChecksAsync();
             await Shell.Current.DisplayAlertAsync("运行环境就绪",
                 "Android 运行环境下载完成。首次启动模拟器约需 1 分钟（之后走快照会快很多）。", "好");
+            await RestartBootstrapAsync();     // 装好就地把桥拉起来，不用重启程序
         }
         catch (Exception ex)
         {
@@ -359,6 +455,297 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
         {
             _provisioningRuntime = false;
         }
+    }
+
+    /// <summary>
+    /// 手动下载：只把安装包地址交到用户手里，不自己起下载。
+    /// <para>自动下载只有 GitHub Releases 直连一条路，代理/墙/断流任一环节不通就整条废掉；
+    /// 用浏览器、迅雷、网盘客户端甚至别的机器下载都行 —— 拿到 zip 后由
+    /// <see cref="InstallRuntimeAsync"/> 校验并解压，装出来的东西与自动下载完全一致。</para>
+    /// </summary>
+    private async Task ManualDownloadAsync()
+    {
+        var url = Services.RuntimeProvisioner.AssetUrl;
+        const string open = "用浏览器打开直链";
+        const string copy = "复制下载链接";
+        const string mirror = "复制镜像链接（gh-proxy）";
+        const string folder = "打开存放目录";
+
+        var pick = await Shell.Current.DisplayActionSheetAsync("手动下载运行环境包", "取消", null,
+            open, copy, mirror, folder);
+        if (pick == mirror)
+        {
+            // 直连在「github.com 被 hosts 黑洞 / 墙内」时打不开，镜像只是换条路，文件相同（装的时候照样校验 SHA256）
+            var m = Services.RuntimeProvisioner.MirrorUrls[0];
+            try { await Clipboard.Default.SetTextAsync(m); } catch { }
+            await AlertAsync("镜像链接已复制：\n\n" + m + "\n\n" + ManualDownloadNextStep);
+            return;
+        }
+        if (pick == copy)
+        {
+            try { await Clipboard.Default.SetTextAsync(url); } catch { }
+            await AlertAsync("下载链接已复制：\n\n" + url + "\n\n" + ManualDownloadNextStep);
+            return;
+        }
+        if (pick == folder)
+        {
+            OpenRuntimeDir();
+            await AlertAsync(ManualDownloadNextStep);
+            return;
+        }
+        if (pick != open) return;
+
+        try { await Launcher.OpenAsync(new Uri(url)); }
+        catch (Exception ex)
+        {
+            DiagLog.Write("[runtime] 打开下载直链失败：" + ex.Message);
+            await AlertAsync("没能调起浏览器。可以手动复制这个地址：\n\n" + url);
+            return;
+        }
+        await AlertAsync(ManualDownloadNextStep);
+    }
+
+    /// <summary>手动下载之后的下一步提示（三个入口共用，免得文案各处漂移）。</summary>
+    private const string ManualDownloadNextStep =
+        "下载完成后回到本面板，点「本地安装包安装」选中该 zip —— 客户端会校验 SHA256、" +
+        "解压到程序同目录（程序目录不可写时为用户数据目录）并自检必需件，与自动下载装出来的完全一致。\n\n" +
+        "提示：网页源 / MacCMS / JS 脚本源不需要这个包，可以先跳过。";
+
+    /// <summary>
+    /// 手动安装 Android 运行环境：选包（或直接用缓存里那份）→ 确认（体积/磁盘/会清掉旧运行环境）
+    /// → 非官方原件再确认一次 → 解压 + 必需件自检。
+    /// </summary>
+    /// <param name="preSelectedZip">已知的包路径（自检发现缓存里已有一份完整包时直接传，省掉选文件）；
+    /// 传 null 则弹文件选择器。</param>
+    private async Task InstallRuntimeAsync(string? preSelectedZip)
+    {
+        if (_provisioningRuntime) return;
+        _provisioningRuntime = true;
+        try
+        {
+            var zip = preSelectedZip;
+            if (zip is null)
+            {
+                var picked = await FilePicker.PickAsync(new PickOptions
+                {
+                    PickerTitle = "选择 Android 运行环境包（zip）",
+                    FileTypes = new FilePickerFileType(new Dictionary<DevicePlatform, IEnumerable<string>>
+                    {
+                        [DevicePlatform.WinUI] = new[] { ".zip" },
+                        [DevicePlatform.Android] = new[] { "*/*" },
+                    }),
+                });
+                if (picked is null) return;                        // 用户取消
+                zip = File.Exists(picked.FullPath)
+                    ? picked.FullPath
+                    : await CopyPickedToCacheAsync(picked);         // 极少数拿不到真实路径的情况
+                if (zip is null) return;
+            }
+
+            if (!File.Exists(zip))
+            {
+                await AlertAsync("找不到这个安装包：\n" + zip);
+                return;
+            }
+
+            var sizeMb = new FileInfo(zip).Length / 1024 / 1024;
+            var drive = new DriveInfo(Path.GetPathRoot(Services.RuntimeProvisioner.TargetRoot)!);
+            var free = drive.AvailableFreeSpace / 1024.0 / 1024 / 1024;
+            if (!await Shell.Current.DisplayAlertAsync("安装 Android 运行环境",
+                    $"安装包：{Path.GetFileName(zip)}（{sizeMb} MB）\n" +
+                    $"解压到：{Services.RuntimeProvisioner.TargetRoot}\n" +
+                    $"磁盘 {drive.Name} 可用 {free:0.#} GB（解压需约 2.6 GB，另留模拟器运行余量）\n\n" +
+                    "安装会先清掉已有的 Android 运行环境（不影响 AVD 数据、订阅与其它设置）。现在开始吗？",
+                    "开始安装", "取消"))
+                return;
+
+            // 官方原件（大小 + SHA256）直接装；对不上再问一次 —— 从网盘/镜像/迅雷下的很可能就是同一个
+            // 文件（下载器改了名字罢了），但也确实可能被动过，让用户自己决定比默默接受或默默拒绝都合适。
+            var official = await Task.Run(() =>
+                Services.RuntimeProvisioner.IsOfficialPackageAsync(zip, CancellationToken.None));
+            if (!official && !await Shell.Current.DisplayAlertAsync("安装包与官方发布不一致",
+                    "所选文件的 SHA256 对不上官方发布包（可能来自第三方镜像、被修改过，或下载不完整）。\n\n" +
+                    "继续安装等于信任这个文件；来源不确定的话，建议先在官方发布页重新下载。",
+                    "继续安装", "取消"))
+                return;
+
+            await Task.Run(() => Services.RuntimeProvisioner.InstallFromZipAsync(
+                zip, RuntimeProgress("运行环境安装中…"), RuntimeStage, CancellationToken.None))
+                .ConfigureAwait(true);
+
+            await RefreshEnvChecksAsync();
+            await RestartBootstrapAsync();     // 装好就地把桥拉起来，不用重启程序
+
+            // 缓存里那份 zip（自己下的）用完就没价值了，938MB 白占地方 —— 问一句删不删；
+            // 用户从别处选的包不动（那是别人的文件）。
+            var cached = string.Equals(zip, Services.RuntimeProvisioner.ZipPath, StringComparison.OrdinalIgnoreCase);
+            const string done = "Android 运行环境安装完成。首次启动模拟器约需 1 分钟（之后走快照会快很多）。";
+            if (cached)
+            {
+                if (await Shell.Current.DisplayAlertAsync("运行环境就绪",
+                        done + $"\n\n本地那份安装包（{sizeMb} MB）已不再需要，现在删除吗？", "删除安装包", "保留"))
+                    Services.RuntimeProvisioner.CleanupDownload();
+            }
+            else
+            {
+                await AlertAsync(done);
+            }
+        }
+        catch (Exception ex)
+        {
+            DiagLog.Write($"[runtime] 手动安装失败：{ex.GetType().Name}: {ex.Message}");
+            await RefreshEnvChecksAsync();
+            await AlertAsync("安装失败：" + ex.Message +
+                "\n\n常见原因：安装包不完整（重新下载）、磁盘空间不足、或模拟器/应用正占着要覆盖的文件。");
+        }
+        finally
+        {
+            _provisioningRuntime = false;
+        }
+    }
+
+    /// <summary>
+    /// 运行环境刚装好：**就地把「统一引导」再跑一遍**（起模拟器 → 装桥 → 连通），
+    /// 期间重新拉起冷启动遮罩显示真实进度，桥就绪后重载首页数据。
+    /// <para>启动时那次引导早已失败退场（环境当时不存在），没人再拉一次的话程序就停在
+    /// 「空首页 + 订阅站点均拉取失败」，非重启不可 —— 这是 2026-10-15 用户实测反馈的缺口。</para>
+    /// </summary>
+    private async Task RestartBootstrapAsync()
+    {
+        if (!Services.RuntimeBootstrapper.Available) return;
+        try
+        {
+            _realPct = -1; _shownPct = -1; _segPct = 0.01; _segStartUtc = DateTime.UtcNow;
+            _coldLoadStarted = false; _coldLoadFinished = false;
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                ColdStartOverlay.IsVisible = true;          // fade-out 会把它关掉，这里重新上屏
+                ColdStartOverlay.Opacity = 1;
+                ColdStartPct.Text = "";
+                ColdStartStatus.Text = "正在启动 Android 运行环境…";
+                ColdStartProgress.Progress = 0.03;
+                if (_coldStartTimer is null)
+                {
+                    _coldStartTimer = Dispatcher.CreateTimer();
+                    _coldStartTimer.Interval = TimeSpan.FromMilliseconds(400);
+                    _coldStartTimer.Tick += (_, _) => UpdateColdStartOverlay();
+                }
+                _coldStartTimer.Start();
+            });
+
+            await Services.RuntimeBootstrapper.RunAsync().ConfigureAwait(true);   // 起模拟器 + 装桥（约 1 分钟）
+            // 桥就绪 → 重新取首页数据；分类上屏后遮罩自己跳 100% 淡出（既有逻辑）
+            await MainThread.InvokeOnMainThreadAsync(async () => await _vm.LoadHomeAsync());
+        }
+        catch (Exception ex)
+        {
+            DiagLog.Write($"[runtime] 装好后重跑引导失败：{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private long _rtLastBytes;
+    private long _rtLastTicks;
+    private double _rtLastMbps;
+    private volatile bool _rtUiPending;
+
+    /// <summary>
+    /// 不走 <see cref="Progress{T}"/>：它会把回调**转回创建它的线程（UI）**，主线程被 jar 站点
+    /// 预加载压住时算出来的是过期样本（用户看到"0.5 MB/s"、实际 8.6 MB/s，2026-10-15 实测）。
+    /// 这里改成普通 IProgress：速度与文案在**上报线程**上算好，再合并投递一帧到 UI。
+    /// </summary>
+    private sealed class RtProgress(HomePage page, string prefix, bool showSpeed) : IProgress<double>
+    {
+        public void Report(double p) => page.OnRuntimeProgress(prefix, showSpeed, p);
+    }
+
+    internal void OnRuntimeProgress(string prefix, bool showSpeed, double p)
+    {
+        var text = $"{prefix} {p * 100:0}%";
+        if (showSpeed)
+        {
+            var bytes = (long)(p / 0.9 * Services.RuntimeProvisioner.AssetBytes);
+            var now = Environment.TickCount64;
+            if (_rtLastTicks == 0) { _rtLastTicks = now; _rtLastBytes = bytes; }
+            else if (now - _rtLastTicks >= 600)
+            {
+                _rtLastMbps = (bytes - _rtLastBytes) / 1048576.0 / ((now - _rtLastTicks) / 1000.0);
+                _rtLastBytes = bytes;
+                _rtLastTicks = now;
+            }
+            text += $"（{_rtLastMbps:0.0} MB/s · 源：{Services.RuntimeProvisioner.LastUsedSource}）";
+        }
+
+        if (_rtUiPending) return;          // UI 没跟上时只保留最新一帧，别排队
+        _rtUiPending = true;
+        var shown = text;
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            _rtUiPending = false;
+            EnvCheckSummary.Text = shown;
+            EnvCheckSummary.TextColor = Color.FromArgb("#0A84FF");
+            EnvCheckBadge.BackgroundColor = Color.FromArgb("#0A84FF").WithAlpha(0.16f);
+        });
+    }
+
+    /// <summary>下载/安装运行环境的进度写进自检卡片的汇总行（蓝色药丸 + 百分比）。
+    /// <paramref name="showSpeed"/>=true 时额外显示实测速度与当前下载源（下载段占进度 0~0.9）。
+    /// <para>括号里那截**恒定显示**（沿用上次读数）：否则"算得出/算不出"两帧宽度不同，整行一闪一闪。</para></summary>
+    private IProgress<double> RuntimeProgress(string prefix, bool showSpeed = false) =>
+        new RtProgress(this, prefix, showSpeed);
+
+    /// <summary>阶段文案：落日志，**同时显示在自检卡片的进度药丸上**。
+    /// <para>连接、判定回环、换源这些阶段没有字节流动，进度回调不会触发 —— 只写日志的话
+    /// 用户看到的就是"点了下载没反应"（2026-10-15 实测反馈），所以这里必须上界面。</para></summary>
+    private void RuntimeStage(string stage)
+    {
+        DiagLog.Write($"[runtime] {stage}");
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            EnvCheckSummary.Text = stage;
+            EnvCheckSummary.TextColor = Color.FromArgb("#0A84FF");
+            EnvCheckBadge.BackgroundColor = Color.FromArgb("#0A84FF").WithAlpha(0.16f);
+        });
+    }
+
+    /// <summary>
+    /// 极少数情况下 FilePicker 给不出本地真实路径（云盘占位符、非本地盘）。
+    /// 这时把内容拷到运行环境缓存目录再装 —— 只有这种情况才多花一次 0.9GB 拷贝。
+    /// </summary>
+    private async Task<string?> CopyPickedToCacheAsync(FileResult picked)
+    {
+        try
+        {
+            var dst = Services.RuntimeProvisioner.ZipPath;
+            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+            EnvCheckSummary.Text = "正在读取所选安装包…";
+            await using (var src = await picked.OpenReadAsync())
+            await using (var fs = File.Create(dst))
+                await src.CopyToAsync(fs);
+            return dst;
+        }
+        catch (Exception ex)
+        {
+            DiagLog.Write($"[runtime] 复制所选安装包失败：{ex.GetType().Name}: {ex.Message}");
+            await AlertAsync("读取所选文件失败：" + ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>打开运行环境缓存目录（把这当成「下载到哪」的落点，手动下载的 zip 放这儿也便于管理）。</summary>
+    private void OpenRuntimeDir()
+    {
+        var dir = Path.GetDirectoryName(Services.RuntimeProvisioner.ZipPath)!;
+        try
+        {
+            Directory.CreateDirectory(dir);
+#if WINDOWS
+            System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo("explorer.exe", dir) { UseShellExecute = true });
+#else
+            _ = Launcher.OpenAsync(new Uri(dir));
+#endif
+        }
+        catch (Exception ex) { DiagLog.Write("[runtime] 打开运行环境目录失败：" + ex.Message); }
     }
 
     private static Task AlertAsync(string message) =>
@@ -465,6 +852,15 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
         if (_vm.IsHomeLoading) _coldLoadStarted = true;
         else if (_coldLoadStarted) _coldLoadFinished = true;
 
+        // ★ 启动门禁（2026-10-15 用户要求「没环境就不让启动」）：运行环境没就绪时**不放行** ——
+        //   不淡出遮罩、也不理会超时兜底，自检面板与下载入口一直留在眼前。
+        //   装好后自检重跑 → _envBlockedReason 变空 → 这里放行，后续按正常流程淡出进主界面。
+        if (_envBlockedReason.Length > 0)
+        {
+            MainThread.BeginInvokeOnMainThread(ApplyColdStartStatus);
+            return;
+        }
+
         // 数据就绪（分类已上屏）= 冷启动结束：停表并淡出进主界面
         if (_vm.Categories.Count > 0)
         {
@@ -515,44 +911,53 @@ public partial class HomePage : ContentView, ITabView, IRemoteKeyHandler
     private void ApplyColdStartStatus()
     {
         var siteCount = SiteRegistry.Playable.Count();
-        var elapsed = (DateTime.UtcNow - _coldStartUtc).TotalSeconds;
 
-        // ── 进度条 + 百分比（分段锚定实测阶段）──
-        // 2026-10-12 重新标定：运行时由 QEMU ART guest 换成**随包 Android 模拟器**，
-        // 冷启实测（无 AVD 的全新安装）到桥就绪 = 76s，故慢段锚点由 45s 改到 80s。
-        // · 0~8s   拉起模拟器进程 + 镜像挂载（快）： 5% → 30%（前段快推，别让人以为卡死）
-        // · 8~80s  客机 boot + adb 就绪（大头，慢）：30% → 80%
-        // · >80s   桥服务/站点加载收尾：            80% → 97% 极慢爬（每秒 ~0.35%，观感仍在推进）
-        // · 数据上屏（分类就绪）：                   瞬间 100% → 淡出
-        // 是假进度（无真实百分比信号），但各段与实测一致，不会 1 分钟卡在同一个数上。
+        // 运行环境没就绪：**进度条停住**（不推进也不回退），只把原因写到遮罩上。
+        // 装好/处置完（自检重跑后 _envBlockedReason 变空）会自动接着走。
+        if (_envBlockedReason.Length > 0)
+        {
+            ColdStartStatus.Text = "运行环境未就绪，进度已暂停 —— " + _envBlockedReason +
+                                   "（点上方「启动自检」里的按钮处置后会自动继续）";
+            return;
+        }
+
+        // ── 进度条 + 百分比：**真进度优先** ──
+        // 2026-10-15（用户要求）：不再按时间编百分比。桥每到一个 adb 实测里程碑就上报一次，
+        // 收到就按它走（只前进不回退）；还没收到任何里程碑时，从 3% 慢慢爬到 15% 就**停住等** ——
+        // 于是「卡在哪一步」= 进度条停在哪个档，不会出现"时间到了就自己涨"的假象。
+        // ── 每个阶段：先快爬、再放缓（用户 2026-10-15 指定的节奏）──
+        //   起步 1% → 3.5s 冲到 ~12% → 放缓等下一阶段；下一阶段到了再冲一次，如此重复。
+        //   上限始终是"下一档 − 1%"，所以快爬也不会越过还没发生的里程碑。
         double p;
-        if (siteCount == 0) p = 5;
-        else if (elapsed <= 8) p = 5 + elapsed / 8.0 * 25;
-        else if (elapsed <= 80) p = 30 + (elapsed - 8) / 72.0 * 50;
-        else p = Math.Min(97, 80 + (elapsed - 80) * 0.35);
+        string stage;
+        if (_realPct >= 0)
+        {
+            if (_realPct > _segPct)                      // 新的真里程碑 = 新阶段
+            {
+                _segPct = _realPct;
+                _segStartUtc = DateTime.UtcNow;
+            }
+            var cap = Math.Max(_realPct, NextMilestone(_realPct) - 0.01);
+            var target = StageProgress(_segPct, cap, _segStartUtc);
+            if (target > _shownPct) _shownPct = target;  // 只前进
+            p = Math.Max(_shownPct, _realPct) * 100;
+            stage = _realStage;
+        }
+        else
+        {
+            // 还没有任何真实里程碑：1% 起步 → 3.5s 快爬到 ~11.5% → 放缓等「设备出现」那一档
+            if (_shownPct < 0) _shownPct = 0.01;
+            var target = StageProgress(0.01, 0.15, _coldStartUtc);
+            if (target > _shownPct) _shownPct = target;
+            p = _shownPct * 100;
+            stage = siteCount == 0 ? "正在恢复订阅与站点…" : "正在准备 Android 运行环境…";
+        }
 
-        if (_vm.Categories.Count > 0) p = 100;
+        if (_vm.Categories.Count > 0) { p = 100; stage = "首页数据已就绪"; }
         p = Math.Round(p, 0, MidpointRounding.AwayFromZero);
         ColdStartPct.Text = $"{p:0}%";
         _ = ColdStartProgress.ProgressTo(p / 100.0, 380, Easing.Linear);
-
-        ColdStartStatus.Text = siteCount == 0
-            ? "正在恢复订阅与站点…"
-            : SiteRegistry.JarSpiderAvailable
-#if ANDROID
-                // Android 的 jar 桥是进程内 DexClassLoader（没有 QEMU），冷启动只是 dex 加载，秒级
-                ? "正在启动爬虫运行时…"
-#else
-                ? elapsed switch
-                {
-                    // 文案随方案更新（2026-10-12）：运行时是**随包 Android 模拟器**，
-                    // 不再是 QEMU 解包内核+根镜像那套。冷启实测约 76s，故慢段阈值取 80s。
-                    < 8 => "正在启动 Android 运行环境（准备模拟器与系统镜像）…",
-                    < 80 => "正在启动 Android 运行环境（首次冷启约 1 分钟）…",
-                    _ => "正在加载首页数据…",
-                }
-#endif
-                : "正在加载首页数据…";
+        ColdStartStatus.Text = stage;
     }
 
     private async Task FadeOutColdStartOverlayAsync()

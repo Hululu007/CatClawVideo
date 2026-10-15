@@ -112,52 +112,22 @@ public static class MauiProgram
 
 #if !ANDROID
 
-        // PC「迅雷磁力播放」双引擎（链式：前者失败才试后者，全部失败回落内置 BT）：
-        //  ① QEMU 本地迅雷引擎（首选）：ARM64 Android 迅雷 SDK 跑在 QEMU 里，走 P2SP 私有网络，
-        //     公共磁力也能满速边下边播；无需登录。运行时随包分发在 QemuGuest/
-        //     （缺失/启动失败判未就绪、自动跳过）。链路与移植说明：JavaBridge/qemu-src/README.md。
-        //  ② 迅雷网盘 API（兜底）：云添加 → 迅雷服务器下载 → 取直链；需登录，未登录判未就绪。
-        // 为什么不是直接用迅雷下载 SDK：那套安卓 SDK 在 PC 上跑不起来（引导域名被沉 127.0.0.2），
-        // 所以 ① 用 QEMU 承载原生跑；② 走官方网盘 API。
-        var qemuThunder = new CatClaw.Qemu.QemuGuestEngine(
-            Path.Combine(AppContext.BaseDirectory, "QemuGuest"), BtFileLog.Write);
-        // 磁力点播磁盘缓存：播放数据 4MB 分块落盘 + LRU 超限清理，已看区间重进/换集直接磁盘秒供。
-        // 上限由设置页控制（默认 20GB，档位 5/10/20/30/50），持久化在 Preferences；
-        // 启动时灌进 Core 的 StreamCachePrefs，引擎在超限清理时实时读取（改完即时生效，无需重启）。
+        // ★ 2026-10-15 用户决定：全走「外置 Android 桥 + 随包模拟器」方案，本机 QEMU 整线退役。
+        //   迅雷/磁力本来就已经搬进桥里（com.catclaw.bridge：libxl_thunder_sdk.so 是 arm64，
+        //   只有模拟器能加载），QEMU 那条只是"桥不可用"时的回退 —— 现在连回退一起删掉：
+        //   桥不可用就是不可用（自检里明确显示运行环境未安装 + 下载入口），不再偷偷起 1.6GB 的 VM。
+        //   磁盘缓存上限（设置页那个"磁力缓存"档位）随之失去消费方，配置项保留但不再生效。
         var cacheGbPref = Preferences.Default.Get("stream_cache_gb", (int)CatClaw.Qemu.StreamCachePrefs.DefaultGb);
         CatClaw.Qemu.StreamCachePrefs.CapGb = cacheGbPref;
-        qemuThunder.StreamCacheRoot = CatClawVideo.Core.AppPaths.Sub("btcache");
-        // 数据面块设备：guest 把引擎吐出的字节按偏移写进宿主镜像，供数时直读同一文件
-        //（实测 2454~2926 MB/s，绕开 SLIRP 的 40MB/s 与 harness 转发的 18.9MB/s）。
-        // 稀疏镜像，写多少占多少；环境异常时引擎会自动退化为纯 HTTP 通道。
-        qemuThunder.BlockDeviceRoot = CatClawVideo.Core.AppPaths.Sub("btcache/hub");
-        BtFileLog.Write($"[缓存] 上限 {CatClaw.Qemu.StreamCachePrefs.CapGb}GB（设置页可调）");
-        // 套件引擎不认识应用接口 → 经 QemuMagnetEngine 适配成 IPreferredMagnetEngine 后再挂链
-        //（后续 ThunderPanEngine 兜底，全部失败回落内置 BT）。
-        // ★ 迅雷已搬到外置 Android 桥（com.catclaw.bridge，arm64-only + libndk_translation）：
-        //   libxl_thunder_sdk.so / libxl_stat.so 只有 arm64，主程序 x86_64 命名空间不 bridged
-        //   加载不了；原来靠宿主 QEMU 里再套 qemu-aarch64-static 跑 harness，白背 ~2.5GB。
-        //   桥放链首 → 成功时下面的 QemuMagnetEngine **一次都不会被调到**（预热也据此跳过）。
+        BtFileLog.Write($"[缓存] 上限 {CatClaw.Qemu.StreamCachePrefs.CapGb}GB（设置页可调；QEMU 退役后暂无消费方）");
+
+        // 磁力播放链路：① 桥内迅雷（首选）→ ② 迅雷网盘 API（兜底）→ 全部失败回落内置 BT
         var bridgeThunder = new CatClawVideo.Core.Providers.BridgeThunderEngine(BtFileLog.Write);
         CatClawVideo.Core.Interfaces.MagnetEngines.Thunder = new CatClawVideo.Core.Providers.ChainedMagnetEngine(
             bridgeThunder,
-            new CatClawVideo.Core.Providers.QemuMagnetEngine(qemuThunder),
             new CatClawVideo.Core.Providers.ThunderPanEngine());
-        // 磁力下载也走同一个迅雷引擎（下载管理页的磁力任务：引擎独占下载 → 媒体口导出本机）
-        magnetDownloadEngine = qemuThunder;
 
         // （统一引导已移到 jarRuntime 声明之后 —— 它要用到 jarRuntime）
-
-        // Guard 解密 VM 已退役为回退开关（单VM合并：x86 走桥内 guard-decrypt op → 宿主
-        // :18481 GuardSvcLoop → 壳内转译 SO 进程内解密，无独立 QEMU；实测 QemuGuardEngine
-        // 全仓库零调用，留着只会再起一台 VM）。默认不建；CATCLAW_LEGACY_GUARD_VM=1 时召回旧路径。
-        if (Environment.GetEnvironmentVariable("CATCLAW_LEGACY_GUARD_VM") == "1")
-        {
-            var qemuGuard = new CatClaw.Qemu.QemuGuardEngine(
-                Path.Combine(AppContext.BaseDirectory, "QemuGuest"), BtFileLog.Write);
-            CatClaw.Qemu.GuardRuntime.Attach(qemuGuard);
-            BtFileLog.Write("[qemu] 独立 Guard VM 已启用（回退模式 CATCLAW_LEGACY_GUARD_VM=1）");
-        }
 #endif
 
         // TVBox 系爬虫（ProxyOrigin 等）会把播放地址拼成 http://127.0.0.1:<port>/proxy?...
@@ -249,13 +219,17 @@ public static class MauiProgram
         };
         // 宿主 proxy 端口下发给桥（Guard 系网盘源靠 SpiderApi.getAddress/getPort 拼数据端点）
         try { CatClawVideo.Core.Providers.SpiderBridgeClient.HostProxyPort = spiderProxy.Port; } catch { }
-        // AVD 名：装过发行版（自带 AndroidSdk\）就用随包的那个（catclaw_play36，
-        // 镜像与它配套、首次运行由客户端自动登记）；开发机没有随包环境，仍用本机的 catclaw_gapi36。
+        // AVD 名**不在这里定死**（2026-10-15 实测踩坑）：这里算的是"进程启动那一刻"的运行环境，
+        // 而运行环境完全可能是启动之后才下载安装好的 —— 那时 Avd 已被写成开发用的 catclaw_gapi36，
+        // 它又不在本机 AVD 家目录里（那儿登记的是 catclaw_play36）⇒ 模拟器报
+        // "Unknown AVD name [catclaw_gapi36]" 当场退出，adb 永远认不到设备。
+        // 现在这里只保留**显式覆盖**（CATCLAW_ANDROID_AVD，开发用）；默认名改由桥在真正启动
+        // 模拟器的那一刻按当时的运行环境判定（见 SpiderBridgeClient.ResolveAvd）。
         CatClawVideo.Core.Providers.SpiderBridgeClient.Avd ??=
-            Environment.GetEnvironmentVariable("CATCLAW_ANDROID_AVD")
-            ?? (Directory.Exists(Path.Combine(AppContext.BaseDirectory, "AndroidSdk", "emulator"))
-                ? CatClawVideo.Core.Providers.SpiderBridgeClient.BundledAvdName
-                : "catclaw_gapi36");
+            Environment.GetEnvironmentVariable("CATCLAW_ANDROID_AVD");
+        // 「显示模拟器画面」偏好（设置页可切）：true 时启动模拟器不加 -no-window，弹出 Android 窗口
+        CatClawVideo.Core.Providers.SpiderBridgeClient.ShowEmulatorWindow =
+            Preferences.Default.Get("emu_show_window", false);
 
         var bridgeDir = CatClawVideo.Core.Providers.JavaSpiderRuntime.FindBridgeDir();
         CatClawVideo.Core.Interfaces.ISpiderRuntime jarRuntime = bridgeDir != null
@@ -276,7 +250,10 @@ public static class MauiProgram
         //   而外置 Android 桥要 ~5s 才好 —— 3s 那次先跑，看到桥还没好就回落 QEMU，
         //   guest 照样被拉起来（实测 22:19:17 起了 2.6GB，用户看到的正是它）。
         //   合并后：**桥可用 ⇒ 两个预热一律不做**，QEMU ART guest 一次都不会被拉起。
-        _ = Task.Run(async () =>
+        //
+        // ★ 2026-10-15：包成具名本地函数并注册到 RuntimeBootstrapper —— 运行环境**装好之后**
+        //   首页会再拉一次（否则引导早已失败退场，装好也只能重启程序才生效）。
+        async Task BootstrapAsync()
         {
             try
             {
@@ -297,24 +274,18 @@ public static class MauiProgram
                     return;
                 }
 
-                // ② 桥不可用才回落 QEMU（迅雷 VM + 爬虫 VM）
-                //    CATCLAW_NO_QEMU=1 ⇒ **彻底切断**：宁可 jar 源不可用，也不起 QEMU guest。
-                if (Environment.GetEnvironmentVariable("CATCLAW_NO_QEMU") == "1")
-                {
-                    BtFileLog.Write("[桥] 桥不可用，且 CATCLAW_NO_QEMU=1 → 不启动 QEMU ART guest（jar 源暂不可用）");
-                    return;
-                }
-                BtFileLog.Write("[桥] 外置 Android 桥不可用 → 回落 QEMU ART guest");
-                try { await qemuThunder.EnsureReadyAsync().ConfigureAwait(false); }
-                catch (Exception ex) { BtFileLog.Write($"[qemu] 迅雷 VM 预热失败（不影响懒启动）：{ex.Message}"); }
-                if (jarRuntime is CatClawVideo.Core.Providers.JavaSpiderRuntime desktopWarm)
-                {
-                    try { await desktopWarm.WarmUpAsync().ConfigureAwait(false); }
-                    catch (Exception ex) { BtFileLog.Write($"[qemu] 爬虫 VM 预热失败（不影响懒启动）：{ex.Message}"); }
-                }
+                // ② 桥不可用：**不再回落 QEMU**（2026-10-15：QEMU 整线退役，也不再随包）。
+                //    jar / 网盘源此时明确不可用，冷启动进度停在「运行环境未就绪」这一档，
+                //    自检里会显示「Android 运行环境：未找到」并给出下载入口 —— 不藏着掖着。
+                BtFileLog.Write("[桥] 外置 Android 桥不可用；本机 QEMU 已退役 → 不起回退（jar/网盘源暂不可用）");
+                CatClawVideo.Core.Providers.SpiderBridgeClient.ReportStage(
+                    0.45, "Android 运行环境未就绪：jar/网盘源暂不可用（可在启动自检里下载）");
             }
             catch (Exception ex) { BtFileLog.Write($"[桥] 引导异常：{ex.Message}"); }
-        });
+        }
+
+        CatClawVideo.Maui.Services.RuntimeBootstrapper.Run = BootstrapAsync;
+        _ = Task.Run(BootstrapAsync);
 
         // 桥爬虫 UI 事件 → MAUI 对话框/二维码（对齐 TVBox：点「登入自己网盘」弹
         // 「已登录+启用中」列表 + 扫码登录，而非回落网页）
@@ -330,24 +301,10 @@ public static class MauiProgram
             if (CatClawVideo.Core.Providers.JavaSpiderRuntime.ExternalBridgeOwnsSpiders)
                 desktopJar.StartGuardSvcIfNeeded(CancellationToken.None);
 
-            // ★ 迅雷引擎合并（2026-09-27 §6.9；2026-09-29 扩展 x86）：aarch64 看
-            //   art_initrd_merged.gz；x86 看 x86guest\art_initrd_x64.gz（注入器已把迅雷资产
-            //   —— ARM harness(qemu-aarch64 转译)/引擎库/init 迅雷段 —— 打进同一 initrd）。
-            //   启用后迅雷引擎不自起 QEMU：与爬虫桥共用同一个 ART VM（媒体口/数据盘/swap 全租用）。
-            var thunderGate = File.Exists(Path.Combine(AppContext.BaseDirectory, "QemuGuest",
-                    CatClawVideo.Core.Providers.JavaSpiderRuntime.ThunderMergeInitrdName))
-                || File.Exists(Path.Combine(AppContext.BaseDirectory, "QemuGuest",
-                    CatClawVideo.Core.Providers.JavaSpiderRuntime.X86ThunderCapableInitrdName));
-            if (thunderGate)
-            {
-                desktopJar.ThunderMerge = new CatClawVideo.Core.Providers.JavaSpiderRuntime.ThunderMergeConfig(
-                    CatClaw.Qemu.QemuGuestEngine.CtrlPort,
-                    qemuThunder.BlockDeviceRoot);
-                qemuThunder.ExternalVmProbe = () => desktopJar.CanProvideThunderVm;
-                qemuThunder.ExternalVmProvider = ct => desktopJar.EnsureThunderVmAsync(ct);
-                BtFileLog.Write("[qemu] 迅雷引擎合并已启用（外部 VM 模式：与爬虫桥共用 ART VM，控制口 "
-                    + CatClaw.Qemu.QemuGuestEngine.CtrlPort + "）");
-            }
+            // ★ 迅雷引擎合并（QEMU ART VM 租用）已随 QEMU 整线退役删除（2026-10-15）：
+            //   那段的前提是"随包 QemuGuest\x86guest\art_initrd_x64.gz 存在"，现在不再随包，
+            //   迅雷完全由外置桥内那套承担（BridgeThunderEngine），不需要宿主侧再租 VM。
+            _ = desktopJar;
         }
 
 #endif

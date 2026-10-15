@@ -1,4 +1,4 @@
-﻿using CatClawVideo.Maui.Services;
+using CatClawVideo.Maui.Services;
 
 namespace CatClawVideo.Maui;
 
@@ -161,6 +161,14 @@ public partial class App : Application
 
         // MAUI 内容根默认按"有标题栏"预留 ~32px 占位 → 设不可见 TitleBar 让内容延伸进标题栏区域
         window.TitleBar = new Microsoft.Maui.Controls.TitleBar { IsVisible = false };
+
+        // 关程序时把「我们自己拉起的模拟器」一并关掉（否则 3~4GB 的 qemu 会一直挂在后台，
+        // 下次再开还会因为端口/AVD 锁被占而连不上）。只回收本应用专用端口上的那个，
+        // 不碰用户自己在 Android Studio 里开的模拟器。
+        window.Destroying += (_, _) =>
+        {
+            try { CatClawVideo.Core.Providers.SpiderBridgeClient.ShutdownEmulator(); } catch { }
+        };
 
         window.HandlerChanged += (_, _) =>
         {

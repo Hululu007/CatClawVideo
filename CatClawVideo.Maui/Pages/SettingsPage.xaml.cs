@@ -313,6 +313,32 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
         sub.ShowArrow = true;
         sub.Activated += async (_, _) => await GoAsync("sourceconfig");
 
+        // Android 虚拟机（模拟器）：jar 爬虫源 / 网盘源全靠它，跑着占 3~4GB 内存。
+        // 以前只有「启动时自动拉起」一条路 —— 想自己开（省得等冷启）自己关（释放内存）都没有入口。
+        _vmRow = AddRow("🤖", "Android 虚拟机",
+            "jar 爬虫源与网盘源要靠它；启动约 30~60 秒，关闭即刻释放 3~4GB 内存", ref rows);
+        RefreshVmStatus();
+        _vmRow.Activated += async (_, _) => await OnVmRowAsync();
+
+        // 显示模拟器画面：默认关（后台跑，没人要看）。打开后启动模拟器会弹出它自己的
+        // Android 窗口，可以直接在里面操作 —— 排查 jar 源 / 试用站点时有用（2026-10-15 用户要求）。
+        _vmWindowRow = AddRow("🖥️", "显示模拟器画面",
+            "打开后启动虚拟机时会弹出 Android 窗口（改完需重启虚拟机生效；不弹窗=后台跑，省资源）",
+            ref rows, ShowVmWindowText());
+        _vmWindowRow.Activated += async (_, _) =>
+        {
+            var on = !CatClawVideo.Core.Providers.SpiderBridgeClient.ShowEmulatorWindow;
+            CatClawVideo.Core.Providers.SpiderBridgeClient.ShowEmulatorWindow = on;
+            Preferences.Default.Set("emu_show_window", on);
+            if (_vmWindowRow is not null) _vmWindowRow.ValueText = ShowVmWindowText();
+            var page = HostPage();
+            if (page is not null)
+                await page.DisplayAlertAsync("显示模拟器画面", on
+                    ? "已开启。下次启动虚拟机（设置 → Android 虚拟机 → 启动，或直接在自检里装好）时会**弹出 Android 窗口**。\n\n" +
+                      "如果虚拟机正在跑，先在上一行「关闭虚拟机」再启动一次才会生效。"
+                    : "已关闭。下次启动虚拟机将回到后台运行（不弹窗）。", "好");
+        };
+
         // 直播源设置（TVBox「配置直播源」同款能力）：地址 / 本地文件 / 历史 + EPG·UA·超时。
         // 订阅自带的直播源自动导入，但可在这里手动配置覆盖（手填 > 源内 > 默认）。
         var live = AddRow("📺", "直播源设置", "配置直播源地址 / 本地文件，含 EPG · UA · 超时", ref rows);
@@ -404,6 +430,267 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
         var status = AddRow("◎", "站点状态", "", ref rows);
         _serverRowIndex = rows - 1;
         RefreshSiteStatus();
+    }
+
+    // ─────────── Android 虚拟机（模拟器）───────────
+
+    private FocusableRow? _vmRow;
+    private FocusableRow? _vmWindowRow;
+    private bool _vmBusy;
+
+    /// <summary>「显示模拟器画面」当前值文案。</summary>
+    private static string ShowVmWindowText() =>
+        CatClawVideo.Core.Providers.SpiderBridgeClient.ShowEmulatorWindow ? "开（弹窗）" : "关（后台）";
+
+    private void RefreshVmStatus()
+    {
+        if (_vmRow is null) return;
+        try { _vmRow.ValueText = VmStatusText(); }
+        catch { _vmRow.ValueText = "状态未知"; }
+    }
+
+    /// <summary>
+    /// 这一行的状态文案：**先看运行环境装没装**（没装的话模拟器根本无从启动，状态只会是"未运行"），
+    /// 装了再看桥在不在跑。
+    /// </summary>
+    private static string VmStatusText()
+    {
+        if (!Services.RuntimeProvisioner.IsProvisioned)
+        {
+            var got = Math.Max(Services.RuntimeProvisioner.ResumedBytes, Services.RuntimeProvisioner.CachedZipBytes);
+            if (got >= Services.RuntimeProvisioner.AssetBytes) return "安装包已就绪 · 待安装";
+            if (got > 0)
+                return $"下载未完成（{got / 1024 / 1024} / {Services.RuntimeProvisioner.AssetBytes / 1024 / 1024} MB）";
+            return "未安装（jar / 网盘源不可用）· 点此安装";
+        }
+        return CatClawVideo.Core.Providers.SpiderBridgeClient.StatusText();
+    }
+
+    /// <summary>安装/启动/关闭期间的即时文案（进度百分比直接写在这一行上）。</summary>
+    private IProgress<double> VmProgress(string prefix) =>
+        new Progress<double>(p => MainThread.BeginInvokeOnMainThread(() =>
+        {
+            if (_vmRow is not null) _vmRow.ValueText = $"{prefix} {p * 100:0}%";
+        }));
+
+    /// <summary>「Android 虚拟机」行：打开（拉起模拟器 + 等桥就绪）/ 关闭（回收模拟器与内存）。</summary>
+    private async Task OnVmRowAsync()
+    {
+        if (_vmBusy) return;                       // 启动/关闭期间连按不叠加
+        var page = HostPage();
+        if (page is null) return;
+
+        const string install = "安装运行环境（下载约 938MB）";
+        const string installLocal = "用本地安装包安装";
+        const string open = "启动虚拟机（约 30~60 秒）";
+        var openWithWindow = CatClawVideo.Core.Providers.SpiderBridgeClient.ShowEmulatorWindow
+            ? "启动虚拟机（会弹出 Android 窗口）"
+            : "启动虚拟机（后台运行）";
+        const string close = "关闭虚拟机（释放 3~4GB 内存）";
+        const string peek = "看一眼模拟器画面（截图）";
+        const string openDir = "打开运行环境目录";
+        const string recheck = "重新检测";
+
+        var installed = Services.RuntimeProvisioner.IsProvisioned;
+        var running = CatClawVideo.Core.Providers.SpiderBridgeClient.EmulatorRunning;
+
+        // 装了没装决定能干什么：没装先给"安装"（这是启动模拟器的前提），装了才给启动/关闭
+        var actions = new List<string>();
+        if (!installed) { actions.Add(install); actions.Add(installLocal); }
+        else if (running) { actions.Add(close); actions.Add(peek); }
+        else actions.Add(openWithWindow);
+        actions.Add(openDir);
+        actions.Add(recheck);
+
+        var title = installed
+            ? (running ? "Android 虚拟机 · 运行中" : "Android 虚拟机 · 已安装未运行")
+            : "Android 虚拟机 · 运行环境未安装";
+        var pick = await page.DisplayActionSheetAsync(title, "取消", null, actions.ToArray());
+        if (string.IsNullOrEmpty(pick) || pick == "取消") return;
+
+        if (pick == peek) { await PeekVmAsync(page); return; }
+        if (pick == openDir) { OpenVmDir(); return; }
+        if (pick == recheck) { RefreshVmStatus(); await page.DisplayAlertAsync("Android 虚拟机", VmStatusText(), "好"); return; }
+
+        if (pick == install || pick == installLocal)
+        {
+            await InstallVmAsync(page, local: pick == installLocal);
+            return;
+        }
+
+        if (pick == openWithWindow || pick == open)
+        {
+            _vmBusy = true;
+            try
+            {
+                if (_vmRow is not null) _vmRow.ValueText = "启动中…（首次冷启约 1 分钟）";
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(180));
+                var ok = await Task.Run(() =>
+                    CatClawVideo.Core.Providers.SpiderBridgeClient.EnsureReadyAsync(cts.Token)).ConfigureAwait(true);
+                RefreshVmStatus();
+                await page.DisplayAlertAsync("Android 虚拟机", ok
+                    ? $"已就绪（{CatClawVideo.Core.Providers.SpiderBridgeClient.Serial ?? "已连接"}）——" +
+                      "jar 爬虫源与网盘源现在可用。"
+                    : "3 分钟内没连上。日志（设置 → 查看 / 导出日志）里搜 [bridge] 能看到卡在哪一步。",
+                    "好");
+            }
+            catch (OperationCanceledException)
+            {
+                await page.DisplayAlertAsync("Android 虚拟机",
+                    "等待超时（3 分钟）。模拟器可能还在冷启，回首页稍等会自己接上。", "好");
+            }
+            catch (Exception ex)
+            {
+                DiagLog.Write("[设置] 打开虚拟机失败：" + ex);
+                await page.DisplayAlertAsync("Android 虚拟机", "启动失败：" + ex.Message, "好");
+            }
+            finally { _vmBusy = false; RefreshVmStatus(); }
+            return;
+        }
+
+        // ── 关闭 ──
+        if (!CatClawVideo.Core.Providers.SpiderBridgeClient.EmulatorRunning)
+        {
+            await page.DisplayAlertAsync("Android 虚拟机", "当前没有由本程序启动的虚拟机。", "好");
+            RefreshVmStatus();
+            return;
+        }
+        if (!await page.DisplayAlertAsync("关闭 Android 虚拟机",
+                "关闭后 jar 爬虫源与网盘源立刻不可用，下次打开要重新冷启（约 30~60 秒）。确定关闭吗？",
+                "关闭", "取消"))
+            return;
+
+        _vmBusy = true;
+        if (_vmRow is not null) _vmRow.ValueText = "正在关闭…";
+        try { await Task.Run(CatClawVideo.Core.Providers.SpiderBridgeClient.ShutdownEmulator).ConfigureAwait(true); }
+        catch (Exception ex) { DiagLog.Write("[设置] 关闭虚拟机失败：" + ex); }
+        finally { _vmBusy = false; RefreshVmStatus(); }
+    }
+
+    /// <summary>
+    /// 安装运行环境（= 下载官方包并解压，或选本地的包）。装完**顺手把桥拉起来**，
+    /// 不用回首页、也不用重启程序。
+    /// </summary>
+    private async Task InstallVmAsync(Page page, bool local)
+    {
+        _vmBusy = true;
+        try
+        {
+            if (local)
+            {
+                var picked = await FilePicker.Default.PickAsync(new PickOptions
+                {
+                    PickerTitle = "选择 Android 运行环境安装包（catclaw-android-runtime-win64.zip）",
+                });
+                if (picked is null) return;
+                var zip = picked.FullPath;
+                if (string.IsNullOrEmpty(zip) || !File.Exists(zip))
+                {
+                    await page.DisplayAlertAsync("Android 虚拟机", "这个文件拿不到本机路径，请换一个位置再选。", "好");
+                    return;
+                }
+                if (!await page.DisplayAlertAsync("安装 Android 运行环境",
+                        $"将解压：{System.IO.Path.GetFileName(zip)}\n\n会先清掉已有的运行环境（不影响 AVD 数据、订阅与设置）。开始吗？",
+                        "开始安装", "取消"))
+                    return;
+                if (_vmRow is not null) _vmRow.ValueText = "安装中…";
+                await Task.Run(() => Services.RuntimeProvisioner.InstallFromZipAsync(
+                    zip, VmProgress("安装中"), stage => DiagLog.Write("[设置] " + stage),
+                    CancellationToken.None)).ConfigureAwait(true);
+            }
+            else
+            {
+                if (!await page.DisplayAlertAsync("安装 Android 运行环境",
+                        "· 下载约 938MB（断点续传，走镜像加速）\n" +
+                        "· 解压后约 2.6GB，落在**程序同目录**的 AndroidSdk\n" +
+                        "· 装好后会自动启动模拟器（首次冷启约 1 分钟）\n\n现在开始吗？",
+                        "开始下载", "以后再说"))
+                    return;
+                if (_vmRow is not null) _vmRow.ValueText = "下载中…";
+                await Task.Run(() => Services.RuntimeProvisioner.ProvisionAsync(
+                    VmProgress("下载中"), stage => DiagLog.Write("[设置] " + stage),
+                    CancellationToken.None)).ConfigureAwait(true);
+            }
+
+            RefreshVmStatus();
+            await page.DisplayAlertAsync("Android 虚拟机", "运行环境已就绪，正在启动模拟器…", "好");
+            if (_vmRow is not null) _vmRow.ValueText = "启动中…（首次冷启约 1 分钟）";
+            await Services.RuntimeBootstrapper.RunAsync().ConfigureAwait(true);   // 起模拟器 + 装桥
+            RefreshVmStatus();
+            await page.DisplayAlertAsync("Android 虚拟机",
+                CatClawVideo.Core.Providers.SpiderBridgeClient.EmulatorRunning
+                    ? $"已就绪（{CatClawVideo.Core.Providers.SpiderBridgeClient.Serial ?? "已连接"}）—— jar 爬虫源与网盘源可用。"
+                    : "运行环境装好了，但模拟器这次没连上。日志里搜 [bridge] 能看到卡在哪一步。",
+                "好");
+        }
+        catch (Exception ex)
+        {
+            DiagLog.Write("[设置] 安装运行环境失败：" + ex);
+            await page.DisplayAlertAsync("Android 虚拟机", "安装失败：" + ex.Message, "好");
+        }
+        finally { _vmBusy = false; RefreshVmStatus(); }
+    }
+
+    /// <summary>
+    /// 「临时看一眼模拟器状态」：adb 截一张当前画面 → 存到本机截图目录 → 用系统看图打开。
+    /// <para>不需要模拟器带窗口、也不用重启它（无窗口后台跑着照样能截）；多点几次就是连拍。</para>
+    /// </summary>
+    private async Task PeekVmAsync(Page page)
+    {
+        try
+        {
+            _vmBusy = true;
+            if (_vmRow is not null) _vmRow.ValueText = "正在截图…";
+            var dir = CatClawVideo.Core.AppPaths.LocalSub("screenshots");
+            var path = System.IO.Path.Combine(dir, $"emu-{DateTime.Now:HHmmss}.png");
+            var got = await CatClawVideo.Core.Providers.SpiderBridgeClient
+                .CaptureScreenshotAsync(path).ConfigureAwait(true);
+
+            if (got is null)
+            {
+                await page.DisplayAlertAsync("模拟器画面",
+                    CatClawVideo.Core.Providers.SpiderBridgeClient.Serial is { Length: > 0 }
+                        ? "截图失败（模拟器可能正忙或还没启动完）。稍后再试一次。"
+                        : "模拟器没在运行或桥没连上 —— 先在上一行「启动虚拟机」起来再看。", "好");
+                return;
+            }
+
+            try
+            {
+#if WINDOWS
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(got)
+                { UseShellExecute = true });
+#else
+                await Launcher.OpenAsync(new Uri(got));
+#endif
+            }
+            catch (Exception ex) { DiagLog.Write("[设置] 打开截图失败：" + ex.Message); }
+
+            await page.DisplayAlertAsync("模拟器画面",
+                "已截一张当前画面，用系统看图打开了。\n\n" +
+                "· 想再看一眼：再点一次（每次一张新的）\n" +
+                "· 截图存在：" + System.IO.Path.GetDirectoryName(got) + "\n" +
+                "· 想在窗口里直接操作模拟器：把上面那行「显示模拟器画面」打开，再重启一次虚拟机", "好");
+        }
+        catch (Exception ex)
+        {
+            DiagLog.Write("[设置] 看模拟器画面失败：" + ex);
+            await page.DisplayAlertAsync("模拟器画面", "截图失败：" + ex.Message, "好");
+        }
+        finally { _vmBusy = false; RefreshVmStatus(); }
+    }
+
+    /// <summary>打开运行环境目录（zip 缓存与解压目标都在这儿，手动放包也方便）。</summary>
+    private void OpenVmDir()
+    {
+        try
+        {
+            var dir = System.IO.Path.GetDirectoryName(Services.RuntimeProvisioner.ZipPath)!;
+            Directory.CreateDirectory(dir);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", dir)
+            { UseShellExecute = true });
+        }
+        catch (Exception ex) { DiagLog.Write("[设置] 打开运行环境目录失败：" + ex.Message); }
     }
 
     private void RefreshSiteStatus()

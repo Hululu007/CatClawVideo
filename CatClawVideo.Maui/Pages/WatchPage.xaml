@@ -41,8 +41,8 @@
             <!-- ═══ 线路行：右侧下拉框 = "切换线路"前缀 + 当前路线（17 条收进下拉） ═══ -->
             <Grid x:Name="RouteBar" ColumnDefinitions="*,Auto" ColumnSpacing="10"
                    Margin="0,2,0,0" VerticalOptions="Start">
-                <BoxView Grid.Column="0" Color="Transparent" />
-                <Border Grid.Column="1" StrokeThickness="0" StrokeShape="RoundRectangle 8"
+                <BoxView x:Name="RouteBarSpacer" Grid.Column="0" Color="Transparent" />
+                <Border x:Name="RoutePill" Grid.Column="1" StrokeThickness="0" StrokeShape="RoundRectangle 8"
                         BackgroundColor="{DynamicResource PrimaryColor}" Padding="14,6">
                     <Border.GestureRecognizers>
                         <TapGestureRecognizer Tapped="OnSwitchRouteClicked" />
@@ -67,7 +67,7 @@
                 </Grid.Margin>
 
                 <!-- 播放器（16:9 高度随宽自适应）+ 线路芯片 + 控制条 -->
-                <Border Grid.Column="0" StrokeThickness="0" StrokeShape="RoundRectangle 12" BackgroundColor="Black"
+                <Border x:Name="PlayerFrame" Grid.Column="0" StrokeThickness="0" StrokeShape="RoundRectangle 12" BackgroundColor="Black"
                         VerticalOptions="Start">
                     <Grid x:Name="PlayerHost" HeightRequest="340">
                         <controls:VideoPlayerView x:Name="Player"
