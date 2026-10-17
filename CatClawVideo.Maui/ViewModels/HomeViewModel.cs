@@ -355,6 +355,14 @@ public partial class HomeViewModel : ObservableObject
                         // 爬虫站冷启实测 36~46s；超 50s 还没动静 = 这条引擎链路已经废了
                         fatal = needsEngine;
                     }
+                    catch (CatClawVideo.Core.Providers.SiteHostPendingException hpe)
+                    {
+                        // 壳没获宿主准入（FishConfig / 设置中心 一族）：spider 回的是占位条目，
+                        // 重试多少次都是同一句 —— 直接退位首选站 + 立刻回退探测，
+                        // 省掉 5 次 × 8 秒纯空转（2026-10-17 实测：首选 🍼┆设置┆中心 时首载白等 37 秒）。
+                        why = hpe.Message;
+                        fatal = true;
+                    }
                     catch (Exception ex)
                     {
                         why = $"{ex.GetType().Name}: {ex.Message}";

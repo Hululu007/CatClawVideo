@@ -79,6 +79,12 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
         var rt = RuntimeFor(site) ?? throw new NotSupportedException(site.StatusNote ?? "爬虫运行时不可用");
         var raw = await rt.HomeContentAsync(site, ct).ConfigureAwait(false);
         var cats = SpiderJsonParser.ParseCategories(raw);
+        // 壳没获宿主准入：返回的是占位条目，重试无意义 —— 抛明确异常让首页立刻回退（2026-10-17）
+        if (cats.Count == 0 && HostPending.LooksLike(raw))
+        {
+            _log?.Invoke($"[准入] {site.Key}.home 返回宿主准入占位（hostAdmission=pending）");
+            throw new SiteHostPendingException(site.Name);
+        }
         // homeContent 的 list 字段 = 站点推荐（TVBox 首页「站点推荐」语义）。与分类同一次
         // 请求拿到，顺手解析缓存，GetHomeRecommendAsync 直接读，不再打网络。
         try { _homeRecommend[site.Key] = SpiderJsonParser.ParseItems(raw, site.Key); }

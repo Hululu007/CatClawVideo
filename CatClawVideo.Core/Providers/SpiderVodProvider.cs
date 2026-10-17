@@ -79,6 +79,12 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
         var rt = RuntimeFor(site) ?? throw new NotSupportedException(site.StatusNote ?? "爬虫运行时不可用");
         var raw = await rt.HomeContentAsync(site, ct).ConfigureAwait(false);
         var cats = SpiderJsonParser.ParseCategories(raw);
+        // 壳没获宿主准入：返回的是占位条目，重试无意义 —— 抛明确异常让首页立刻回退（2026-10-17）
+        if (cats.Count == 0 && HostPending.LooksLike(raw))
+        {
+            _log?.Invoke($"[准入] {site.Key}.home 返回宿主准入占位（hostAdmission=pending）");
+            throw new SiteHostPendingException(site.Name);
+        }
         _log?.Invoke($"[解析] {site.Key}.home → {raw.Length}B → 分类 {cats.Count} 个");
         return cats;
     }

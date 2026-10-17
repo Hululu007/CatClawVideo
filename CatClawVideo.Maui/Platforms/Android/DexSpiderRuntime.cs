@@ -99,7 +99,18 @@ public class DexSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderActi
     {
         if (await BridgeSpiderClient.TryCallAsync(site, "homeContent", new[] { "true" }, ct) is { } bridged)
             return bridged;
-        return await InvokeAsync(site, h => CallSafe(h, h.Home, new Java.Lang.Boolean(true)), ct);
+        var raw = await InvokeAsync(site, h => CallSafe(h, h.Home, new Java.Lang.Boolean(true)), ct);
+        // ★ 常驻诊断（2026-10-17 排查「设置中心打不开」时加的，保留）：spider 调用**不抛异常**、
+        //   只是返回空/占位，上层只会写一句"分类为空"，看不到到底返回了什么。
+        //   有这行，下次遇到「某站空分类」一眼就知道是准入占位、还是真没分类。
+        try
+        {
+            var head = raw is null ? "(null)" : raw.Replace("\r", " ").Replace("\n", " ");
+            if (head.Length > 400) head = head[..400];
+            Log($"homeContent[{site.Key}] len={(raw?.Length ?? -1)} 内容={head}");
+        }
+        catch { }
+        return raw;
     }
 
     public async Task<string> CategoryContentAsync(VodSiteInfo site, string tid, string pg,
@@ -765,6 +776,32 @@ public class DexSpiderRuntime : ISpiderRuntime, ISpiderProxyRuntime, ISpiderActi
             catch (System.Exception ex)
             {
                 Log($"⚠ 保护壳 DexLoader 绑定异常: {site.Key} → {ex.GetType().Name}: {ex.Message}");
+            }
+
+            // ★★ 非 Guard 壳必须走 TVBox 的 else 分支（2026-10-17 对比 jun 源码后补上）：
+            //   JarLoader.invokeInit 里 protectedInitJar.check(jar) 为 false 时，TVBox 调的是
+            //   Init.init(android.content.Context)【静态】—— 壳（FishNative/FishCrypto 那一族）
+            //   的宿主准入与授权状态就在这里初始化。
+            //   我们以前只实现 Guard 分支（jar 里有 DexNative 才处理）⇒ 摸鱼儿 FishConfig 这种
+            //   「无 DexNative 的壳」从未 init ⇒ spider 永远返回 {"hostAdmission":"pending"}、
+            //   设置中心打不开（真机实测 2026-10-17；对照：同一 jar 在 TVBox jun 上正常）。
+            if (!hasGuardNative)
+            {
+                try
+                {
+                    var initCtx = initCls.GetMethod("init",
+                        Java.Lang.Class.FromType(typeof(global::Android.Content.Context)));
+                    initCtx.Invoke(null, appCtx);
+                    Log($"Init.init(Context) 完成（非 Guard 壳路径）: {site.Key}");
+                }
+                catch (Java.Lang.Throwable t)
+                {
+                    Log($"⚠ Init.init(Context) 失败: {site.Key} → {Describe(t)}");
+                }
+                catch (System.Exception ex)
+                {
+                    Log($"⚠ Init.init(Context) 失败: {site.Key} → {ex.GetType().Name}: {ex.Message}");
+                }
             }
 
             // ③ 可选引导

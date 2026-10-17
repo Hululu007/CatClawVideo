@@ -180,7 +180,11 @@ public static class MauiProgram
 #if ANDROID
         var jarRuntime = new Platforms.Android.DexSpiderRuntime(
             Path.Combine(FileSystem.CacheDirectory, "spider"),
-            m => System.Diagnostics.Debug.WriteLine(m),
+            // ⚠ 必须同时进 DiagLog（= logcat 的 CatClawDiag）：
+
+  // Release 版只写 Debug.WriteLine 的话，jar 下载/initApi/spider 异常在真机上一概看不到
+            // —— 2026-10-17 排查「设置中心站点打不开」时踩到：logcat 里一条 [dex] 都没有。
+            m => { System.Diagnostics.Debug.WriteLine(m); DiagLog.Write(m); },
             // Guard 系网盘源弹「云盘配置」对话框需要前台 Activity（Alert 需要 Activity token）
             currentActivity: () => Microsoft.Maui.ApplicationModel.Platform.CurrentActivity);
 

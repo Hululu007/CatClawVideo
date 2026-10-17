@@ -313,7 +313,10 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
         sub.ShowArrow = true;
         sub.Activated += async (_, _) => await GoAsync("sourceconfig");
 
-        // Android 虚拟机（模拟器）：jar 爬虫源 / 网盘源全靠它，跑着占 3~4GB 内存。
+#if WINDOWS
+        // Android 虚拟机（模拟器）—— **仅 Windows 有意义**：Windows 端 jar/网盘源靠随包模拟器
+        // （本机数据目录那份运行环境）；安卓端是进程内 DexClassLoader 直接跑 jar 源，
+        // 既没有模拟器也不需要下载运行环境，所以这两行在安卓端**不显示**（2026-10-17 用户要求）。
         // 以前只有「启动时自动拉起」一条路 —— 想自己开（省得等冷启）自己关（释放内存）都没有入口。
         _vmRow = AddRow("🤖", "Android 虚拟机",
             "jar 爬虫源与网盘源要靠它；启动约 30~60 秒，关闭即刻释放 3~4GB 内存", ref rows);
@@ -338,6 +341,7 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
                       "如果虚拟机正在跑，先在上一行「关闭虚拟机」再启动一次才会生效。"
                     : "已关闭。下次启动虚拟机将回到后台运行（不弹窗）。", "好");
         };
+#endif
 
         // 直播源设置（TVBox「配置直播源」同款能力）：地址 / 本地文件 / 历史 + EPG·UA·超时。
         // 订阅自带的直播源自动导入，但可在这里手动配置覆盖（手填 > 源内 > 默认）。
