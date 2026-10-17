@@ -1,5 +1,38 @@
 # 更新日志
 
+## 0.3.1 — 2026-10-17
+
+> 从 **0.3.0** 起的全部改动。本版以**安卓端**为主：修好了「jar 源（设置中心 / 摸鱼儿那一族）打不开」，
+> 并让安卓端的排障日志第一次真正可见。
+
+### 修好：安卓端 jar 源「设置中心」打不开
+- **现象**：安卓端选到 `🍼┆设置┆中心`（`csp_FishConfig`）只显示一条「爬虫组件加载中，请稍候」，
+  首页拿到空分类 → 重试 5 次 → 回退探测别的站（首载白等约 37 秒）。**同一站点在 Windows 端正常**。
+- **定位**：拿手机上装的 TVBox jun 当参照系，对比 GitHub 上的 `JarLoader` / `ProtectedInitJar` 源码
+  （`xiaofu2415/StarFlowTV`、`daji888/oldTv`、`evecus/NovaBox`）后发现：TVBox 在
+  `protectedInitJar.check(jar) == false`（jar 里没有 `DexNative` —— 这个 Fish jar 正是）时，调的是壳的
+  **静态 `Init.init(Context)`**，壳的宿主准入/授权状态就在这一步初始化。我们此前只实现了 Guard 分支
+  （有 `DexNative` 才处理）⇒ 这类壳**从未 init** ⇒ spider 永远返回 `{"hostAdmission":"pending"}`。
+- **修复**：非 Guard 壳补调 `Init.init(Context)`（`DexSpiderRuntime`）。
+- **验证**：真机 `homeContent` 从 145 字节占位变成 608 字节**真分类**
+  （控制台 / 系统设置 / 智能海报墙 / 弹幕配置 / 媒体库设置 / B站设置 / 夸克网盘 / UC网盘 /
+  天翼网盘 / 移动云盘 / 百度网盘…），与 Windows、TVBox jun 一致。
+
+### 安卓端：排障与体验
+- **jar 运行时日志第一次进 logcat**：安卓 Release 下只写 `Debug.WriteLine`，真机上连一行 `[dex]` 都看不到
+  （这次是把壳绑定、jar 下载、`initApi` 全摸了一遍才定位到问题）。现在同时进 `DiagLog`。
+- **`homeContent` 原始返回常驻打印**：spider 不抛异常、只回空/占位时，以前上层只有一句「分类为空」；
+  现在直接能看到返回内容（145B 占位 与 608B 真分类一眼可辨）。
+- **准入占位识别**：`hostAdmission` / `__host_pending__` → 抛 `SiteHostPendingException`，
+  首页跳过剩余重试并把首选站退位（省掉 5 × 8 秒空转）。
+- **安卓端隐藏 Windows 专属设置**：「Android 虚拟机」「显示模拟器画面」两行不再出现在安卓设置里
+  （安卓是进程内 Dex 跑 jar 源，既没有模拟器、也不需要下载运行环境）。
+
+### 说明
+- 本版**不含 Windows 端功能变更**：`Init.init(Context)` 分支只在 `#if ANDROID` 的运行时里，
+  对 Windows 是零影响；Windows 安装包仍建议用 0.3.0。
+- 安卓端仍是进程内 `DexClassLoader` 跑 jar 源，本版修的是**壳的初始化**，不改变源协议本身。
+
 ## 0.3.0 — 2026-10-15
 
 > 从 **0.2.5** 起的全部改动。本版把 Android 运行环境做成「自包含 + 按需下载 + 完全可控」，
