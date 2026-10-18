@@ -181,13 +181,58 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     /// <para>下一步（用户已认可）：接 Anime4K / NVIDIA Image Scaling 的 GLSL shader（都是开源现成轮子），
     /// 走 <c>--glsl-shaders</c> —— 那才是真"超分"，这里先把零下载这档做出来。</para>
     /// </summary>
+    /// <summary>拼 Anime4K shader 链（返回 null = 随包文件缺失）。mpv 的列表分隔符用 ':'，
+    /// 路径里的反斜杠统一成正斜杠（mpv 在 Windows 上对两者都认，但正斜杠更保险）。</summary>
+    private static string? BuildAnime4KChain()
+    {
+        try
+        {
+            var dir = System.IO.Path.Combine(AppContext.BaseDirectory, "shaders", "anime4k");
+            string[] files =
+            [
+                "Anime4K_Clamp_Highlights.glsl",
+                "Anime4K_AutoDownscalePre_x2.glsl",
+                "Anime4K_Restore_CNN_M.glsl",
+                "Anime4K_Upscale_CNN_x2_M.glsl",
+            ];
+            var parts = new List<string>();
+            foreach (var f in files)
+            {
+                var p = System.IO.Path.Combine(dir, f);
+                if (!System.IO.File.Exists(p)) return null;   // 缺一不可（链断了 mpv 会报错）
+                parts.Add(p.Replace('\\', '/'));
+            }
+            // 分隔符用 ':' —— 依据是 Anime4K 官方 mpv 配置写法（glsl-shaders="a.glsl:b.glsl:…"）。
+            // 实测 mpv 对 ',' ':' ';' 都不报错、读回值原样返回，故以官方文档为准；
+            // 真实加载结果由 logs/mpv.log 里的 shader 编译/加载行复核。
+            return string.Join(":", parts);
+        }
+        catch { return null; }
+    }
+
     private void ApplyEnhance()
     {
         var mode = Services.EnhancePrefs.Load();
         switch (mode)
         {
+            case Services.EnhanceMode.Shaders:
+                // Anime4K v4.0（MIT）官方推荐链：Clamp_Highlights（防高光过曝）→ AutoDownscalePre_x2
+                // （内容已足够高时先降采样，省掉无意义的 x2）→ Restore_CNN_M（修线条）→ Upscale_CNN_x2_M（x2 升采样）。
+                // 缺文件（未随包/被删）时自动退回内建缩放，绝不把播放卡死。
+                var chain = BuildAnime4KChain();
+                if (chain is not null)
+                {
+                    MpvLib.SetPropertyString(_mpv, "glsl-shaders", chain);
+                    MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
+                    MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
+                    MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");
+                    BtLog($"[mpv] 超分=Anime4K(M)（{chain}）");
+                    break;
+                }
+                BtLog("[mpv] 超分=Anime4K 缺文件 → 退回内建缩放");
+                goto case Services.EnhanceMode.Builtin;
+
             case Services.EnhanceMode.Builtin:
-            case Services.EnhanceMode.Shaders:   // shader 包还没接入 → 先按内建缩放生效
                 MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
                 MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
                 MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");

@@ -10,9 +10,10 @@ public enum EnhanceMode
     /// 零下载、几乎不花钱，比 mpv 默认的 bilinear 明显锐利，但不是 AI 超分。</summary>
     Builtin,
 
-    /// <summary>GLSL shader 包（Anime4K / NIS 等）—— 下一步接入：随包或按需下载 glsl 目录，
-    /// 走 <c>--glsl-shaders</c>。这两个都是成熟开源轮子（Anime4K 动画向、NIS 真人向），
-    /// 我们只写目录管理与档位 UI，不自己写算法。</summary>
+    /// <summary>GLSL shader 超分：**Anime4K v4.0（MIT）** 随包 132KB，链 =
+    /// Clamp_Highlights → AutoDownscalePre_x2 → Restore_CNN_M → Upscale_CNN_x2_M。
+    /// 成熟开源轮子，我们只做目录管理 + 拼 <c>glsl-shaders</c>，不自己写算法。
+    /// 缺文件时自动退回 <see cref="Builtin"/>，不会把播放卡死。</summary>
     Shaders,
 }
 
@@ -33,7 +34,7 @@ public static class EnhancePrefs
     public static string Label(EnhanceMode mode) => mode switch
     {
         EnhanceMode.Builtin => "内建缩放",
-        EnhanceMode.Shaders => "shader（未接入）",
+        EnhanceMode.Shaders => "Anime4K",
         _ => "关",
     };
 
@@ -50,8 +51,9 @@ public static class EnhancePrefs
             "已开启「内建缩放」：升采样用 ewa_lanczossharp、降采样 mitchell，并开启 correct-downscaling。" +
             "\n\n零下载、几乎不增加开销，比默认缩放锐利。【重新起播生效】",
         EnhanceMode.Shaders =>
-            "「shader 超分」还没接入（下一步：随包/下载 Anime4K·NIS 的 glsl，挂 --glsl-shaders）。" +
-            "\n\n现在先按「内建缩放」生效。",
+            "已开启「Anime4K」超分（v4.0，官方推荐链：Clamp_Highlights → AutoDownscalePre_x2 → " +
+            "Restore_CNN_M → Upscale_CNN_x2_M）。\n\n动画片源效果最明显（线条更干净、边缘更锐）；" +
+            "真人片源也能用，但更推荐「内建缩放」。\n\n【重新起播生效】；若显卡吃力/掉帧就退回「内建缩放」。",
         _ => "已关闭超分（用 mpv 默认缩放）。【重新起播生效】",
     };
 }
