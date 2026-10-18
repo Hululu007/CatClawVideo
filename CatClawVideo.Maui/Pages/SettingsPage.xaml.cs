@@ -756,6 +756,39 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
             decRow.ValueText = Services.DecoderModePrefs.Label(next);
         };
 
+#if WINDOWS
+        // 播放内核（Windows 独有）：默认 mpv —— 插帧/超分这些 mpv 独有能力只有走它才生效。
+        // 留这个开关是为了出问题能一键退回最稳的 MF（FFmpegInteropX/MediaFoundation）。
+        var kernelRow = AddRow("▶", "播放内核（Windows）",
+            "默认 mpv（插帧/HDR 都在这条链上）；个别流放不动就切「MF 兼容」",
+            ref rows, Services.PlayerBackendPrefs.Label(Services.PlayerBackendPrefs.PreferMpv()));
+        kernelRow.Activated += async (_, _) =>
+        {
+            var next = !Services.PlayerBackendPrefs.PreferMpv();
+            Services.PlayerBackendPrefs.Save(next);
+            kernelRow.ValueText = Services.PlayerBackendPrefs.Label(next);
+            var host = HostPage();
+            if (host is not null)
+                await host.DisplayAlertAsync("播放内核", Services.PlayerBackendPrefs.Hint(next), "好");
+        };
+
+        // 插帧（Windows 独有）：我们的 Windows 播放器是 libmpv，插帧就是两条现成的 mpv 路径
+        //（时间维重采样 / lavfi minterpolate）；安卓端 ExoPlayer(Media3) 没有等价钩子 ——
+        // 只有 GlEffect 那层 shader，所以安卓端这一行不出现（2026-10-18 用户要求先试插帧）。
+        var interpRow = AddRow("⚡", "插帧（Windows）",
+            "消除 24fps 抖动：「平滑运动」几乎不耗资源；「运动补偿」是真 MEMC（1080p 实测约 1 个 CPU 核）",
+            ref rows, Services.InterpolationPrefs.Label(Services.InterpolationPrefs.Load()));
+        interpRow.Activated += async (_, _) =>
+        {
+            var next = Services.InterpolationPrefs.Next(Services.InterpolationPrefs.Load());
+            Services.InterpolationPrefs.Save(next);
+            interpRow.ValueText = Services.InterpolationPrefs.Label(next);
+            var host = HostPage();
+            if (host is not null)
+                await host.DisplayAlertAsync("插帧", Services.InterpolationPrefs.Hint(next), "好");
+        };
+#endif
+
         var histRow = AddRow("🕮", "历史条数上限", "超过就按「最早看过」删；同一部剧本来就合并成一条", ref rows,
             Services.HistoryCap.Label(Services.HistoryCap.Load()));
         histRow.Activated += (_, _) =>

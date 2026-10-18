@@ -76,6 +76,10 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
 
         // DV 日志：详细日志由 wait_event 的 LOG_MESSAGE 事件透出（见 EventPump）
 
+        // 插帧（Windows 独有，见 Services.InterpolationPrefs）：video-sync/interpolation 属初始化期选项，
+        // 起播前定案；读完偏好即落地，默认档不改变任何原有行为。
+        ApplyInterpolation();
+
         var rc = MpvLib.mpv_initialize(_mpv);
         if (rc < 0) throw new InvalidOperationException($"mpv_initialize 失败: {MpvErrorStr(rc)}");
 
@@ -120,6 +124,52 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
 
     private static void BtLog(string msg) =>
         Maui.Services.BtFileLog.Write(msg);
+
+    /// <summary>
+    /// 插帧：把设置页选定的档位落地到 mpv（**Windows 独有**，安卓端 ExoPlayer 没有等价钩子）。
+    /// <para>① 平滑运动 = <c>video-sync=display-resample + interpolation + tscale=oversample</c>：
+    /// 时间维重采样出中间帧，开销极低。依赖渲染侧上报 swap 估出刷新率 ——
+    /// <see cref="OnRenderFrame"/> 每次渲染后都调了 <c>mpv_render_context_report_swap</c>，这条链是通的。</para>
+    /// <para>② 运动补偿 = 上面三条 + <c>vf=lavfi=[minterpolate=…mi_mode=mci]</c>：真光流插帧，CPU 重。</para>
+    /// <para>③ 关 = 恢复 mpv 默认（<c>video-sync=audio</c>，画面按原帧率输出）。</para>
+    /// </summary>
+    private void ApplyInterpolation()
+    {
+        var mode = Services.InterpolationPrefs.Load();
+
+        // 防呆：DV 源在上层已被强制软解（hwdec=no，为了保住 RPU 做 tone-map），
+        // 再叠一层 CPU 光流插帧会把 5600 直接吃满、必然掉帧 —— 自动降级到「平滑运动」。
+        if (mode == Services.InterpolationMode.MotionCompensated && _dvSource)
+        {
+            BtLog("[mpv] DV 源 + 运动补偿 → 自动降级为「平滑运动」（软解已吃 CPU，再插帧必掉帧）");
+            mode = Services.InterpolationMode.Smooth;
+        }
+
+        switch (mode)
+        {
+            case Services.InterpolationMode.Smooth:
+                MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");
+                MpvLib.SetPropertyString(_mpv, "interpolation", "yes");
+                MpvLib.SetPropertyString(_mpv, "tscale", "oversample");
+                break;
+
+            case Services.InterpolationMode.MotionCompensated:
+                MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");
+                MpvLib.SetPropertyString(_mpv, "interpolation", "yes");
+                MpvLib.SetPropertyString(_mpv, "tscale", "oversample");
+                // mi_mode=mci 光流插帧 + aobmc 自适应重叠块补偿 + vsbmc 变尺寸块匹配：
+                // ffmpeg 里画质最好的一档；fps=60 是目标输出帧率（1080p 上 5600 跑得动）。
+                MpvLib.SetPropertyString(_mpv, "vf",
+                    "lavfi=[minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1]");
+                break;
+
+            default:
+                MpvLib.SetPropertyString(_mpv, "video-sync", "audio");
+                MpvLib.SetPropertyString(_mpv, "interpolation", "no");
+                break;
+        }
+        BtLog($"[mpv] 插帧={Services.InterpolationPrefs.Label(mode)}（{mode}）");
+    }
 
     // ═══════════ 渲染 ═══════════
 
@@ -246,14 +296,22 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     /// 夸克转码容器声明的比例常是错的（mpv: "Using container aspect ratio" → 21:9 被拉成 16:9
     /// 铺满无黑边）；读 video-params 的真实像素尺寸覆写，恢复标准上下黑边。幂等：值同不写。
     /// </summary>
+    /// <summary>真出画标志：只有**真正解出视频帧**时 mpv 的 <c>video-params/dw|dh</c> 才有值。
+    /// <para>2026-10-18 用它做 mpv 兜底的判据：夸克代理流上 mpv 会「成功打开」——
+    /// 日志 <c>audio=playing, video=eof</c>、首帧渲染 rc=0 —— 但画面**全黑**（rc=0 只说明我们的
+    /// render 调用成功，不说明有帧）。同一条流旧内核 MF 能正常出画，所以上层靠这个标志在
+    /// 6 秒内没出画时回落 MF。</para></summary>
+    public bool HasVideoFrame { get; private set; }
+
     private void FixAspectOverride()
     {
         if (_mpv == IntPtr.Zero) return;
-        if (_aspectMode is not (VideoAspect.AspectFit or VideoAspect.Original)) return;
         try
         {
             var dw = MpvLib.GetPropertyDouble(_mpv, "video-params/dw");
             var dh = MpvLib.GetPropertyDouble(_mpv, "video-params/dh");
+            if (dw > 0 && dh > 0) HasVideoFrame = true;   // ★ 出画判据（必须在下面的比例档早退之前）
+            if (_aspectMode is not (VideoAspect.AspectFit or VideoAspect.Original)) return;
             if (dw <= 0 || dh <= 0) return;
             var want = $"{(long)dw}/{(long)dh}";
             var cur = MpvLib.GetPropertyString(_mpv, "video-aspect-override");
@@ -297,6 +355,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             MpvLib.SetPropertyString(_mpv, "http-header-fields", string.Join(",", pairs));
         }
 
+        HasVideoFrame = false;   // 新源：复位出画标志（上层的起播看门狗按它判定）
         var rc = MpvLib.Command(_mpv, "loadfile", url, "replace");
         BtLog($"[mpv] loadfile rc={rc}: {url}");
         if (rc >= 0 && Math.Abs(_pendingSpeed - 1.0) > 0.001)

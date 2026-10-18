@@ -38,6 +38,8 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
     /// <summary>非 null 时接口方法全部转发给它（当前 = mpv 后端）。</summary>
     private IVideoPlayerImplementation? _delegate;
     private bool _mpvInitialized;   // mpv 实例只初始化一次（Initialize 失败会回落 MPE）
+    private string? _mpvFailedUrl;  // 本次会话里 mpv 打不开（起播 6 秒无视频帧）的 URL → 直接走 MF
+    private int _mpvWatchdogGen;    // 看门狗代数：换源/重开时作废旧看门狗
 
     /// <summary>libmpv 后端是否可用：输出目录里有 mpv-2.dll 才启用（不再随包，见 Initialize 注释）。</summary>
     private static bool MpvBackendAvailable() =>
@@ -221,18 +223,26 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
         try
         {
             // 2026-10-03：libmpv **不再随包**（用户判定「装了也不能播」，115.4MB 死重）。
-            //   仅当输出目录里真有 mpv-2.dll 时才启用该后端；缺件一律走 FFmpegInteropX/MF
-            //   （原默认路径），避免 DV 片源选中一个起不来的后端。
-            var useMpv = MpvBackendAvailable()
-                && (Mpv.DolbyVisionDetector.QuickMatch(url)
-                    || await Mpv.DolbyVisionDetector.ProbeAsync(url).ConfigureAwait(true));
-            if (gen != _detectionGen) return;   // 期间已换源
-
-            if (useMpv)
+            //   仅当输出目录里真有 mpv-2.dll 时才启用该后端；缺件一律走 FFmpegInteropX/MF。
+            // 2026-10-18（用户要求）：**默认内核换成 libmpv** —— mpv 独有的能力（插帧、
+            //   以后的 Anime4K/NIS 超分、gpu-next 缩放）只有走 mpv 才生效，而以前只有 DV 源走它，
+            //   普通片源全在 FFmpegInteropX/MF ⇒ 插帧设了也没人执行（实测 12:16 播放日志里一条 [mpv] 都没有）。
+            //   DV 探测现在只决定 hwdec（DV 必须软解保 RPU），不再决定「用不用 mpv」；
+            //   mpv-2.dll 缺失、或 Initialize/渲染确定性失败时，仍自动回落 MPE（原有兜底不变）。
+            //   出问题的逃生门：设置 → 播放 → 播放内核 → 「MF 兼容」。
+            var dv = false;
+            // ⚠ 必须全限定：本文件里 Services 是基类上的 IServiceProvider 属性，不是命名空间
+            // _mpvFailedUrl：这条 URL 上次把 mpv 撞黑了（6 秒无视频帧）→ 直接走 MF，别每次都黑一次
+            if (MpvBackendAvailable() && CatClawVideo.Maui.Services.PlayerBackendPrefs.PreferMpv()
+                && url != _mpvFailedUrl)
             {
-                ActivateMpv(url, headers, isDolbyVision: true);
+                dv = Mpv.DolbyVisionDetector.QuickMatch(url)
+                     || await Mpv.DolbyVisionDetector.ProbeAsync(url).ConfigureAwait(true);
+                if (gen != _detectionGen) return;   // 期间已换源
+                ActivateMpv(url, headers, isDolbyVision: dv);
                 return;
             }
+            if (gen != _detectionGen) return;
             // ⚠ 非 DV 源必须先解除 mpv 接管：_delegate 不清的话接口调用仍转发给 mpv，
             //   而 SetSourceMpe 又开了 FFmpeg/MF —— 双播放器同页面同时解码（13:01 实测）。
             if (_delegate is not null)
@@ -274,7 +284,7 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
             {
                 _mpvBackend.Initialize();
                 _mpvInitialized = true;   // 首次成功才算激活
-                Maui.Services.BtFileLog.Write("[player] libmpv 后端激活（DV/HDR tone-map 路径）");
+                Maui.Services.BtFileLog.Write($"[player] libmpv 内核激活（默认内核；DV={isDolbyVision}）");
             }
             catch (Exception ex)
             {
@@ -287,6 +297,35 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
         }
         _delegate = _mpvBackend;
         ((IVideoPlayerImplementation)_mpvBackend).SetSource(url, headers);
+
+        // ★ 起播看门狗（2026-10-18）：mpv 能在「只有音频、视频轨立刻 EOF」的流上"成功打开"
+        //   （日志 audio=playing / video=eof / 首帧渲染 rc=0），但画面**全黑** —— 同一条流旧内核 MF
+        //   能正常出画（夸克代理流实测）。6 秒内没有真视频帧就判定 mpv 吃不下：记住 URL（本次会话
+        //   不再对它用 mpv）并回落 MF 重放，用户至少能看到画面。
+        StartMpvWatchdog(url);
+    }
+
+    /// <summary>mpv 起播看门狗：6 秒内 <see cref="Mpv.MpvVideoBackend.HasVideoFrame"/> 仍为 false
+    /// ⇒ 判定这条流 mpv 吃不下 → 走 <see cref="OnMpvRenderFailed"/> 的既有回落链（MF 重放当前源）。</summary>
+    private void StartMpvWatchdog(string url)
+    {
+        var gen = ++_mpvWatchdogGen;
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            for (var i = 0; i < 12; i++)   // 12 × 500ms = 6s
+            {
+                await System.Threading.Tasks.Task.Delay(500).ConfigureAwait(false);
+                if (gen != _mpvWatchdogGen) return;                                     // 已换源/重开
+                var backend = _mpvBackend;
+                if (backend is null || !ReferenceEquals(_delegate, backend)) return;    // mpv 已不是当前内核
+                if (backend.HasVideoFrame) return;                                      // 出画了 → 正常
+            }
+            if (gen != _mpvWatchdogGen) return;
+            _mpvFailedUrl = url;
+            void Fallback() => OnMpvRenderFailed("mpv 打开流后 6 秒内没有视频帧（视频轨提前 EOF / 只有音频）");
+            if (_mpvRender?.DispatcherQueue is { } dq && !dq.HasThreadAccess) dq.TryEnqueue(Fallback);
+            else Fallback();
+        });
     }
 
     /// <summary>回到 MPE 路径（mpv 不可用回落；当前源非 DV）。</summary>
