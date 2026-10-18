@@ -159,8 +159,9 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             case Services.InterpolationMode.Rife:
                 // AI 插帧：环境就绪才挂 vf=vapoursynth（脚本由 RifeEnvironment 生成），
                 // 否则**自动退回运动补偿** —— 用户至少还有插帧，不会黑屏/卡住。
+                var rifeFps = Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load());
                 if (Services.RifeEnvironment.IsReady
-                    && Services.RifeEnvironment.EnsureScript() is { } vpy)
+                    && Services.RifeEnvironment.EnsureScript(rifeFps) is { } vpy)
                 {
                     MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");
                     MpvLib.SetPropertyString(_mpv, "interpolation", "yes");
@@ -181,8 +182,9 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 MpvLib.SetPropertyString(_mpv, "tscale", "oversample");
                 // mi_mode=mci 光流插帧 + aobmc 自适应重叠块补偿 + vsbmc 变尺寸块匹配：
                 // ffmpeg 里画质最好的一档；fps=60 是目标输出帧率（1080p 上 5600 跑得动）。
+                var target = Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load());
                 MpvLib.SetPropertyString(_mpv, "vf",
-                    "lavfi=[minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1]");
+                    $"lavfi=[minterpolate=fps={target}:mi_mode=mci:mc_mode=aobmc:vsbmc=1]");
                 break;
 
             default:
@@ -210,12 +212,14 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         try
         {
             var dir = System.IO.Path.Combine(AppContext.BaseDirectory, "shaders", "anime4k");
+            // 档位由「超分强度」决定：S/M/L（随包的 Anime4K v4.0 五档都在，先暴露这三档）
+            var tier = Services.EnhanceStrengthPrefs.Tier(Services.EnhanceStrengthPrefs.Load());
             string[] files =
             [
                 "Anime4K_Clamp_Highlights.glsl",
                 "Anime4K_AutoDownscalePre_x2.glsl",
-                "Anime4K_Restore_CNN_M.glsl",
-                "Anime4K_Upscale_CNN_x2_M.glsl",
+                $"Anime4K_Restore_CNN_{tier}.glsl",
+                $"Anime4K_Upscale_CNN_x2_{tier}.glsl",
             ];
             var parts = new List<string>();
             foreach (var f in files)

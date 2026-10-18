@@ -831,6 +831,36 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
         };
 #endif
 
+#if WINDOWS
+        // 超分强度（Windows 独有）：决定 Anime4K 用 S/M/L 哪一档 CNN 权重（随包 1.2MB 全在）
+        var enhStrengthRow = AddRow("🎚", "超分强度（Windows）",
+            "Anime4K 的 S/M/L 档：越大越锐、GPU 开销越高（「超分辨率」选 Anime4K 时才生效）",
+            ref rows, Services.EnhanceStrengthPrefs.Label(Services.EnhanceStrengthPrefs.Load()));
+        enhStrengthRow.Activated += async (_, _) =>
+        {
+            var (ok, val) = await PickPrefAsync("超分强度",
+                "轻 S：最省；中 M：平衡（默认）；强 L：更锐但吃 GPU",
+                Services.EnhanceStrengthPrefs.Load(), Services.EnhanceStrengthPrefs.Next, Services.EnhanceStrengthPrefs.Label);
+            if (!ok) return;
+            Services.EnhanceStrengthPrefs.Save(val);
+            enhStrengthRow.ValueText = Services.EnhanceStrengthPrefs.Label(val);
+        };
+
+        // 插帧强度 = 目标帧率（喂 minterpolate=fps 与 RIFE 的 fps_num）
+        var interpTargetRow = AddRow("🎚", "插帧目标帧率（Windows）",
+            "插帧到多少帧；高于显示器刷新率没有意义（真实结果看播放页左上角「出 xx fps」）",
+            ref rows, Services.InterpTargetPrefs.Label(Services.InterpTargetPrefs.Load()));
+        interpTargetRow.Activated += async (_, _) =>
+        {
+            var (ok, val) = await PickPrefAsync("插帧目标帧率",
+                "24/30fps 片源：60 最稳、90/120 更顺但开销更大",
+                Services.InterpTargetPrefs.Load(), Services.InterpTargetPrefs.Next, Services.InterpTargetPrefs.Label);
+            if (!ok) return;
+            Services.InterpTargetPrefs.Save(val);
+            interpTargetRow.ValueText = Services.InterpTargetPrefs.Label(val);
+        };
+#endif
+
         var histRow = AddRow("🕮", "历史条数上限", "超过就按「最早看过」删；同一部剧本来就合并成一条", ref rows,
             Services.HistoryCap.Label(Services.HistoryCap.Load()));
         histRow.Activated += async (_, _) =>
