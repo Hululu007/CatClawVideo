@@ -445,7 +445,11 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         {
             var dw = MpvLib.GetPropertyDouble(_mpv, "video-params/dw");
             var dh = MpvLib.GetPropertyDouble(_mpv, "video-params/dh");
-            if (dw > 0 && dh > 0) HasVideoFrame = true;   // ★ 出画判据（必须在下面的比例档早退之前）
+            if (dw > 0 && dh > 0)
+            {
+                HasVideoFrame = true;   // ★ 出画判据（必须在下面的比例档早退之前）
+                ApplyHeavySourceGuard(dw, dh);   // ★ 4K 保护（见下）
+            }
             if (_aspectMode is not (VideoAspect.AspectFit or VideoAspect.Original)) return;
             if (dw <= 0 || dh <= 0) return;
             var wantValue = dw / dh;
@@ -460,6 +464,48 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             if (TryParseAspect(cur, out var curValue) && Math.Abs(curValue - wantValue) < 0.002) return;
             MpvLib.SetPropertyString(_mpv, "video-aspect-override", want);
             BtLog($"[mpv] 强制按编码像素比例 letterbox: {want}（忽略容器声明 {cur ?? "无"}）");
+        }
+        catch { }
+    }
+
+    private bool _heavyGuardApplied;
+
+    /// <summary>
+    /// 4K 保护（2026-10-18 自测实测发现）：源是 4K（3840×2160）时，
+    /// ① <c>minterpolate</c> 的 mci 运动补偿**根本跑不动** —— 左上角状态浮层实测显示
+    ///    「源 24fps · 3840×2160 / 出 24fps」，即插帧一帧都没插上，白白占着 CPU；
+    /// ② Anime4K 的 Upscale_CNN_x2 更是白烧 GPU —— 4K 源在 2560 宽的屏上本来就是**降采样**，
+    ///    先放大 2 倍再缩回去，纯浪费。
+    /// 所以在**第一帧到达、知道真实尺寸之后**（这里）做一次性降级：重插帧 → 平滑运动，
+    /// 并清掉 shader 链（内建缩放继续有效）。用户的选择不写回设置，只对这条源生效。
+    /// </summary>
+    private void ApplyHeavySourceGuard(double dw, double dh)
+    {
+        if (_heavyGuardApplied || _mpv == IntPtr.Zero) return;
+        _heavyGuardApplied = true;
+        try
+        {
+            var bigSource = dh > 1200 || dw > 2000;      // 超过 1080p 就算重源
+            if (!bigSource) return;
+
+            var mode = Services.InterpolationPrefs.Load();
+            if (mode == Services.InterpolationMode.MotionCompensated)
+            {
+                MpvLib.SetPropertyString(_mpv, "vf", "");
+                MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");
+                MpvLib.SetPropertyString(_mpv, "interpolation", "yes");
+                MpvLib.SetPropertyString(_mpv, "tscale", "oversample");
+                BtLog($"[mpv] ⚠ 重源保护：{(long)dw}×{(long)dh} 上 minterpolate 跑不动（实测出帧率不涨）→ 本条源改用平滑运动");
+            }
+
+            if (Services.EnhancePrefs.Load() == Services.EnhanceMode.Shaders)
+            {
+                MpvLib.Command(_mpv, "glsl-shaders-clr");
+                MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
+                MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
+                MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");
+                BtLog($"[mpv] ⚠ 重源保护：{(long)dw}×{(long)dh} 是降采样场景，Anime4K 的 x2 升采样无意义 → 本条源改用内建缩放");
+            }
         }
         catch { }
     }
