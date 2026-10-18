@@ -11,8 +11,61 @@ public static class MauiProgram
     /// <summary>全局服务定位器（平台层/页面无构造注入时的入口）</summary>
     public static IServiceProvider Services { get; private set; } = null!;
 
+#if WINDOWS
+    private static Mutex? _instanceMutex;
+
+    /// <summary>命名 Mutex 占位：true = 我是首个实例。
+    /// <para>万一 Mutex 本身出问题（权限/命名冲突），返回 true —— 宁可多开也不要拦死启动。</para></summary>
+    private static bool TryClaimSingleInstance()
+    {
+        try
+        {
+            _instanceMutex = new Mutex(initiallyOwned: true, @"Local\CatClawVideo.Maui.SingleInstance", out var isFirst);
+            return isFirst;
+        }
+        catch { return true; }
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    /// <summary>把已有实例的窗口拉到前台（进程名找不到就静默返回）。</summary>
+    private static void ActivateExistingWindow()
+    {
+        try
+        {
+            var me = Environment.ProcessId;
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("CatClawVideo.Maui"))
+            {
+                if (p.Id == me || p.MainWindowHandle == IntPtr.Zero) continue;
+                ShowWindow(p.MainWindowHandle, 9);      // SW_RESTORE
+                SetForegroundWindow(p.MainWindowHandle);
+                break;
+            }
+        }
+        catch { }
+    }
+#endif
+
     public static MauiApp CreateMauiApp()
     {
+#if WINDOWS
+        // ★ 单实例保护（2026-10-18 自测发现）：应用允许多开会**互相抢模拟器 / adb 端口 / 桥服务** ——
+        //   实测症状：两个实例各自反复预热 VM（每约 2 分钟一轮）、桥连接被抢断
+        //   （用户看到「线路加载失败：桥会话已断开（主桥刚崩溃，正在重建）」），
+        //   而且我所有时延测量都被污染。用户双击两次图标就能踩到，所以在这里硬拦。
+        if (!TryClaimSingleInstance())
+        {
+            try { CatClawVideo.Maui.Services.BtFileLog.Write("[启动] 已有实例在运行 → 激活它并退出（单实例保护）"); } catch { }
+            ActivateExistingWindow();
+            Environment.Exit(0);                          // 不构建 UI、不碰模拟器
+            return MauiApp.CreateBuilder().Build();       // 到不了，仅为满足返回类型
+        }
+#endif
+
         var builder = MauiApp.CreateBuilder();
         builder
             .UseMauiApp<App>()
