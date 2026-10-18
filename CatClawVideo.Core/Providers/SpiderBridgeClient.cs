@@ -941,8 +941,19 @@ public static class SpiderBridgeClient
     /// <para>做法：<c>adb shell monkey</c> 拉起 launcher activity（比 am start 稳，不需要知道 activity 名），
     /// 然后等 <see cref="Ready"/> 恢复，最多约 15 秒；返回是否恢复。</para>
     /// </summary>
+    private static int _reviving;
+
     public static async Task<bool> ReviveBridgeAppAsync(CancellationToken ct = default)
     {
+        // ★ 单飞（2026-10-18 自测）：97 个站点并发失败时，**每个失败都会各自发起一次自愈** ——
+        //   实测 0.3 秒内出现 5+ 条「自愈成功」，每次都跑一遍 adb（拉起 + 等就绪），纯浪费。
+        //   这里只允许一个真正执行，其余等它的结果（最多 15 秒）。
+        if (Interlocked.CompareExchange(ref _reviving, 1, 0) != 0)
+        {
+            for (var i = 0; i < 30 && !Ready; i++)
+                await Task.Delay(500, ct).ConfigureAwait(false);
+            return Ready;
+        }
         try
         {
             var adb = FindAdb();
@@ -959,6 +970,7 @@ public static class SpiderBridgeClient
             return Ready;
         }
         catch (Exception ex) { Log?.Invoke("[bridge] 自愈异常: " + ex.Message); return false; }
+        finally { Volatile.Write(ref _reviving, 0); }
     }
 
     /// <summary>桥内聚合搜索的结果流（<c>ev=search</c> 单站结果、<c>ev=search-done</c> 收尾）。</summary>
