@@ -1375,6 +1375,11 @@ public static class SpiderBridgeClient
         catch (Exception ex)
         {
             Log?.Invoke($"[bridge] {site.Key}.{method} 异常：{ex.Message}");
+            // ★ 自愈（2026-10-18 自测实证）：桥 APK 被 Android 杀掉后，**两条通道会一起失效** ——
+            //   外置桥与 guest 共用同一个 ART VM（见文件头与「迅雷引擎合并」注释），
+            //   所以上层回落 guest 也照样失败，用户看到「线路加载失败：桥会话已断开（主桥刚崩溃，正在重建）」。
+            //   这里**后台异步**把桥拉回来（不阻塞本次调用），下一次调用时已恢复 —— 用户不必自己点重试。
+            _ = Task.Run(async () => { try { await ReviveBridgeAppAsync().ConfigureAwait(false); } catch { } });
             Forget();
             return null;
         }
