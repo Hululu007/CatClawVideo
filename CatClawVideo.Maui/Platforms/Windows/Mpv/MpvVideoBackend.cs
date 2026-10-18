@@ -166,9 +166,11 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                     BtLog($"[mpv] 插帧=RIFE(AI) → vf=vapoursynth={vpy}");
                     break;
                 }
-                BtLog($"[mpv] 插帧=RIFE 环境未就绪（{Services.RifeEnvironment.StatusText}）→ 退回运动补偿");
-                mode = Services.InterpolationMode.MotionCompensated;   // 让末尾的档位日志与实际生效一致
-                goto case Services.InterpolationMode.MotionCompensated;
+                // ⚠ 退回**平滑运动**而不是运动补偿：运动补偿是最重的一档（lavfi minterpolate 吃 CPU，
+                //   4K 片源直接卡成幻灯片 —— 2026-10-18 用户实测反馈）。环境未就绪时给最便宜的那档。
+                BtLog($"[mpv] 插帧=RIFE 环境未就绪（{Services.RifeEnvironment.StatusText}）→ 退回平滑运动（最省）");
+                mode = Services.InterpolationMode.Smooth;   // 末尾档位日志与实际生效一致
+                goto case Services.InterpolationMode.Smooth;
 
             case Services.InterpolationMode.MotionCompensated:
                 MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");

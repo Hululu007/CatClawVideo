@@ -731,29 +731,35 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
         //   现在接成真开关：点一下轮一档，值存 Preferences，播放页起播时读。
         var aspectRow = AddRow("▣", "默认画面比例", "变形拉伸只在片源比例与屏幕差太多时用", ref rows,
             Services.AspectPrefs.Label(Services.AspectPrefs.Load()));
-        aspectRow.Activated += (_, _) =>
+        aspectRow.Activated += async (_, _) =>
         {
-            var next = Services.AspectPrefs.Next(Services.AspectPrefs.Load());
-            Services.AspectPrefs.Save(next);
-            aspectRow.ValueText = Services.AspectPrefs.Label(next);
+            var (ok, val) = await PickPrefAsync("默认画面比例", "变形拉伸只在片源比例与屏幕差太多时用",
+                Services.AspectPrefs.Load(), Services.AspectPrefs.Next, Services.AspectPrefs.Label);
+            if (!ok) return;
+            Services.AspectPrefs.Save(val);
+            aspectRow.ValueText = Services.AspectPrefs.Label(val);
         };
 
         var speedRow = AddRow("⏩", "默认倍速", "每次起播的初始倍速，播放中仍可临时调", ref rows,
             Services.SpeedPrefs.Label(Services.SpeedPrefs.Load()));
-        speedRow.Activated += (_, _) =>
+        speedRow.Activated += async (_, _) =>
         {
-            var next = Services.SpeedPrefs.Next(Services.SpeedPrefs.Load());
-            Services.SpeedPrefs.Save(next);
-            speedRow.ValueText = Services.SpeedPrefs.Label(next);
+            var (ok, val) = await PickPrefAsync("默认倍速", "每次起播的初始倍速，播放中仍可临时调",
+                Services.SpeedPrefs.Load(), Services.SpeedPrefs.Next, Services.SpeedPrefs.Label);
+            if (!ok) return;
+            Services.SpeedPrefs.Save(val);
+            speedRow.ValueText = Services.SpeedPrefs.Label(val);
         };
 
         var decRow = AddRow("⚙", "解码模式", "花屏/绿屏/无声时换一档试试（对位 TVBox 的硬解/软解切换）", ref rows,
             Services.DecoderModePrefs.Label(Services.DecoderModePrefs.Load()));
-        decRow.Activated += (_, _) =>
+        decRow.Activated += async (_, _) =>
         {
-            var next = Services.DecoderModePrefs.Next(Services.DecoderModePrefs.Load());
-            Services.DecoderModePrefs.Save(next);
-            decRow.ValueText = Services.DecoderModePrefs.Label(next);
+            var (ok, val) = await PickPrefAsync("解码模式", "花屏/绿屏/无声时换一档试试",
+                Services.DecoderModePrefs.Load(), Services.DecoderModePrefs.Next, Services.DecoderModePrefs.Label);
+            if (!ok) return;
+            Services.DecoderModePrefs.Save(val);
+            decRow.ValueText = Services.DecoderModePrefs.Label(val);
         };
 
 #if WINDOWS
@@ -764,12 +770,16 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
             ref rows, Services.PlayerBackendPrefs.Label(Services.PlayerBackendPrefs.PreferMpv()));
         kernelRow.Activated += async (_, _) =>
         {
-            var next = !Services.PlayerBackendPrefs.PreferMpv();
-            Services.PlayerBackendPrefs.Save(next);
-            kernelRow.ValueText = Services.PlayerBackendPrefs.Label(next);
+            var cur = Services.PlayerBackendPrefs.PreferMpv();
+            var (ok, val) = await PickPrefAsync("播放内核",
+                "mpv：插帧/超分只在它这条链上；MF 兼容：个别流 mpv 放不动时用",
+                cur, Services.PlayerBackendPrefs.Next, Services.PlayerBackendPrefs.Label);
+            if (!ok) return;
+            Services.PlayerBackendPrefs.Save(val);
+            kernelRow.ValueText = Services.PlayerBackendPrefs.Label(val);
             var host = HostPage();
             if (host is not null)
-                await host.DisplayAlertAsync("播放内核", Services.PlayerBackendPrefs.Hint(next), "好");
+                await host.DisplayAlertAsync("播放内核", Services.PlayerBackendPrefs.Hint(val), "好");
         };
 
         // 超分（Windows 独有）：走 mpv 的 gpu 缩放链（内建 scaler；shader 包是下一步的 Anime4K/NIS）
@@ -778,12 +788,15 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
             ref rows, Services.EnhancePrefs.Label(Services.EnhancePrefs.Load()));
         enhRow.Activated += async (_, _) =>
         {
-            var next = Services.EnhancePrefs.Next(Services.EnhancePrefs.Load());
-            Services.EnhancePrefs.Save(next);
-            enhRow.ValueText = Services.EnhancePrefs.Label(next);
+            var (ok, val) = await PickPrefAsync("超分辨率",
+                "内建缩放：零下载；Anime4K：随包 shader，动画最明显（真人更推荐内建）",
+                Services.EnhancePrefs.Load(), Services.EnhancePrefs.Next, Services.EnhancePrefs.Label);
+            if (!ok) return;
+            Services.EnhancePrefs.Save(val);
+            enhRow.ValueText = Services.EnhancePrefs.Label(val);
             var host = HostPage();
             if (host is not null)
-                await host.DisplayAlertAsync("超分辨率", Services.EnhancePrefs.Hint(next), "好");
+                await host.DisplayAlertAsync("超分辨率", Services.EnhancePrefs.Hint(val), "好");
         };
 
         // 插帧（Windows 独有）：我们的 Windows 播放器是 libmpv，插帧就是两条现成的 mpv 路径
@@ -794,22 +807,39 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
             ref rows, Services.InterpolationPrefs.Label(Services.InterpolationPrefs.Load()));
         interpRow.Activated += async (_, _) =>
         {
-            var next = Services.InterpolationPrefs.Next(Services.InterpolationPrefs.Load());
-            Services.InterpolationPrefs.Save(next);
-            interpRow.ValueText = Services.InterpolationPrefs.Label(next);
+            var (ok, val) = await PickPrefAsync("插帧",
+                "平滑运动：几乎不耗资源；运动补偿：真 MEMC 但吃 CPU（4K 会卡）；RIFE：AI，需先下载 ~300MB 环境",
+                Services.InterpolationPrefs.Load(), Services.InterpolationPrefs.Next, Services.InterpolationPrefs.Label);
+            if (!ok) return;
+
             var host = HostPage();
+            // RIFE 环境没装就不要让人"选了个假档"：明确告知并保持原档不变（旧版会静默退回最重的
+            // 运动补偿 —— 用户开着 4K 片源时直接卡成幻灯片，2026-10-18 实测反馈）。
+            if (val == Services.InterpolationMode.Rife && !Services.RifeEnvironment.IsReady)
+            {
+                if (host is not null)
+                    await host.DisplayAlertAsync("插帧 · RIFE 还不能用",
+                        Services.RifeEnvironment.StatusText + "\n\n" +
+                        "下载入口还没做好（下一步）。现在先选「平滑运动」或「运动补偿」。", "好");
+                return;
+            }
+
+            Services.InterpolationPrefs.Save(val);
+            interpRow.ValueText = Services.InterpolationPrefs.Label(val);
             if (host is not null)
-                await host.DisplayAlertAsync("插帧", Services.InterpolationPrefs.Hint(next), "好");
+                await host.DisplayAlertAsync("插帧", Services.InterpolationPrefs.Hint(val), "好");
         };
 #endif
 
         var histRow = AddRow("🕮", "历史条数上限", "超过就按「最早看过」删；同一部剧本来就合并成一条", ref rows,
             Services.HistoryCap.Label(Services.HistoryCap.Load()));
-        histRow.Activated += (_, _) =>
+        histRow.Activated += async (_, _) =>
         {
-            var next = Services.HistoryCap.Next(Services.HistoryCap.Load());
-            Services.HistoryCap.Save(next);
-            histRow.ValueText = Services.HistoryCap.Label(next);
+            var (ok, val) = await PickPrefAsync("历史条数上限", "超过就按「最早看过」删；同一部剧本来就合并成一条",
+                Services.HistoryCap.Load(), Services.HistoryCap.Next, Services.HistoryCap.Label);
+            if (!ok) return;
+            Services.HistoryCap.Save(val);
+            histRow.ValueText = Services.HistoryCap.Label(val);
         };
 
         AddRow("◉", "电视遥控焦点样式", "", ref rows, "白色描边 + 放大");
@@ -1061,6 +1091,42 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
     private static int _aboutTaps;
 
     /// <summary>本页是 ContentView（tab 内容），弹窗得找承载它的 Page。</summary>
+    /// <summary>
+    /// 统一的选择弹窗（设置项一律「点开选」，不再「点一下轮一档」）。
+    /// <para>为什么能通用：本仓库每个设置项都是一个 Prefs 类，遵守同一套约定 ——
+    /// Load/Save/Label/Next，其中 Next 是纯函数。于是拿 Next 从当前值转一圈就能得到
+    /// 完整档位表（回到起点即闭合），不需要给每个类再加一个 Options()。</para>
+    /// <para>返回选中值；取消返回 default。</para>
+    /// </summary>
+    private async Task<(bool Ok, T Value)> PickPrefAsync<T>(
+        string title, string? note, T current, Func<T, T> next, Func<T, string> label)
+    {
+        var host = HostPage();
+        if (host is null) return (false, current);
+
+        var values = new List<T>();
+        var cur = current;
+        for (var i = 0; i < 12; i++)                       // 上限 12 档，防 Next 实现异常时死循环
+        {
+            if (i > 0 && EqualityComparer<T>.Default.Equals(cur, current)) break;
+            values.Add(cur);
+            cur = next(cur);
+        }
+        if (values.Count <= 1) return (false, current);     // 只有一档，不必弹
+
+        var labels = values.Select(label).ToList();
+        var currentIndex = values.FindIndex(v => EqualityComparer<T>.Default.Equals(v, current));
+        for (var i = 0; i < labels.Count; i++)
+            labels[i] = i == currentIndex ? labels[i] + "  ✓（当前）" : labels[i];
+
+        var pick = await host.DisplayActionSheetAsync(
+            string.IsNullOrEmpty(note) ? title : title + "\n" + note, "取消", null, labels.ToArray());
+        if (string.IsNullOrEmpty(pick) || pick == "取消") return (false, current);
+
+        var idx = labels.IndexOf(pick);
+        return idx < 0 ? (false, current) : (true, values[idx]);
+    }
+
     ContentPage? HostPage()
     {
         for (VisualElement? v = this; v is not null; v = v.Parent as VisualElement)

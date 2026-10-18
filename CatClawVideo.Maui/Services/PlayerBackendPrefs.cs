@@ -19,6 +19,9 @@ public static class PlayerBackendPrefs
 
     public static string Label(bool preferMpv) => preferMpv ? "mpv（默认）" : "MF 兼容";
 
+    /// <summary>供设置页的通用选择器枚举档位（回环）。</summary>
+    public static bool Next(bool preferMpv) => !preferMpv;
+
     public static string Hint(bool preferMpv) => preferMpv
         ? "已切到 mpv 内核：【重新起播生效】。\n\n" +
           "好处：插帧可用，HDR/杜比视界 tone-map 一致，后续超分（Anime4K/NIS）也在这一侧。\n\n" +
