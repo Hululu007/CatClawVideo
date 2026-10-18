@@ -167,7 +167,17 @@ public partial class App : Application
         // 不碰用户自己在 Android Studio 里开的模拟器。
         window.Destroying += (_, _) =>
         {
-            try { CatClawVideo.Core.Providers.SpiderBridgeClient.ShutdownEmulator(); } catch { }
+            // ★ 模拟器常驻（2026-10-18 用户要求）：打开后退出**不关**模拟器，
+            //   下次启动直接复用（启动路径本来就有 EmulatorRunning 复用判断），
+            //   省掉每次约 1 分钟的冷启动 —— 代价是常驻约 2.5GB 内存。
+            if (Services.EmulatorPrefs.KeepAlive)
+            {
+                Services.BtFileLog.Write("[桥] 模拟器常驻已开启 → 退出时不关闭模拟器（下次启动直接复用）");
+            }
+            else
+            {
+                try { CatClawVideo.Core.Providers.SpiderBridgeClient.ShutdownEmulator(); } catch { }
+            }
         };
 
         window.HandlerChanged += (_, _) =>

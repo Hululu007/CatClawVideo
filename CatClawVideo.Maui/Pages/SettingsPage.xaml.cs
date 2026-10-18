@@ -323,6 +323,27 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
         RefreshVmStatus();
         _vmRow.Activated += async (_, _) => await OnVmRowAsync();
 
+        // 模拟器常驻（2026-10-18 用户要求）：退出应用时不关模拟器 → 下次启动直接复用，
+        // 省掉每次约 1 分钟的冷启动（开发/测试必备）。代价：常驻约 2.5GB 内存。
+        _vmKeepAliveRow = AddRow("🔌", "模拟器常驻",
+            "退出应用时不关闭虚拟机，下次启动直接复用（省掉每次 ~1 分钟冷启动；常驻约 2.5GB 内存）",
+            ref rows, Services.EmulatorPrefs.Label(Services.EmulatorPrefs.KeepAlive));
+        _vmKeepAliveRow.Activated += async (_, _) =>
+        {
+            var host = HostPage();
+            var (ok, val) = await PickPrefAsync("模拟器常驻",
+                "常驻：退出不关，下次秒起（吃 2.5GB 内存）；随应用关闭：退出即释放",
+                Services.EmulatorPrefs.KeepAlive, Services.EmulatorPrefs.Next, Services.EmulatorPrefs.Label);
+            if (!ok) return;
+            Services.EmulatorPrefs.KeepAlive = val;
+            if (_vmKeepAliveRow is not null) _vmKeepAliveRow.ValueText = Services.EmulatorPrefs.Label(val);
+            if (host is not null)
+                await host.DisplayAlertAsync("模拟器常驻", val
+                    ? "已开启：退出猫爪影视时**不会关闭**虚拟机，下次启动直接复用（秒起）。\n\n" +
+                      "想立刻释放内存：设置 → Android 虚拟机 → 关闭虚拟机。"
+                    : "已关闭：退出应用时会关闭虚拟机并释放内存（下次启动需冷启动，约 1 分钟）。", "好");
+        };
+
         // 显示模拟器画面：默认关（后台跑，没人要看）。打开后启动模拟器会弹出它自己的
         // Android 窗口，可以直接在里面操作 —— 排查 jar 源 / 试用站点时有用（2026-10-15 用户要求）。
         _vmWindowRow = AddRow("🖥️", "显示模拟器画面",
@@ -440,6 +461,7 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
 
     private FocusableRow? _vmRow;
     private FocusableRow? _vmWindowRow;
+    private FocusableRow? _vmKeepAliveRow;
     private bool _vmBusy;
 
     /// <summary>「显示模拟器画面」当前值文案。</summary>

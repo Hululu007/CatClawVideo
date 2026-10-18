@@ -15,6 +15,7 @@ namespace CatClawVideo.Maui.Pages;
 public partial class WatchPage
 {
     private IDispatcherTimer? _statsTimer;
+    private long _lastStatsLogMs;   // 临时诊断用的节流
 
     private void SyncStatsOverlay(bool visible)
     {
@@ -50,6 +51,16 @@ public partial class WatchPage
 
             var interp = Services.InterpolationPrefs.Load() != Services.InterpolationMode.Off;
             var enhance = Services.EnhancePrefs.Load() != Services.EnhanceMode.Off;
+            // 临时诊断（2026-10-18 自测）：把 mpv 原始数值一起记进 bt.log，用来判定
+            // estimated-vf-fps 到底反不反映 lavfi 插帧的实际输出（浮层读数曾与源帧率一样，可疑）。
+            if (Environment.TickCount64 - _lastStatsLogMs > 3000)
+            {
+                _lastStatsLogMs = Environment.TickCount64;
+                Maui.Services.BtFileLog.Write(
+                    $"[stats] 源={s.SrcW:0}x{s.SrcH:0}@{s.SrcFps:0.##} 出={s.OutW:0}x{s.OutH:0}@{s.OutFps:0.##} " +
+                    $"插帧={Services.InterpolationPrefs.Load()} 超分={Services.EnhancePrefs.Load()} 强度={Services.EnhanceStrengthPrefs.Load()} 目标={Services.InterpTargetPrefs.Load()}");
+            }
+
             var src = $"源 {s.SrcFps:0.##}fps · {(long)s.SrcW}×{(long)s.SrcH}";
 
             if (!interp && !enhance)
