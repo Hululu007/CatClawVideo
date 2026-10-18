@@ -765,6 +765,25 @@ public static class SpiderBridgeClient
             // ⚠ 窗口必须盖住**模拟器冷启动**（实测 60~90s，慢的时候更久）：
             //   窗口太短会在冷启时判定「桥不可用」→ 引导回落到 QEMU guest（2026-10-11 实测：
             //   kill 模拟器重启后 75s 窗口不够，QEMU 又被拉起来 2.6GB）。
+            // ★ 光靠上面那次 am start 有时不生效（2026-10-18 实测）：桥服务 90 秒还没开始监听，
+            //   60 次 ping 全部失败 ⇒ 启动自检报「Android 运行环境未就绪」。根因是桥 APK 在
+            //   转译模拟器（ndk_translation）里冷启动特别慢，am start 也可能被系统吞掉。
+            //   这里额外补一次 monkey 拉起 —— 不同的启动路径（命中 launcher intent），
+            //   成本约 1 秒，但能把「永远起不来」变成「等一会儿就起来」。
+            try
+            {
+                var kickAdb = FindAdb();
+                if (kickAdb is not null)
+                {
+                    var kickSerial = Serial;
+                    var kickArgs = (string.IsNullOrWhiteSpace(kickSerial) ? string.Empty : $"-s {kickSerial} ")
+                                 + "shell monkey -p com.catclaw.bridge -c android.intent.category.LAUNCHER 1";
+                    var (kickCode, kickOut) = Run(kickAdb, kickArgs, 20000);
+                    Log?.Invoke($"[bridge] 就绪等待前补一次 monkey 拉起 rc={kickCode} {(kickOut.Length > 80 ? kickOut[^80..] : kickOut).Replace('\n', ' ')}");
+                }
+            }
+            catch { }
+
             for (var attempt = 0; attempt < 60; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
