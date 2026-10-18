@@ -11,6 +11,12 @@ public enum InterpolationMode
     /// 消除 24fps 在 60/120Hz 上的抖动 —— 但**不是运动补偿**，快速横摇的大位移会看出残影/不连贯。</summary>
     Smooth,
 
+    /// <summary>RIFE（AI 插帧）：走 <c>--vf=vapoursynth=&lt;rife.vpy&gt;</c>。
+    /// <para>需要一整套运行时（便携 VapourSynth + 嵌入式 Python + onnxruntime-gpu + rife 模型，
+    /// 约 300 MB，**可选下载**）。环境未就绪时自动退回 <see cref="MotionCompensated"/>，
+    /// 不会黑屏也不会卡住播放 —— 状态由 <see cref="RifeEnvironment"/> 判定。</para></summary>
+    Rife,
+
     /// <summary>真运动补偿：<c>--vf=lavfi=[minterpolate=…mi_mode=mci:mc_mode=aobmc:vsbmc=1]</c>。
     /// ffmpeg 的块匹配光流插帧，零额外依赖（随包的 mpv-2.dll 自带 lavfi）。
     /// <para>实测（2026-10-18，Ryzen 5 5600 + RTX 4060，随包 mpv-2.dll 直接调 API / vo=null）：
@@ -39,20 +45,27 @@ public static class InterpolationPrefs
     {
         InterpolationMode.Smooth => "平滑运动",
         InterpolationMode.MotionCompensated => "运动补偿（重）",
+        InterpolationMode.Rife => "RIFE（AI）",
         _ => "关",
     };
 
-    /// <summary>点一下轮一档：关 → 平滑运动 → 运动补偿 → 关。</summary>
+    /// <summary>点一下轮一档：关 → 平滑运动 → 运动补偿 → RIFE(AI) → 关。</summary>
     public static InterpolationMode Next(InterpolationMode mode) => mode switch
     {
         InterpolationMode.Off => InterpolationMode.Smooth,
         InterpolationMode.Smooth => InterpolationMode.MotionCompensated,
+        InterpolationMode.MotionCompensated => InterpolationMode.Rife,
         _ => InterpolationMode.Off,
     };
 
     /// <summary>切换后给用户的说明（重新起播生效）。</summary>
     public static string Hint(InterpolationMode mode) => mode switch
     {
+        InterpolationMode.Rife => Services.RifeEnvironment.IsReady
+            ? "已开启「RIFE（AI）」插帧：走 VapourSynth + rife 模型，24/30fps 插到 60fps，画质最好。\n\n【重新起播生效】"
+            : "「RIFE（AI）」需要额外的运行时（便携 VapourSynth + 嵌入式 Python + onnxruntime-gpu + rife 模型，"
+              + "约 300 MB，可选下载）。\n\n" + Services.RifeEnvironment.StatusText
+              + "\n\n现在先按「运动补偿」生效（不会黑屏）。下载入口在下一步接入。",
         InterpolationMode.Smooth =>
             "已开启「平滑运动」：帧率对齐屏幕刷新率，24fps 的抖动会明显减少，开销很小。\n\n" +
             "【重新起播生效】下次点开视频时应用。若觉得画面发虚或音画不同步，换回「关」。",

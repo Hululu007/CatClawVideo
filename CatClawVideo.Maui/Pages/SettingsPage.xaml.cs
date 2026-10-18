@@ -790,7 +790,7 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
         //（时间维重采样 / lavfi minterpolate）；安卓端 ExoPlayer(Media3) 没有等价钩子 ——
         // 只有 GlEffect 那层 shader，所以安卓端这一行不出现（2026-10-18 用户要求先试插帧）。
         var interpRow = AddRow("⚡", "插帧（Windows）",
-            "消除 24fps 抖动：「平滑运动」几乎不耗资源；「运动补偿」是真 MEMC（1080p 实测约 1 个 CPU 核）",
+            "四档：平滑运动（几乎不耗资源）/ 运动补偿（真 MEMC，1080p 约 1 核）/ RIFE（AI，需下载 ~300MB 环境）",
             ref rows, Services.InterpolationPrefs.Label(Services.InterpolationPrefs.Load()));
         interpRow.Activated += async (_, _) =>
         {
