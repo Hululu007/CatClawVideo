@@ -35,7 +35,10 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     {
         _dvSource = dv;
         if (_mpv != IntPtr.Zero)
-            MpvLib.SetPropertyString(_mpv, "hwdec", dv ? "no" : "auto-copy");
+            // auto（零拷贝：d3d11va 帧直接留在 GPU 上给 mpv 的 GPU 渲染器用）——
+            // 2026-10-18 从 auto-copy 改过来：拷回内存每帧都要过一次 CPU/总线，4K 上是卡顿主因之一。
+            // DV 仍必须 no（软解保 RPU，见上）。
+            MpvLib.SetPropertyString(_mpv, "hwdec", dv ? "no" : "auto");
         BtLog($"[mpv] DV 源={dv} → hwdec={(dv ? "no（软解，保 RPU）" : "auto-copy")}");
     }
 
@@ -57,7 +60,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         // ⚠ DV 源必须软解：d3d11va 等 hwaccel 的 HEVC 输出 GPU surface，**不携带 RPU**，
         //   mpv 拿不到 DV 元数据 → P5 的 IPT 色彩被当普通 YCbCr 解读 → 发绿发紫（12:56 实测）。
         //   是否 DV 由 Handler 探测后经 SetDolbyVision 下发（initialize 前必须定案）。
-        MpvLib.SetPropertyString(_mpv, "hwdec", _dvSource ? "no" : "auto-copy");
+        MpvLib.SetPropertyString(_mpv, "hwdec", _dvSource ? "no" : "auto");   // 零拷贝，见 SetDolbyVision
         MpvLib.SetPropertyString(_mpv, "keep-open", "no");
         MpvLib.SetPropertyString(_mpv, "idle", "yes");
         MpvLib.SetPropertyString(_mpv, "force-window", "no");
@@ -110,7 +113,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         _eventPump = new Thread(EventPump) { IsBackground = true, Name = "mpv-events" };
         _eventPump.Start();
 
-        BtLog("[mpv] 初始化完成（hwdec=auto-copy, tone-mapping=bt.2446a）");
+        BtLog($"[mpv] 初始化完成（hwdec={(_dvSource ? "no" : "auto")}, tone-mapping=bt.2446a）");
     }
 
     private static string MpvErrorStr(int code) => $"code={code}";
@@ -413,13 +416,42 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             if (dw > 0 && dh > 0) HasVideoFrame = true;   // ★ 出画判据（必须在下面的比例档早退之前）
             if (_aspectMode is not (VideoAspect.AspectFit or VideoAspect.Original)) return;
             if (dw <= 0 || dh <= 0) return;
+            var wantValue = dw / dh;
             var want = $"{(long)dw}/{(long)dh}";
             var cur = MpvLib.GetPropertyString(_mpv, "video-aspect-override");
-            if (cur == want) return;
+            // ⚠ 必须按**数值**比较：mpv 会把自己设过的比例规范化成小数（"1920/1080" → "1.777778"），
+            //   字符串比较永远不相等 ⇒ 每次属性变化都再设一次 ⇒ 设置本身又触发属性变化 ⇒ **自己触发自己**，
+            //   表现就是 mpv 日志里同一秒内反复 "Set property: video-aspect-override"，
+            //   紧接着 "Audio/Video desynchronisation detected! ... too slow" —— 播放卡顿的真凶。
+            //   （这段逻辑早就在，但以前 mpv 只服务 DV 片源，今天 mpv 成了默认内核才被放大到每个片源。
+            //     2026-10-18 实测。）
+            if (TryParseAspect(cur, out var curValue) && Math.Abs(curValue - wantValue) < 0.002) return;
             MpvLib.SetPropertyString(_mpv, "video-aspect-override", want);
             BtLog($"[mpv] 强制按编码像素比例 letterbox: {want}（忽略容器声明 {cur ?? "无"}）");
         }
         catch { }
+    }
+
+    /// <summary>mpv 的比例值可能是 "16/9" 也可能是规范化后的 "1.777778"，两种都要认。</summary>
+    private static bool TryParseAspect(string? s, out double value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(s)) return false;
+        var slash = s.IndexOf('/');
+        try
+        {
+            if (slash > 0)
+            {
+                var num = double.Parse(s[..slash], System.Globalization.CultureInfo.InvariantCulture);
+                var den = double.Parse(s[(slash + 1)..], System.Globalization.CultureInfo.InvariantCulture);
+                if (den <= 0) return false;
+                value = num / den;
+                return value > 0;
+            }
+            return double.TryParse(s, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out value) && value > 0;
+        }
+        catch { return false; }
     }
 
     private void DispatchOnUi(Action action)
