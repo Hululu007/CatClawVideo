@@ -58,7 +58,8 @@ public partial class WatchPage
                 _lastStatsLogMs = Environment.TickCount64;
                 Maui.Services.BtFileLog.Write(
                     $"[stats] 源={s.SrcW:0}x{s.SrcH:0}@{s.SrcFps:0.##} 出={s.OutW:0}x{s.OutH:0}@{s.OutFps:0.##} " +
-                    $"插帧={Services.InterpolationPrefs.Load()} 超分={Services.EnhancePrefs.Load()} 强度={Services.EnhanceStrengthPrefs.Load()} 目标={Services.InterpTargetPrefs.Load()}");
+                    $"插帧={Services.InterpolationPrefs.Load()} 超分={Services.EnhancePrefs.Load()} 强度={Services.EnhanceStrengthPrefs.Load()} 目标={Services.InterpTargetPrefs.Load()} "
+                    + $"实际={Platforms.Windows.Mpv.MpvVideoBackend.Current?.AchievedFps:0.##}fps | {Platforms.Windows.Mpv.MpvVideoBackend.Current?.DescribeFilters()}");
             }
 
             var src = $"源 {s.SrcFps:0.##}fps · {(long)s.SrcW}×{(long)s.SrcH}";
@@ -77,7 +78,9 @@ public partial class WatchPage
 
             if (!interp && !enhance)
             {
-                StatsOverlayText.Text = src;
+                // 没开增强也照样报实际帧率（用户要看的就是这个真实数字）
+                var plainFps = Platforms.Windows.Mpv.MpvVideoBackend.Current?.AchievedFps ?? 0;
+                StatsOverlayText.Text = plainFps > 0 ? $"{src}\n实际 {plainFps:0.#}fps" : src;
                 return;
             }
 
@@ -86,6 +89,10 @@ public partial class WatchPage
             var settingMode = Services.InterpolationPrefs.Load();
             var effectiveMode = Platforms.Windows.Mpv.MpvVideoBackend.Current?.EffectiveInterpolation ?? settingMode;
             var parts = new List<string>();
+            // ★ 第一项就是**实际上了多少帧**（2026-10-18 用户反馈"显示的是目标、像在骗人"）：
+            //   这个数字数的是 mpv 真正送来渲染的新帧，插帧有没有生效看它一眼就知道。
+            var achievedFps = Platforms.Windows.Mpv.MpvVideoBackend.Current?.AchievedFps ?? 0;
+            if (achievedFps > 0) parts.Add($"实际 {achievedFps:0.#}fps");
             if (interp)
                 parts.Add($"插帧 目标{Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load())}fps（{Services.InterpolationPrefs.Label(effectiveMode)}"
                           + (effectiveMode != settingMode ? "，重源自动降级" : "") + "）");

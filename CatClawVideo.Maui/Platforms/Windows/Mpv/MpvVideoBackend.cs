@@ -193,6 +193,17 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 break;
         }
         EffectiveInterpolation = mode;   // 实际生效档（重源保护可能已降级）——状态浮层读它
+
+        // ★ 硬解方式要跟着插帧走（2026-10-18 实测：est-vf-fps=23、实际 24fps ⇒ minterpolate 等于直通）：
+        //   minterpolate 是 **CPU 滤镜**，而 hwdec=auto 给的是 GPU 帧（d3d11va）——帧要先下载回内存，
+        //   互操作开销把滤镜拖垮。插帧档统一改 auto-copy（解码后立刻拷回内存，滤镜拿到的是内存帧），
+        //   关插帧时再用回零拷贝 auto。DV 源始终 no（保 RPU）。
+        if (!_dvSource && _mpv != IntPtr.Zero)
+        {
+            var wantHwdec = mode == Services.InterpolationMode.Off ? "auto" : "auto-copy";
+            MpvLib.SetPropertyString(_mpv, "hwdec", wantHwdec);
+            BtLog($"[mpv] 插帧={mode} → hwdec={wantHwdec}（CPU 滤镜需要内存帧；关插帧时用零拷贝）");
+        }
         BtLog($"[mpv] 插帧={Services.InterpolationPrefs.Label(mode)}（{mode}）");
 
         ApplyEnhance();
@@ -308,6 +319,25 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             pars[0] = new(MpvLib.RenderParamOpenGLFbo, &fbo);
             pars[1] = new(MpvLib.RenderParamFlipY, &flip);
             pars[2] = default; // 终止符 MPV_RENDER_PARAM_INVALID
+            // ★ 真实上屏帧率（2026-10-18 用户质疑"插帧没用、显示在骗人"后加）：
+            //   mpv_render_context_update 返回的 MPV_RENDER_UPDATE_FRAME(=1) 表示"确实有一帧新画面要画"；
+            //   数它 = **真正送到屏幕上的不同帧数**（比 estimated-vf-fps 可信 —— 后者在这条链上实测恒等于源帧率）。
+            //   必须在 render 之前调用，这正是该 API 的用法。
+            // 用渲染循环自己的节奏估显示器刷新率（frameDelta 是上一帧到这一帧的间隔，约 0.5 秒平均一次）
+            if (frameDelta.TotalMilliseconds > 1 && frameDelta.TotalMilliseconds < 50)
+            {
+                var hz = Math.Round(1000.0 / frameDelta.TotalMilliseconds);
+                if (Math.Abs(hz - _lastDisplayHzGuess) >= 1 && ++_hzStableTicks >= 60)
+                {
+                    _lastDisplayHzGuess = hz;
+                    _hzStableTicks = 0;
+                    SetDisplayFpsOverride(hz);
+                }
+            }
+
+            var upFlags = MpvLib.mpv_render_context_update(_renderCtx);
+            if ((upFlags & 1UL) != 0) TickFpsWindow();
+
             var rc = MpvLib.mpv_render_context_render(_renderCtx, pars);
             if (!_firstFrameLogged)
             {
@@ -325,6 +355,63 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
 
     private bool _firstFrameLogged;
     private int _lastRenderRc;
+
+    private double _lastDisplayHzGuess;
+    private int _hzStableTicks;
+
+    private long _fpsWindowStartMs = Environment.TickCount64;
+    private long _fpsWindowFrames;
+    private double _achievedFps;
+
+    /// <summary>真实上屏帧率（约 2 秒滚动一次）：数的是 mpv 报告"有新帧要画"的次数，
+    /// 也就是真正显示出来的不同帧 —— 插帧有没有生效，看它就够了。</summary>
+    public double AchievedFps => _achievedFps;
+
+    /// <summary>把实测到的显示刷新率喂给 mpv（vo=libmpv 时它查不到，display-fps=0 会让
+    /// display-resample 失效）。外面用渲染循环的 frameDelta 测出来调它。</summary>
+    public void SetDisplayFpsOverride(double hz)
+    {
+        if (_mpv == IntPtr.Zero || hz < 20 || hz > 240) return;
+        try
+        {
+            MpvLib.SetPropertyString(_mpv, "display-fps-override",
+                hz.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));
+            BtLog($"[mpv] display-fps-override={hz:0.##}（vo=libmpv 查不到刷新率，按实测喂给它）");
+        }
+        catch { }
+    }
+
+    /// <summary>诊断用：把 mpv 侧跟"插帧到底有没有生效"有关的原始值一次性读出来。</summary>
+    public string DescribeFilters()
+    {
+        if (_mpv == IntPtr.Zero) return "(no mpv)";
+        try
+        {
+            string Rd(string p)
+            {
+                var v = MpvLib.GetPropertyString(_mpv, p);
+                return v is null ? "-" : (v.Length > 90 ? v[..90] + "…" : v);
+            }
+            double RdD(string p) => MpvLib.GetPropertyDouble(_mpv, p);
+            return $"vf=\"{Rd("vf")}\" est-vf-fps={RdD("estimated-vf-fps"):0.##} display-fps={RdD("display-fps"):0.##} "
+                 + $"drops={RdD("frame-drop-count"):0} mistimed={RdD("mistimed-frame-count"):0} "
+                 + $"decoder-drops={RdD("decoder-frame-drop-count"):0} video-sync={Rd("video-sync")} interp={Rd("interpolation")}";
+        }
+        catch (Exception ex) { return "(err " + ex.Message + ")"; }
+    }
+
+    private void TickFpsWindow()
+    {
+        var now = Environment.TickCount64;
+        _fpsWindowFrames++;
+        var elapsed = now - _fpsWindowStartMs;
+        if (elapsed >= 2000)
+        {
+            _achievedFps = _fpsWindowFrames * 1000.0 / elapsed;
+            _fpsWindowFrames = 0;
+            _fpsWindowStartMs = now;
+        }
+    }
 
     /// <summary>在 GL 上下文当前线程上创建 render context（RenderControl.Ready 已 MakeCurrent）。</summary>
     private void EnsureRenderContext()
