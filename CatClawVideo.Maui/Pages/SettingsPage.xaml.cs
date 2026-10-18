@@ -772,6 +772,20 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
                 await host.DisplayAlertAsync("播放内核", Services.PlayerBackendPrefs.Hint(next), "好");
         };
 
+        // 超分（Windows 独有）：走 mpv 的 gpu 缩放链（内建 scaler；shader 包是下一步的 Anime4K/NIS）
+        var enhRow = AddRow("🔍", "超分辨率（Windows）",
+            "默认关；「内建缩放」零下载、几乎不花钱（下一步接 Anime4K/NIS 的 glsl shader）",
+            ref rows, Services.EnhancePrefs.Label(Services.EnhancePrefs.Load()));
+        enhRow.Activated += async (_, _) =>
+        {
+            var next = Services.EnhancePrefs.Next(Services.EnhancePrefs.Load());
+            Services.EnhancePrefs.Save(next);
+            enhRow.ValueText = Services.EnhancePrefs.Label(next);
+            var host = HostPage();
+            if (host is not null)
+                await host.DisplayAlertAsync("超分辨率", Services.EnhancePrefs.Hint(next), "好");
+        };
+
         // 插帧（Windows 独有）：我们的 Windows 播放器是 libmpv，插帧就是两条现成的 mpv 路径
         //（时间维重采样 / lavfi minterpolate）；安卓端 ExoPlayer(Media3) 没有等价钩子 ——
         // 只有 GlEffect 那层 shader，所以安卓端这一行不出现（2026-10-18 用户要求先试插帧）。

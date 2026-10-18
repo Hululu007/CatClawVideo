@@ -169,6 +169,36 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 break;
         }
         BtLog($"[mpv] 插帧={Services.InterpolationPrefs.Label(mode)}（{mode}）");
+
+        ApplyEnhance();
+    }
+
+    /// <summary>
+    /// 超分（**Windows 独有**）：仅用 mpv 内建的 gpu 缩放链，零下载、零额外依赖。
+    /// <para>mpv 默认 <c>--scale=bilinear</c> 偏软；这里换成 ewa_lanczossharp（Jinc 系，锐利且振铃可控）
+    /// + mitchell 降采样 + correct-downscaling/linear-downscaling（在**线性光**里缩放，避免暗部糊）。
+    /// 色度保持 bilinear：色度平面乱升只会放大色带、白花 GPU。</para>
+    /// <para>下一步（用户已认可）：接 Anime4K / NVIDIA Image Scaling 的 GLSL shader（都是开源现成轮子），
+    /// 走 <c>--glsl-shaders</c> —— 那才是真"超分"，这里先把零下载这档做出来。</para>
+    /// </summary>
+    private void ApplyEnhance()
+    {
+        var mode = Services.EnhancePrefs.Load();
+        switch (mode)
+        {
+            case Services.EnhanceMode.Builtin:
+            case Services.EnhanceMode.Shaders:   // shader 包还没接入 → 先按内建缩放生效
+                MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
+                MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
+                MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");
+                MpvLib.SetPropertyString(_mpv, "linear-downscaling", "yes");
+                BtLog($"[mpv] 超分={Services.EnhancePrefs.Label(mode)}（scale=ewa_lanczossharp, dscale=mitchell, correct-downscaling=yes）");
+                break;
+
+            default:
+                BtLog("[mpv] 超分=关（用 mpv 默认缩放）");
+                break;
+        }
     }
 
     // ═══════════ 渲染 ═══════════
