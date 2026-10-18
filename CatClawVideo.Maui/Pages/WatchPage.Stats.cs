@@ -90,7 +90,14 @@ public partial class WatchPage
                 parts.Add($"插帧 目标{Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load())}fps（{Services.InterpolationPrefs.Label(effectiveMode)}"
                           + (effectiveMode != settingMode ? "，重源自动降级" : "") + "）");
             if (enhance)
-                parts.Add($"超分 {Services.EnhancePrefs.Label(Services.EnhancePrefs.Load())}·{Services.EnhanceStrengthPrefs.Label(Services.EnhanceStrengthPrefs.Load())}");
+            {
+                // 同插帧：显示实际生效档（重源保护会在降采样场景把 Anime4K 降成内建缩放）
+                var settingEnh = Services.EnhancePrefs.Load();
+                var effEnh = Platforms.Windows.Mpv.MpvVideoBackend.Current?.EffectiveEnhance ?? settingEnh;
+                parts.Add($"超分 {Services.EnhancePrefs.Label(effEnh)}"
+                          + (effEnh == Services.EnhanceMode.Shaders ? "·" + Services.EnhanceStrengthPrefs.Label(Services.EnhanceStrengthPrefs.Load()) : "")
+                          + (effEnh != settingEnh ? "，重源自动降级" : ""));
+            }
             parts.Add($"显示面 {(long)s.OutW}×{(long)s.OutH}");
             StatsOverlayText.Text = src + "\n" + string.Join(" · ", parts);
         }

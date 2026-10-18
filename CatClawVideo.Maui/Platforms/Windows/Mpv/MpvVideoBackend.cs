@@ -258,13 +258,16 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                     MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
                     MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
                     MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");
+                    EffectiveEnhance = Services.EnhanceMode.Shaders;
                     BtLog($"[mpv] 超分=Anime4K(M)（{chain}）");
                     break;
                 }
+                EffectiveEnhance = Services.EnhanceMode.Builtin;
                 BtLog("[mpv] 超分=Anime4K 缺文件 → 退回内建缩放");
                 goto case Services.EnhanceMode.Builtin;
 
             case Services.EnhanceMode.Builtin:
+                EffectiveEnhance = Services.EnhanceMode.Builtin;
                 MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
                 MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
                 MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");
@@ -273,6 +276,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 break;
 
             default:
+                EffectiveEnhance = Services.EnhanceMode.Off;
                 try { MpvLib.Command(_mpv, "glsl-shaders-clr"); } catch { }   // 关档也要清链，否则残留上一档
                 BtLog("[mpv] 超分=关（用 mpv 默认缩放，已清 shader 链）");
                 break;
@@ -410,6 +414,9 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     /// （2026-10-18 自测：4K 源上浮层显示运动补偿，而保护已降级）。</summary>
     public Services.InterpolationMode EffectiveInterpolation { get; private set; } = Services.InterpolationMode.Off;
 
+    /// <summary>本条源**实际生效**的超分档（重源保护会把它降成内建缩放）。浮层据此显示。</summary>
+    public Services.EnhanceMode EffectiveEnhance { get; private set; } = Services.EnhanceMode.Off;
+
     /// <summary>真出画标志：只有**真正解出视频帧**时 mpv 的 <c>video-params/dw|dh</c> 才有值。
     /// <para>2026-10-18 用它做 mpv 兜底的判据：夸克代理流上 mpv 会「成功打开」——
     /// 日志 <c>audio=playing, video=eof</c>、首帧渲染 rc=0 —— 但画面**全黑**（rc=0 只说明我们的
@@ -515,6 +522,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
                 MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
                 MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");
+                EffectiveEnhance = Services.EnhanceMode.Builtin;   // 浮层据实显示，别报设置值
                 BtLog($"[mpv] ⚠ 重源保护：{(long)dw}×{(long)dh} 是降采样场景，Anime4K 的 x2 升采样无意义 → 本条源改用内建缩放");
             }
         }
