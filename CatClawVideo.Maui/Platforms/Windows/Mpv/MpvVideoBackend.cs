@@ -192,6 +192,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 MpvLib.SetPropertyString(_mpv, "interpolation", "no");
                 break;
         }
+        EffectiveInterpolation = mode;   // 实际生效档（重源保护可能已降级）——状态浮层读它
         BtLog($"[mpv] 插帧={Services.InterpolationPrefs.Label(mode)}（{mode}）");
 
         ApplyEnhance();
@@ -404,6 +405,11 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     /// 夸克转码容器声明的比例常是错的（mpv: "Using container aspect ratio" → 21:9 被拉成 16:9
     /// 铺满无黑边）；读 video-params 的真实像素尺寸覆写，恢复标准上下黑边。幂等：值同不写。
     /// </summary>
+    /// <summary>本条源**实际生效**的插帧档（可能被重源保护改过）。
+    /// 状态浮层显示它而不是设置里的档位，避免"设置写运动补偿、实际跑平滑运动"这种不一致
+    /// （2026-10-18 自测：4K 源上浮层显示运动补偿，而保护已降级）。</summary>
+    public Services.InterpolationMode EffectiveInterpolation { get; private set; } = Services.InterpolationMode.Off;
+
     /// <summary>真出画标志：只有**真正解出视频帧**时 mpv 的 <c>video-params/dw|dh</c> 才有值。
     /// <para>2026-10-18 用它做 mpv 兜底的判据：夸克代理流上 mpv 会「成功打开」——
     /// 日志 <c>audio=playing, video=eof</c>、首帧渲染 rc=0 —— 但画面**全黑**（rc=0 只说明我们的
@@ -499,6 +505,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");
                 MpvLib.SetPropertyString(_mpv, "interpolation", "yes");
                 MpvLib.SetPropertyString(_mpv, "tscale", "oversample");
+                EffectiveInterpolation = Services.InterpolationMode.Smooth;   // 浮层据实显示，别报设置值
                 BtLog($"[mpv] ⚠ 重源保护：{(long)dw}×{(long)dh} 上 minterpolate 跑不动（实测出帧率不涨）→ 本条源改用平滑运动");
             }
 

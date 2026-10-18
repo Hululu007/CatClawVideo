@@ -81,9 +81,14 @@ public partial class WatchPage
                 return;
             }
 
+            // 显示**实际生效**的档位（重源保护会在 4K 上把运动补偿降成平滑运动），
+            // 与设置不一致时明确标出来 —— 否则用户会以为插帧没生效、或以为设置没保存。
+            var settingMode = Services.InterpolationPrefs.Load();
+            var effectiveMode = Platforms.Windows.Mpv.MpvVideoBackend.Current?.EffectiveInterpolation ?? settingMode;
             var parts = new List<string>();
             if (interp)
-                parts.Add($"插帧 目标{Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load())}fps（{Services.InterpolationPrefs.Label(Services.InterpolationPrefs.Load())}）");
+                parts.Add($"插帧 目标{Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load())}fps（{Services.InterpolationPrefs.Label(effectiveMode)}"
+                          + (effectiveMode != settingMode ? "，重源自动降级" : "") + "）");
             if (enhance)
                 parts.Add($"超分 {Services.EnhancePrefs.Label(Services.EnhancePrefs.Load())}·{Services.EnhanceStrengthPrefs.Label(Services.EnhanceStrengthPrefs.Load())}");
             parts.Add($"显示面 {(long)s.OutW}×{(long)s.OutH}");
