@@ -77,6 +77,17 @@
                         <!-- 弹幕浮层：播放器之上、控制条之下。InputTransparent，永不抢遥控器/触摸焦点 -->
                         <controls:DanmakuOverlay x:Name="Danmaku" InputTransparent="True" />
 
+                        <!-- 左上角播放状态浮层（2026-10-18 用户要求）：显示**真实**数值 ——
+                             源分辨率/源帧率，开插帧/超分后追加一行实际输出（estimated-vf-fps / osd-dimensions）。
+                             刻意放在最后一个子元素（MAUI 后者在上）：mpv 渲染控件是运行时 Add 进来的，
+                             不这样会被它盖住。显隐由 SyncStatsOverlay 跟底部控件同步。 -->
+                        <Border x:Name="StatsOverlay" IsVisible="False" InputTransparent="True"
+                                HorizontalOptions="Start" VerticalOptions="Start" Margin="10,10,0,0"
+                                StrokeThickness="0" BackgroundColor="#99000000" Padding="8,5"
+                                StrokeShape="RoundRectangle 8">
+                            <Label x:Name="StatsOverlayText" TextColor="White" FontSize="12.5" LineHeight="1.25" />
+                        </Border>
+
                         <!-- 缓冲指示：圆环进度 + 中央百分比（解析/时长未知时自动退化为旋转弧） -->
                         <Grid x:Name="BufferingIndicator" IsVisible="False">
                             <!-- 半透明底衬：深色画面上保证百分比可读（磁力/暗景常见） -->

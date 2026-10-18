@@ -3171,6 +3171,8 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         if (_unlockChip is not null) _unlockChip.IsVisible = _locked;
         if (_locked) on = false;
         ControlBar.IsVisible = on;
+        // ★ 左上角状态浮层与控件条同生共死（2026-10-18 用户要求：跟随底部播放控件的状态出现和消失）
+        SyncStatsOverlay(on);
         // 中央大键与控件条播放键互斥：播放中不显示中央键（否则出现两个「暂停」）
         CenterPlayButton.IsVisible = on && !_playing;
     }

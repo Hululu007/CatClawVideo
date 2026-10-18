@@ -342,6 +342,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             _renderCtx = ctx;
         }
         _renderCtxReady = true;
+        Current = this;   // 左上角状态浮层据此读真实统计
         BtLog("[mpv] 渲染上下文就绪（OpenGL → D3D11 互操作）");
     }
 
@@ -405,6 +406,33 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     /// render 调用成功，不说明有帧）。同一条流旧内核 MF 能正常出画，所以上层靠这个标志在
     /// 6 秒内没出画时回落 MF。</para></summary>
     public bool HasVideoFrame { get; private set; }
+
+    /// <summary>当前活动实例（左上角状态浮层读它取真实数值）。Dispose 时置空。</summary>
+    public static MpvVideoBackend? Current { get; private set; }
+
+    /// <summary>
+    /// 真实播放统计：源分辨率/源帧率、滤镜后实际帧率、渲染面（输出）分辨率。
+    /// <para>为什么用这些属性：<c>video-params/w|h</c> 是解码出来的真实像素尺寸；
+    /// <c>container-fps</c> 是容器的源帧率；<c>estimated-vf-fps</c> 是**过完滤镜链后**的实际帧率
+    /// （插帧开着时它会真的升到 60，而不是我们"打算插到多少"）；<c>osd-dimensions</c> 是真正显示出来的
+    /// 尺寸（超分开着时就是放大后的表面）。没出画时返回 null，浮层显示占位。</para>
+    /// </summary>
+    public (double SrcW, double SrcH, double SrcFps, double OutFps, double OutW, double OutH)? ReadStats()
+    {
+        if (_mpv == IntPtr.Zero) return null;
+        try
+        {
+            var sw = MpvLib.GetPropertyDouble(_mpv, "video-params/w");
+            var sh = MpvLib.GetPropertyDouble(_mpv, "video-params/h");
+            if (sw <= 0 || sh <= 0) return null;
+            return (sw, sh,
+                MpvLib.GetPropertyDouble(_mpv, "container-fps"),
+                MpvLib.GetPropertyDouble(_mpv, "estimated-vf-fps"),
+                MpvLib.GetPropertyDouble(_mpv, "osd-dimensions/w"),
+                MpvLib.GetPropertyDouble(_mpv, "osd-dimensions/h"));
+        }
+        catch { return null; }
+    }
 
     private void FixAspectOverride()
     {
