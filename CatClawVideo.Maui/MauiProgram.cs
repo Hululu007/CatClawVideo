@@ -281,7 +281,18 @@ public static class MauiProgram
                 // ② 桥不可用：**不再回落 QEMU**（2026-10-15：QEMU 整线退役，也不再随包）。
                 //    jar / 网盘源此时明确不可用，冷启动进度停在「运行环境未就绪」这一档，
                 //    自检里会显示「Android 运行环境：未找到」并给出下载入口 —— 不藏着掖着。
-                BtFileLog.Write("[桥] 外置 Android 桥不可用；本机 QEMU 已退役 → 不起回退（jar/网盘源暂不可用）");
+                // ★ 先别放弃（2026-10-18 自测）：桥 APK 很可能只是被 Android 的 LMK 杀掉了 ——
+                //   桌面端手里有 adb，自己把它拉起来再试一次；自愈失败才真的宣告不可用。
+                BtFileLog.Write("[桥] 外置 Android 桥不可用 → 尝试自愈（adb 拉起桥 APK / com.catclaw.bridge）");
+                if (await CatClawVideo.Core.Providers.SpiderBridgeClient.ReviveBridgeAppAsync()
+                    && await CatClawVideo.Core.Providers.SpiderBridgeClient.EnsureReadyAsync())
+                {
+                    CatClawVideo.Core.Models.SiteRegistry.JarSpiderAvailable = true;
+                    BtFileLog.Write("[桥] 自愈成功 → jar/网盘源已恢复");
+                    return;
+                }
+
+                BtFileLog.Write("[桥] 外置 Android 桥不可用（自愈也没救回来）；本机 QEMU 已退役 → 不起回退（jar/网盘源暂不可用）");
                 CatClawVideo.Core.Providers.SpiderBridgeClient.ReportStage(
                     0.45, "Android 运行环境未就绪：jar/网盘源暂不可用（可在启动自检里下载）");
             }

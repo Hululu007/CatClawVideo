@@ -914,6 +914,34 @@ public static class SpiderBridgeClient
     /// <summary>桥是否已就绪（ping 通过）。</summary>
     public static bool Ready => _ready;
 
+    /// <summary>
+    /// 桥 APK 掉了就自己把它拉回来。桌面端本来就管着模拟器、手里有 adb，没理由让用户自己去点重试。
+    /// <para>2026-10-18 自测发现：半小时内桥崩了两次（Android 的 LMK 会杀掉后台的桥），用户看到的是
+    /// 「线路加载失败：桥会话已断开（主桥刚崩溃，正在重建）」，而应用只是记了条日志就放弃 ——
+    /// 接着落进已退役的本机 guest 分支，报出更误导的错。</para>
+    /// <para>做法：<c>adb shell monkey</c> 拉起 launcher activity（比 am start 稳，不需要知道 activity 名），
+    /// 然后等 <see cref="Ready"/> 恢复，最多约 15 秒；返回是否恢复。</para>
+    /// </summary>
+    public static async Task<bool> ReviveBridgeAppAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var adb = FindAdb();
+            if (adb is null) { Log?.Invoke("[bridge] 自愈：找不到 adb，放弃"); return false; }
+            var serial = Serial;
+            var args = (string.IsNullOrWhiteSpace(serial) ? string.Empty : $"-s {serial} ")
+                     + "shell monkey -p com.catclaw.bridge -c android.intent.category.LAUNCHER 1";
+            var (code, outp) = Run(adb, args, 30000);
+            var tail = outp.Length > 120 ? outp[^120..] : outp;
+            Log?.Invoke($"[bridge] 自愈：拉起桥 APK rc={code} {tail.Replace('\n', ' ')}");
+            for (var i = 0; i < 15 && !Ready; i++)
+                await Task.Delay(1000, ct).ConfigureAwait(false);
+            Log?.Invoke(Ready ? "[bridge] 自愈成功：桥已恢复" : "[bridge] 自愈失败：桥仍不可达");
+            return Ready;
+        }
+        catch (Exception ex) { Log?.Invoke("[bridge] 自愈异常: " + ex.Message); return false; }
+    }
+
     /// <summary>桥内聚合搜索的结果流（<c>ev=search</c> 单站结果、<c>ev=search-done</c> 收尾）。</summary>
     public static Action<JsonObject>? SearchEvent;
 
