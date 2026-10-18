@@ -167,6 +167,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                     break;
                 }
                 BtLog($"[mpv] 插帧=RIFE 环境未就绪（{Services.RifeEnvironment.StatusText}）→ 退回运动补偿");
+                mode = Services.InterpolationMode.MotionCompensated;   // 让末尾的档位日志与实际生效一致
                 goto case Services.InterpolationMode.MotionCompensated;
 
             case Services.InterpolationMode.MotionCompensated:
@@ -218,10 +219,10 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 if (!System.IO.File.Exists(p)) return null;   // 缺一不可（链断了 mpv 会报错）
                 parts.Add(p.Replace('\\', '/'));
             }
-            // 分隔符用 ':' —— 依据是 Anime4K 官方 mpv 配置写法（glsl-shaders="a.glsl:b.glsl:…"）。
-            // 实测 mpv 对 ',' ':' ';' 都不报错、读回值原样返回，故以官方文档为准；
-            // 真实加载结果由 logs/mpv.log 里的 shader 编译/加载行复核。
-            return string.Join(":", parts);
+            // ⚠ 分隔符必须是 ',' —— 2026-10-18 真机自测踩过：按 Anime4K 文档的 ':' 拼出来，
+            //   mpv 会把整串当成**一个文件名**（logs/mpv.log: "Cannot open file 'a.glsl:b.glsl:…'"），
+            //   四个 shader 一个都没加载。'=' 逗号才是 mpv 字符串列表的正规分隔符。
+            return string.Join(",", parts);
         }
         catch { return null; }
     }
@@ -238,7 +239,12 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 var chain = BuildAnime4KChain();
                 if (chain is not null)
                 {
-                    MpvLib.SetPropertyString(_mpv, "glsl-shaders", chain);
+                    // ⚠ glsl-shaders 是**列表型**属性：用 mpv_set_property_string 写会把整串当成
+                    //   一个文件名（2026-10-18 真机自测连踩 ':' 与 ',' 两次，mpv.log 均报
+                    //   "Cannot open file 'a.glsl,b.glsl,…'"）。必须走列表命令：先 clr 再逐个 append。
+                    MpvLib.Command(_mpv, "glsl-shaders-clr");
+                    foreach (var shaderFile in chain.Split(','))
+                        if (shaderFile.Length > 0) MpvLib.Command(_mpv, "glsl-shaders-append", shaderFile);
                     MpvLib.SetPropertyString(_mpv, "scale", "ewa_lanczossharp");
                     MpvLib.SetPropertyString(_mpv, "dscale", "mitchell");
                     MpvLib.SetPropertyString(_mpv, "correct-downscaling", "yes");
@@ -257,7 +263,8 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 break;
 
             default:
-                BtLog("[mpv] 超分=关（用 mpv 默认缩放）");
+                try { MpvLib.Command(_mpv, "glsl-shaders-clr"); } catch { }   // 关档也要清链，否则残留上一档
+                BtLog("[mpv] 超分=关（用 mpv 默认缩放，已清 shader 链）");
                 break;
         }
     }
