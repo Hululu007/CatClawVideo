@@ -410,7 +410,12 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
             Services.DohPrefs.Label(Services.DohPrefs.Load()));
         dohRow.Activated += async (_, _) =>
         {
-            var next = Services.DohPrefs.Next(Services.DohPrefs.Load());
+            // 档位改成「点开选」（2026-10-18 用户反馈：整个设置页点一下轮一档不合理）；
+            // 选完再问服务商，两步都是有意识的动作，取消也不会误改设置。
+            var (ok, next) = await PickPrefAsync("加密 DNS（DoH）",
+                "解析被污染时用；流媒体分片不走它，避免拖慢起播",
+                Services.DohPrefs.Load(), Services.DohPrefs.Next, Services.DohPrefs.Label);
+            if (!ok) return;
             Services.DohPrefs.Save(next);
             Core.Services.Doh.Selector = next;          // 立刻生效（解析器每次查询现读）
             dohRow.ValueText = Services.DohPrefs.Label(next);
