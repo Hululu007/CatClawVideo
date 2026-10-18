@@ -1347,6 +1347,15 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
             WatchLog($"[load-fail] site={_site.Key} type={_site.Type} api={_site.Api} " +
                      $"spiderKind={_site.SpiderKind} jar={(string.IsNullOrEmpty(_site.Jar) ? "<null>" : "有")} " +
                      $"item={_item.Id} → {ex.GetType().Name}: {ex.Message}\n{ex}");
+            // ★ 失败给「重试」（2026-10-18 自测：桥被系统重启时用户只看到一个「确定」，
+            //   必须退回去自己再点一次 —— 而底层已经能自愈，界面应该直接给一次性重试）。
+            if (await DisplayAlertAsync("线路加载失败",
+                    $"{ex.Message}\n\n（爬虫桥可能刚被系统重启；底层已会自动把它拉回来，直接重试通常就好了）",
+                    "重试", "取消"))
+            {
+                await LoadSourcesAsync();
+                return;
+            }
             await ShowTipAsync($"线路加载失败：{ex.Message}");
         }
         finally
