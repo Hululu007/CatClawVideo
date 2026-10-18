@@ -414,6 +414,10 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     /// <summary>当前活动实例（左上角状态浮层读它取真实数值）。Dispose 时置空。</summary>
     public static MpvVideoBackend? Current { get; private set; }
 
+    /// <summary>供上层的状态浮层判断：这个实例是不是**当前真正在用**的那个内核。
+    /// 之前浮层直接读 Current，切到 MF 兼容内核后还显示旧 mpv 的陈旧数值（2026-10-18 自测发现）。</summary>
+    public bool IsDisposed { get; private set; }
+
     /// <summary>
     /// 真实播放统计：源分辨率/源帧率、滤镜后实际帧率、渲染面（输出）分辨率。
     /// <para>为什么用这些属性：<c>video-params/w|h</c> 是解码出来的真实像素尺寸；
@@ -709,6 +713,13 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         _mpv != IntPtr.Zero && MpvLib.GetPropertyDouble(_mpv, "paused-for-cache") > 0.5;
 
     public void Dispose()
+    {
+        IsDisposed = true;
+        if (ReferenceEquals(Current, this)) Current = null;   // 别把作废实例留给状态浮层
+        DisposeCore();
+    }
+
+    private void DisposeCore()
     {
         BtLog($"[mpv] Dispose 开始（renderCtx={_renderCtx != IntPtr.Zero} mpv={_mpv != IntPtr.Zero}）");
         _pumpStop = true;

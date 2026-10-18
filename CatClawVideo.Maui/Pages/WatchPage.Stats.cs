@@ -63,15 +63,31 @@ public partial class WatchPage
 
             var src = $"源 {s.SrcFps:0.##}fps · {(long)s.SrcW}×{(long)s.SrcH}";
 
+            // ⚠ 诚实优先（2026-10-18 自测修正）：jav 的 estimated-vf-fps 在 vo=libmpv 这条链上
+            //   读不出 lavfi 插帧的实际输出（实测始终等于源帧率），拿它当"出 xx fps"是**假数据**。
+            //   同时在 MF 兼容内核下根本不该读 mpv 的数值。所以：
+            //   ① 非 mpv 内核 → 明确写出来，不给数；
+            //   ② mpv 内核 → 源帧率给真实值（container-fps），插帧显示**目标**并注明档位，
+            //      尺寸给真实的显示面（osd-dimensions）。没有一句是编的。
+            if (!Platforms.Windows.VideoPlayerViewHandler.ActiveKernelIsMpv)
+            {
+                StatsOverlayText.Text = src + "\nMF 兼容内核（本条未启用插帧/超分）";
+                return;
+            }
+
             if (!interp && !enhance)
             {
                 StatsOverlayText.Text = src;
                 return;
             }
 
-            var outLine = $"出 {s.OutFps:0.##}fps · {(long)s.OutW}×{(long)s.OutH}";
-            var tags = (interp ? "插帧" : "") + (interp && enhance ? "+" : "") + (enhance ? "超分" : "");
-            StatsOverlayText.Text = src + "\n" + outLine + (tags.Length > 0 ? $"（{tags}）" : "");
+            var parts = new List<string>();
+            if (interp)
+                parts.Add($"插帧 目标{Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load())}fps（{Services.InterpolationPrefs.Label(Services.InterpolationPrefs.Load())}）");
+            if (enhance)
+                parts.Add($"超分 {Services.EnhancePrefs.Label(Services.EnhancePrefs.Load())}·{Services.EnhanceStrengthPrefs.Label(Services.EnhanceStrengthPrefs.Load())}");
+            parts.Add($"显示面 {(long)s.OutW}×{(long)s.OutH}");
+            StatsOverlayText.Text = src + "\n" + string.Join(" · ", parts);
         }
         catch { }
     }

@@ -37,6 +37,9 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
     private Mpv.MpvVideoBackend? _mpvBackend;
     /// <summary>非 null 时接口方法全部转发给它（当前 = mpv 后端）。</summary>
     private IVideoPlayerImplementation? _delegate;
+    /// <summary>当前播放用的是不是 mpv 内核（状态浮层用它判断数值可信度）。</summary>
+    public static bool ActiveKernelIsMpv { get; private set; }
+
     private bool _mpvInitialized;   // mpv 实例只初始化一次（Initialize 失败会回落 MPE）
     private string? _mpvFailedUrl;  // 本次会话里 mpv 打不开（起播 6 秒无视频帧）的 URL → 直接走 MF
     private int _mpvWatchdogGen;    // 看门狗代数：换源/重开时作废旧看门狗
@@ -131,6 +134,7 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
         DiagLog.Write("[player→] DisconnectHandler 开始");
         VirtualView.Implementation = null;
         _delegate = null;
+        ActiveKernelIsMpv = false;   // 切回 MF：浮层不能再读 mpv 的数值
         try { _mpvBackend?.Dispose(); } catch { }
         _mpvBackend = null;
         try
@@ -296,6 +300,7 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
             }
         }
         _delegate = _mpvBackend;
+        ActiveKernelIsMpv = true;    // 状态浮层据此判断数值是否可信（见 MpvVideoBackend.Current 的说明）
         ((IVideoPlayerImplementation)_mpvBackend).SetSource(url, headers);
 
         // ★ 起播看门狗（2026-10-18）：mpv 能在「只有音频、视频轨立刻 EOF」的流上"成功打开"
