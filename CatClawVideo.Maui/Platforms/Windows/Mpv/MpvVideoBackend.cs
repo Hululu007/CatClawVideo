@@ -39,7 +39,7 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             // 2026-10-18 从 auto-copy 改过来：拷回内存每帧都要过一次 CPU/总线，4K 上是卡顿主因之一。
             // DV 仍必须 no（软解保 RPU，见上）。
             MpvLib.SetPropertyString(_mpv, "hwdec", dv ? "no" : "auto");
-        BtLog($"[mpv] DV 源={dv} → hwdec={(dv ? "no（软解，保 RPU）" : "auto-copy")}");
+        BtLog($"[mpv] DV 源={dv} → hwdec={(dv ? "no（软解，保 RPU）" : "auto（零拷贝）")}");
     }
 
     public MpvVideoBackend(VideoPlayerView view, MpvRenderControl renderControl)
