@@ -528,6 +528,14 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
     /// 6 秒内没出画时回落 MF。</para></summary>
     public bool HasVideoFrame { get; private set; }
 
+    /// <summary>mpv 是否在等数据（paused-for-cache=yes）。给"卡死自动换线"看门狗判活用。</summary>
+    public bool IsWaitingForCache =>
+        _mpv != IntPtr.Zero && MpvLib.GetPropertyString(_mpv, "paused-for-cache") == "yes";
+
+    /// <summary>demuxer 缓存里还有多少秒数据。≈0 且 IsWaitingForCache ⇒ 这条流真的没数据（不是慢）。</summary>
+    public double CacheSeconds =>
+        _mpv == IntPtr.Zero ? 0 : MpvLib.GetPropertyDouble(_mpv, "demuxer-cache-duration");
+
     /// <summary>当前活动实例（左上角状态浮层读它取真实数值）。Dispose 时置空。</summary>
     public static MpvVideoBackend? Current { get; private set; }
 

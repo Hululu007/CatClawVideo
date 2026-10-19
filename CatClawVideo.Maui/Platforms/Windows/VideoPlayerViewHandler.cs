@@ -330,7 +330,7 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
             }
             if (gen != _mpvWatchdogGen) return;
             _mpvFailedUrl = url;
-            void Fallback() => OnMpvRenderFailed("mpv 打开流后 6 秒内没有视频帧（视频轨提前 EOF / 只有音频）");
+            void Fallback() => OnMpvRenderFailed("mpv 打开流后 25 秒内没有视频帧（线路太慢，或视频轨提前 EOF / 只有音频）");
             if (_mpvRender?.DispatcherQueue is { } dq && !dq.HasThreadAccess) dq.TryEnqueue(Fallback);
             else Fallback();
         });

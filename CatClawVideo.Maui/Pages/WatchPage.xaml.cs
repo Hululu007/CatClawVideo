@@ -25,6 +25,7 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     private List<VodPlaySource> _sources = [];
     private VodEpisode? _currentEpisode;
     private int _currentSourceIndex;
+    private int _autoSwitchOnFail;   // 播放失败自动换线次数（≤2，防止在坏线之间来回跳）
     private int _currentEpisodeIndex = -1;
     private readonly List<EpisodeRow> _episodeRows = [];
 
@@ -132,6 +133,7 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
 
         Player.PositionChanged += (_, _) => MainThread.BeginInvokeOnMainThread(() =>
         {
+            StartStallWatchdog();       // 幂等：首次收到位置事件即挂上"卡死自动换线"看门狗
             UpdateProgress();
             TickBufferingIndicator();   // 先在「真的在播」时收起指示器（MF 会误报 Buffering）
             UpdateBufferProgress();     // 仍在缓冲：刷新百分比
@@ -233,6 +235,17 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
             UpdatePlayIcon();
             try
             {
+                // ★ 失败自动换线（2026-10-19）：夸克原画这类线路经常"首帧 20 秒不来 / 直接没数据"，
+                //   与其让用户对着「播放失败」点确定后自己去翻线路，不如自动试下一条（最多 2 次）。
+                if (_sources.Count > 1 && _autoSwitchOnFail < 2 && _currentSourceIndex >= 0)
+                {
+                    _autoSwitchOnFail++;
+                    var nextSource = (_currentSourceIndex + 1) % _sources.Count;
+                    WatchLog($"[换线] 播放失败 → 自动切到「{_sources[nextSource].Name}」（第 {_autoSwitchOnFail} 次）");
+                    await SelectSourceAsync(nextSource);
+                    return;
+                }
+
                 // 协议侧给过原因时优先用它，比 ExoPlayer 的 "Source error" 有用得多
                 var why = _resolvedPlay?.Message;
                 await ShowTipAsync(string.IsNullOrEmpty(why)
@@ -1269,9 +1282,63 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         }
     }
 
+    // ═══════════ 卡死自动换线（2026-10-19 用户反馈"播二十秒必卡"的根治项）═══════════
+    private IDispatcherTimer? _stallTimer;
+    private int _stallDeadTicks;
+    private int _stallSwitchCount;
+
+    private void StartStallWatchdog()
+    {
+        if (_stallTimer is not null) return;
+        _stallDeadTicks = 0;
+        _stallSwitchCount = 0;
+        _stallTimer = Dispatcher.CreateTimer();
+        _stallTimer.Interval = TimeSpan.FromSeconds(1);
+        _stallTimer.Tick += OnStallTick;
+        _stallTimer.Start();
+    }
+
+    private void StopStallWatchdog()
+    {
+        if (_stallTimer is null) return;
+        _stallTimer.Stop();
+        _stallTimer.Tick -= OnStallTick;
+        _stallTimer = null;
+    }
+
+    /// <summary>每秒一次：只有「在等数据 **且** demuxer 缓存里几乎是 0」才累计，连续 20 秒才换线。
+    /// <para>为什么不按"位置不动"判断：正常缓冲会停在上一帧、缓存里仍有数据 —— 那样换线会误伤；
+    /// 而真死的流是 <c>paused-for-cache=yes</c> + <c>demuxer-cache-duration≈0</c>，这才是该换的。
+    /// 换线最多 2 次，之后提示用户手动换（避免在几条坏线之间来回跳）。</para></summary>
+    private async void OnStallTick(object? sender, EventArgs e)
+    {
+        try
+        {
+            if (_sources.Count < 2) return;                         // 只有一条线路，换也没用
+            var mpv = Platforms.Windows.Mpv.MpvVideoBackend.Current;
+            if (mpv is null) return;                                // 非 mpv 内核不参与（MF 有自己的行为）
+            if (!mpv.IsWaitingForCache || mpv.CacheSeconds > 0.5) { _stallDeadTicks = 0; return; }
+
+            if (++_stallDeadTicks < 20) return;
+            _stallDeadTicks = 0;
+            if (_stallSwitchCount >= 2)
+            {
+                _ = ShowTipAsync("这条线路一直取不到数据，请手动切换其他线路");
+                return;
+            }
+
+            var next = (_currentSourceIndex + 1) % _sources.Count;
+            _stallSwitchCount++;
+            WatchLog($"[换线] 「{_sources[_currentSourceIndex].Name}」连续 20s 无数据（waiting=yes cache≈0）→ 自动切到「{_sources[next].Name}」");
+            await SelectSourceAsync(next);
+        }
+        catch (Exception ex) { WatchLog("[换线] 异常: " + ex.Message); }
+    }
+
     protected override void OnDisappearing()
     {
         base.OnDisappearing();
+        StopStallWatchdog();
         RemoteKeyRouter.Pop(this);
 
 #if WINDOWS
