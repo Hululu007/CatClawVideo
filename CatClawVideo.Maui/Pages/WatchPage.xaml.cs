@@ -1286,12 +1286,16 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     private IDispatcherTimer? _stallTimer;
     private int _stallDeadTicks;
     private int _stallSwitchCount;
+    private TimeSpan _stallLastPos;
+    private TimeSpan _stallLastBuf;
 
     private void StartStallWatchdog()
     {
         if (_stallTimer is not null) return;
         _stallDeadTicks = 0;
         _stallSwitchCount = 0;
+        _stallLastPos = Player.Position;
+        _stallLastBuf = Player.BufferedPosition;
         _stallTimer = Dispatcher.CreateTimer();
         _stallTimer.Interval = TimeSpan.FromSeconds(1);
         _stallTimer.Tick += OnStallTick;
@@ -1315,11 +1319,22 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         try
         {
             if (_sources.Count < 2) return;                         // 只有一条线路，换也没用
-            var mpv = Platforms.Windows.Mpv.MpvVideoBackend.Current;
-            if (mpv is null) return;                                // 非 mpv 内核不参与（MF 有自己的行为）
-            if (!mpv.IsWaitingForCache || mpv.CacheSeconds > 0.5) { _stallDeadTicks = 0; return; }
+            if (_currentSourceIndex < 0 || _currentSourceIndex >= _sources.Count) return;
 
-            if (++_stallDeadTicks < 20) return;
+            // 判据**不依赖任何内核**（2026-10-19 实测：死线常表现为"黑屏 + 无失败事件 + mpv 已回落"）：
+            //   播放位置 OR 缓冲前沿，只要有一个在推进 ⇒ 数据还在来，不换（慢线会继续缓冲，不算死）；
+            //   两者都 25 秒没动 ⇒ 这条线真的没料了。
+            var pos = Player.Position;
+            var buf = Player.BufferedPosition;
+            if ((pos - _stallLastPos).TotalSeconds > 0.4 || (buf - _stallLastBuf).TotalSeconds > 0.4)
+            {
+                _stallLastPos = pos;
+                _stallLastBuf = buf;
+                _stallDeadTicks = 0;
+                return;
+            }
+
+            if (++_stallDeadTicks < 25) return;
             _stallDeadTicks = 0;
             if (_stallSwitchCount >= 2)
             {
@@ -1329,8 +1344,11 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
 
             var next = (_currentSourceIndex + 1) % _sources.Count;
             _stallSwitchCount++;
-            WatchLog($"[换线] 「{_sources[_currentSourceIndex].Name}」连续 20s 无数据（waiting=yes cache≈0）→ 自动切到「{_sources[next].Name}」");
+            WatchLog($"[换线] 位置与缓冲 25s 都没动（pos={pos.TotalSeconds:F0}s buf={buf.TotalSeconds:F0}s）→ 自动切到「{_sources[next].Name}」");
             await SelectSourceAsync(next);
+            _stallLastPos = TimeSpan.Zero;   // 新线路从零开始计时
+            _stallLastBuf = TimeSpan.Zero;
+            _stallDeadTicks = 0;
         }
         catch (Exception ex) { WatchLog("[换线] 异常: " + ex.Message); }
     }
