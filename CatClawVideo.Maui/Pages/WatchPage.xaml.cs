@@ -2330,6 +2330,20 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
                 ShowBufferingIndeterminate(false);
                 CatClawVideo.Core.Providers.CatClawLog.Write(
                     $"[播放] 丢弃不可播地址 {play.Url}（{notPlayableWhy}）");
+                // ★ 线路级故障 ⇒ 自动换下一条（2026-10-19，用户目标 P1）：
+                //   实测「玩偶|4K」这类站点的 6 条线路只有第一条偶发可用，其余在 jar 的 playerContent
+                //   阶段就返回未解码 token（形如 xxx++yyy++zzz），根本组不出 URL。
+                //   以前这里直接弹窗让用户自己翻线路；现在自动换（≤2 次，与失败/卡死换线共用额度），
+                //   换完仍不行才弹窗 —— 换线日志会写明这一条为什么被跳过。
+                if (_sources.Count > 1 && _autoSwitchOnFail < 2 && _currentSourceIndex >= 0)
+                {
+                    _autoSwitchOnFail++;
+                    var nextSource = (_currentSourceIndex + 1) % _sources.Count;
+                    WatchLog($"[换线] 「{_sources[_currentSourceIndex].Name}」无可播地址（{notPlayableWhy}）→ 自动切到「{_sources[nextSource].Name}」（第 {_autoSwitchOnFail} 次）");
+                    await SelectSourceAsync(nextSource);
+                    return;
+                }
+
                 await ShowTipAsync($"这条没有可播地址：{notPlayableWhy}（拿到的是「{play.Url}」）。"
                     + (play.Message.Length > 0 ? $"\n站点说明：{play.Message}" : ""));
                 return;
