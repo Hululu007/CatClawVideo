@@ -75,8 +75,11 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         //   End buffering waited 174.997813 secs、Enter buffering 100% → 0%），与解码/渲染无关
         //   （vf 为空、丢帧仅 2）。夸克代理链路吞吐不稳时，64MiB/10s 的缓存太浅，一抖就断流。
         //   调到 512MiB / 60s：源慢但稳定时能扛过抖动，代价是起播多等一会儿、多占点内存。
-        MpvLib.SetPropertyString(_mpv, "demuxer-max-bytes", "512MiB");
-        MpvLib.SetPropertyString(_mpv, "demuxer-max-back-bytes", "128MiB");
+        // ⚠ 2026-10-19 回退：这两行（512MiB + 128MiB 回退缓存）是我上一轮加的，怀疑它让 mpv 在
+        //   大文件（1.29GB）上"先攒很久才播 / 攒满前后行为异常"，实测症状是"读一小会儿就完全不再发请求"。
+        //   回到保守值（mpv 默认 150MiB 的一半），先把变量收窄，再按代理逐连接日志定位真因。
+        MpvLib.SetPropertyString(_mpv, "demuxer-max-bytes", "64MiB");
+        MpvLib.SetPropertyString(_mpv, "demuxer-max-back-bytes", "16MiB");
         // ⚠ readahead-secs 决定"**预读够多少秒才开始播**"，别调大：
         //   2026-10-19 实测把它从 10 调到 60 后，夸克原画这条涓流线路永远凑不够 60 秒 ⇒
         //   进度条停在 0.x 秒、日志一路 Still buffering（[0.566667s] 卡住不动）。

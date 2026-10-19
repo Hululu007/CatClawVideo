@@ -671,6 +671,11 @@ public sealed class SpiderProxyServer : IDisposable
         await stream.FlushAsync().ConfigureAwait(false);
 
         var buf = new byte[64 * 1024];
+        // ★ 逐连接推流观测（2026-10-19）：排查"播放器读一小会儿就完全不再发请求"。
+        //   以前这里什么也不打，出问题只能看到"收到 GET"，看不出**推了多少、谁先停**。
+        long total = 0, sinceLog = 0;
+        var startedMs = Environment.TickCount64;
+        var lastLogMs = startedMs;
         try
         {
             int n;
@@ -678,15 +683,30 @@ public sealed class SpiderProxyServer : IDisposable
             {
                 await stream.WriteAsync(buf.AsMemory(0, n)).ConfigureAwait(false);
                 await stream.FlushAsync().ConfigureAwait(false);
+                total += n;
+                sinceLog += n;
+                if (sinceLog >= 8L * 1024 * 1024)
+                {
+                    var dt = Math.Max((Environment.TickCount64 - lastLogMs) / 1000.0, 0.001);
+                    Providers.CatClawLog.Write($"[spider-proxy] 推流中 累计 {total / 1048576.0:F1}MB，本段 {sinceLog / 1048576.0:F1}MB/{dt:F1}s = {sinceLog / 1048576.0 / dt:F2} MB/s");
+                    sinceLog = 0;
+                    lastLogMs = Environment.TickCount64;
+                }
             }
+            Providers.CatClawLog.Write($"[spider-proxy] 推流结束(EOF) {status} 共 {total / 1048576.0:F2}MB / {(Environment.TickCount64 - startedMs) / 1000.0:F1}s");
         }
         catch (IOException)
         {
-            // 播放器提前断开（换集/退出）：正常，不算错误
+            // 播放器提前断开（换集/退出）：正常，不算错误 —— 但要记下"推到哪一步被断开"
+            Providers.CatClawLog.Write($"[spider-proxy] 播放器断开 {status}，已推 {total / 1048576.0:F2}MB / {(Environment.TickCount64 - startedMs) / 1000.0:F1}s");
         }
         catch (ObjectDisposedException)
         {
-            // 上游流被关闭：同上
+            Providers.CatClawLog.Write($"[spider-proxy] 上游流被关闭 {status}，已推 {total / 1048576.0:F2}MB");
+        }
+        catch (Exception ex)
+        {
+            Providers.CatClawLog.Write($"[spider-proxy] 推流异常 {status} 已推 {total / 1048576.0:F2}MB：{ex.GetType().Name} {ex.Message}");
         }
     }
 
