@@ -77,7 +77,11 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         //   调到 512MiB / 60s：源慢但稳定时能扛过抖动，代价是起播多等一会儿、多占点内存。
         MpvLib.SetPropertyString(_mpv, "demuxer-max-bytes", "512MiB");
         MpvLib.SetPropertyString(_mpv, "demuxer-max-back-bytes", "128MiB");
-        MpvLib.SetPropertyString(_mpv, "demuxer-readahead-secs", "60");
+        // ⚠ readahead-secs 决定"**预读够多少秒才开始播**"，别调大：
+        //   2026-10-19 实测把它从 10 调到 60 后，夸克原画这条涓流线路永远凑不够 60 秒 ⇒
+        //   进度条停在 0.x 秒、日志一路 Still buffering（[0.566667s] 卡住不动）。
+        //   缓存容量靠 demuxer-max-bytes（上限）撑，预读时长保持 10 秒（够起播、也够缓冲抖动）。
+        MpvLib.SetPropertyString(_mpv, "demuxer-readahead-secs", "10");
         MpvLib.SetPropertyString(_mpv, "cache-pause", "yes");
         // 网络超时与重试：跟播放场景对齐（长超时，别秒断）
         MpvLib.SetPropertyString(_mpv, "network-timeout", "30");
