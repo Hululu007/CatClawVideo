@@ -314,18 +314,11 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             //   mpv_render_context_update 返回的 MPV_RENDER_UPDATE_FRAME(=1) 表示"确实有一帧新画面要画"；
             //   数它 = **真正送到屏幕上的不同帧数**（比 estimated-vf-fps 可信 —— 后者在这条链上实测恒等于源帧率）。
             //   必须在 render 之前调用，这正是该 API 的用法。
-            // 用渲染循环自己的节奏估显示器刷新率（frameDelta 是上一帧到这一帧的间隔，约 0.5 秒平均一次）
-            if (frameDelta.TotalMilliseconds > 1 && frameDelta.TotalMilliseconds < 50)
-            {
-                var hz = Math.Round(1000.0 / frameDelta.TotalMilliseconds);
-                if (Math.Abs(hz - _lastDisplayHzGuess) >= 1 && ++_hzStableTicks >= 60)
-                {
-                    _lastDisplayHzGuess = hz;
-                    _hzStableTicks = 0;
-                    SetDisplayFpsOverride(hz);
-                }
-            }
-
+            // ⚠ 2026-10-19 实测移除：这里原来用 frameDelta 估刷新率喂 display-fps-override（为插帧的
+            //   display-resample 服务）。实测它估出来在 71/74/78 之间乱跳 → mpv 日志刷
+            //   "Assuming 71/74/78 FPS for display sync" → 每秒重做一次 display sync →
+            //   表现为**进度条不走、画面冻住**（实际 1.1fps、drops 上升）。插帧移除后是 video-sync=audio，
+            //   根本不需要 override，故整段去掉。
             var upFlags = MpvLib.mpv_render_context_update(_renderCtx);
             if ((upFlags & 1UL) != 0) TickFpsWindow();
 
