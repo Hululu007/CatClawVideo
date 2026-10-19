@@ -405,7 +405,12 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 return v is null ? "-" : (v.Length > 90 ? v[..90] + "…" : v);
             }
             double RdD(string p) => MpvLib.GetPropertyDouble(_mpv, p);
-            return $"vf=\"{Rd("vf")}\" est-vf-fps={RdD("estimated-vf-fps"):0.##} display-fps={RdD("display-fps"):0.##} "
+            // 2026-10-19 用户质疑"48Mbps 还卡"后补：把**入流速率与缓存余量**也打出来 ——
+            //   这才是判"到底谁慢"的唯一硬指标（raw-input-rate 单位是 bytes/s）。
+            var inBps = RdD("demuxer-cache-state/raw-input-rate");
+            return $"pos={RdD("time-pos"):0.0}s cache={RdD("demuxer-cache-duration"):0.0}s waiting={Rd("paused-for-cache")} "
+                 + $"in={inBps / 1024.0:0}KB/s "
+                 + $"vf=\"{Rd("vf")}\" est-vf-fps={RdD("estimated-vf-fps"):0.##} display-fps={RdD("display-fps"):0.##} "
                  + $"drops={RdD("frame-drop-count"):0} mistimed={RdD("mistimed-frame-count"):0} "
                  + $"decoder-drops={RdD("decoder-frame-drop-count"):0} video-sync={Rd("video-sync")} interp={Rd("interpolation")}";
         }
