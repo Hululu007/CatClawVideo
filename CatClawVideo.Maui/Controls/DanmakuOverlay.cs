@@ -41,7 +41,15 @@ public sealed class DanmakuOverlay : ContentView
     {
         InputTransparent = true;
         // 开关跨启动记住：默认关 —— 网盘源的 danmaku 字段是宿主钩子，开了才会去 GET 它
-        _on = Preferences.Default.Get("catclaw.danmu_on", false);
+        // 2026-10-19：默认**开**。视频应用里弹幕是主功能；默认关会让"配置了弹幕源却什么都没加载"
+        // 看起来像功能坏了（实测就是：IsOn=False ⇒ 入口直接 return）。用户手动关过则尊重既有值。
+        // 环境变量 CATCLAW_DANMU_ON=1/0 可强制开关（自动化验证用；与弹幕源地址的 env 覆盖同一套约定）。
+        _on = Environment.GetEnvironmentVariable("CATCLAW_DANMU_ON") switch
+        {
+            "1" => true,
+            "0" => false,
+            _ => Preferences.Default.Get("catclaw.danmu_on", true),
+        };
         Density = Preferences.Default.Get("catclaw.danmu_density", 1.0);
         FontScale = Preferences.Default.Get("catclaw.danmu_fontscale", 1.0);
         IsVisible = _on;

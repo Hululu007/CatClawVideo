@@ -828,6 +828,9 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     {
         _danmuUrl = url;
         Danmaku.SetCues([]);
+        // ★ 入口日志（2026-10-19）：之前这里静默返回，导致"弹幕为什么没出来"完全无法判断。
+        var srcCfg = Services.DanmakuSourcePrefs.Url;
+        WatchLog($"[弹幕] 入口 siteUrl={(string.IsNullOrEmpty(url) ? "无" : url)} IsOn={Danmaku.IsOn} 配置源={(srcCfg.Length == 0 ? "关" : srcCfg)}");
         if (!Danmaku.IsOn) return;
 
         var cues = new List<CatClawVideo.Core.Services.DanmuCue>();
