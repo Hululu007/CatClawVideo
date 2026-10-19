@@ -942,6 +942,7 @@ public static class SpiderBridgeClient
     /// 然后等 <see cref="Ready"/> 恢复，最多约 15 秒；返回是否恢复。</para>
     /// </summary>
     private static int _reviving;
+    private static long _lastReviveMs;   // 自愈限频（每分钟最多一次，见 TryCallAsync 的注释）
 
     public static async Task<bool> ReviveBridgeAppAsync(CancellationToken ct = default)
     {
@@ -1391,7 +1392,16 @@ public static class SpiderBridgeClient
             //   外置桥与 guest 共用同一个 ART VM（见文件头与「迅雷引擎合并」注释），
             //   所以上层回落 guest 也照样失败，用户看到「线路加载失败：桥会话已断开（主桥刚崩溃，正在重建）」。
             //   这里**后台异步**把桥拉回来（不阻塞本次调用），下一次调用时已恢复 —— 用户不必自己点重试。
-            _ = Task.Run(async () => { try { await ReviveBridgeAppAsync().ConfigureAwait(false); } catch { } });
+            // ★★ 2026-10-19 回归修复（真机上"桥动不动就崩"的元凶）：
+            //   原来**每次调用失败**都 monkey 拉起桥 APK —— 而"拉起"会让桥重启服务，把**其它所有在飞的连接**
+            //   一起掐断；那些连接又各自失败、又去拉起…形成自愈风暴。实测日志：一天 304 次「读循环结束」、
+            //   275 次「连接已重置」，一分钟内 6 次以上，用户看到的就是「桥怎么动不动就崩」。
+            //   现在：① 只有桥真的不可用（!Ready）才拉起；② 每分钟最多一次。
+            if (!Ready && Environment.TickCount64 - _lastReviveMs > 60_000)
+            {
+                _lastReviveMs = Environment.TickCount64;
+                _ = Task.Run(async () => { try { await ReviveBridgeAppAsync().ConfigureAwait(false); } catch { } });
+            }
             Forget();
             return null;
         }
