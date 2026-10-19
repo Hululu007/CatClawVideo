@@ -1271,6 +1271,10 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         AttachTitleBarDragArea();
         Dispatcher.StartTimer(TimeSpan.FromMilliseconds(250), () => { AttachTitleBarDragArea(); return false; });
 #endif
+        // ★ 看门狗必须在这里启动（2026-10-19 定位）：原来挂在 Player.PositionChanged 里启动，
+        //   而故障场景恰恰是"位置一直不动"⇒ 事件永不来 ⇒ 看门狗从未启动 ⇒ 自动换线形同虚设。
+        StartStallWatchdog();
+
         if (!_loaded)
         {
             _loaded = true;
