@@ -540,12 +540,28 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         var file = Player.SubtitlePath;
         var state = string.IsNullOrEmpty(file) ? "未加载字幕" : $"{System.IO.Path.GetFileName(file)}";
         var offset = Player.SubtitleOffsetSeconds;
-        var choice = await DisplayActionSheetAsync(
-            $"字幕 · {state} · 偏移 {offset:+0.##;-0.##;0}s",
-            "取消", null,
-            "选择字幕文件…", "字幕延后 0.5s", "字幕提前 0.5s", "偏移归零", "关闭字幕",
-            "切换音轨…", "切换内嵌字幕轨…", "画面比例…", "A-B 区间循环…",
-            "屏幕方向…", "外部播放器打开…", "弹幕…", "投屏…", _locked ? "解除锁定" : "锁定画面");
+        // 2026-10-19：改用自绘面板（分组 + 当前值 + 按钮化偏移），系统 action sheet 无法美化。
+        var key = await PlaybackOptionsPage.ShowAsync(
+            this, $"字幕 · {state} · 偏移 {offset:+0.##;-0.##;0}s", _locked);
+        var choice = key switch
+        {
+            "pick-subtitle" => "选择字幕文件…",
+            "sub-delay" => "字幕延后 0.5s",
+            "sub-advance" => "字幕提前 0.5s",
+            "sub-reset" => "偏移归零",
+            "sub-off" => "关闭字幕",
+            "audio-track" => "切换音轨…",
+            "embedded-sub" => "切换内嵌字幕轨…",
+            "aspect" => "画面比例…",
+            "ab-loop" => "A-B 区间循环…",
+            "orientation" => "屏幕方向…",
+            "external-player" => "外部播放器打开…",
+            "danmaku" => "弹幕…",
+            "cast" => "投屏…",
+            "lock" => _locked ? "解除锁定" : "锁定画面",
+            _ => null,
+        };
+        if (choice is null) return;
         switch (choice)
         {
             case "选择字幕文件…":

@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="CatClawVideo.Maui.Pages.PlaybackOptionsPage"
+             BackgroundColor="#B3000000"
+             Shell.TabBarIsVisible="False"
+             Shell.NavBarIsVisible="False">
+    <ContentPage.Resources>
+        <Style x:Key="SheetBtn" TargetType="Button">
+            <Setter Property="BackgroundColor" Value="#3A3157" />
+            <Setter Property="TextColor" Value="#FFFFFF" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="HeightRequest" Value="38" />
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="Padding" Value="14,0" />
+            <Setter Property="Margin" Value="0,0,8,8" />
+        </Style>
+    </ContentPage.Resources>
+
+    <!-- 自绘「音画设置」面板（2026-10-19）：替换原来那条系统 action sheet。
+         系统的 DisplayActionSheet 是原生灰列表、改不了样式，而且 15 项平铺很难按。 -->
+    <Grid RowDefinitions="*,Auto" Padding="16">
+        <Border Grid.Row="1"
+                BackgroundColor="#2A2440"
+                StrokeThickness="0"
+                StrokeShape="RoundRectangle 18"
+                Padding="0"
+                VerticalOptions="End">
+            <Grid RowDefinitions="Auto,Auto,*,Auto">
+                <!-- 标题 + 当前状态摘要 -->
+                <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Padding="20,16,12,10">
+                    <VerticalStackLayout Spacing="2">
+                        <Label Text="音画设置" FontSize="17" FontAttributes="Bold" TextColor="#FFFFFF" />
+                        <Label x:Name="SubtitleSummary" FontSize="12" TextColor="#9C93BD" />
+                    </VerticalStackLayout>
+                    <Button Grid.Column="1" x:Name="CloseButton" Text="✕" FontSize="15"
+                            BackgroundColor="{x:Null}" TextColor="#9C93BD"
+                            WidthRequest="40" HeightRequest="34" Clicked="OnCancelClicked" />
+                </Grid>
+
+                <ScrollView Grid.Row="1" MaximumHeightRequest="460">
+                    <VerticalStackLayout Padding="16,0,16,10" Spacing="14">
+                        <!-- 字幕 -->
+                        <VerticalStackLayout Spacing="8">
+                            <Label Text="字幕" FontSize="12" TextColor="#7C749B" />
+                            <FlexLayout Wrap="Wrap" JustifyContent="Start">
+                                <Button Text="选择字幕文件…" Style="{StaticResource SheetBtn}" Clicked="OnPickSubtitle" />
+                                <Button Text="延后 0.5s" Style="{StaticResource SheetBtn}" Clicked="OnSubDelay" />
+                                <Button Text="提前 0.5s" Style="{StaticResource SheetBtn}" Clicked="OnSubAdvance" />
+                                <Button Text="偏移归零" Style="{StaticResource SheetBtn}" Clicked="OnSubReset" />
+                                <Button Text="关闭字幕" Style="{StaticResource SheetBtn}" Clicked="OnSubOff" />
+                            </FlexLayout>
+                        </VerticalStackLayout>
+
+                        <!-- 音轨 -->
+                        <VerticalStackLayout Spacing="8">
+                            <Label Text="音轨" FontSize="12" TextColor="#7C749B" />
+                            <FlexLayout Wrap="Wrap" JustifyContent="Start">
+                                <Button Text="切换音轨…" Style="{StaticResource SheetBtn}" Clicked="OnAudioTrack" />
+                                <Button Text="内嵌字幕轨…" Style="{StaticResource SheetBtn}" Clicked="OnEmbeddedSub" />
+                            </FlexLayout>
+                        </VerticalStackLayout>
+
+                        <!-- 画面 -->
+                        <VerticalStackLayout Spacing="8">
+                            <Label Text="画面" FontSize="12" TextColor="#7C749B" />
+                            <FlexLayout Wrap="Wrap" JustifyContent="Start">
+                                <Button Text="画面比例…" Style="{StaticResource SheetBtn}" Clicked="OnAspect" />
+                                <Button Text="A-B 区间循环…" Style="{StaticResource SheetBtn}" Clicked="OnAbLoop" />
+                                <Button Text="屏幕方向…" Style="{StaticResource SheetBtn}" Clicked="OnOrientation" />
+                                <Button x:Name="LockButton" Text="锁定画面" Style="{StaticResource SheetBtn}" Clicked="OnLock" />
+                            </FlexLayout>
+                        </VerticalStackLayout>
+
+                        <!-- 弹幕 -->
+                        <VerticalStackLayout Spacing="8">
+                            <Label Text="弹幕" FontSize="12" TextColor="#7C749B" />
+                            <FlexLayout Wrap="Wrap" JustifyContent="Start">
+                                <Button Text="弹幕设置…" Style="{StaticResource SheetBtn}" Clicked="OnDanmaku" />
+                            </FlexLayout>
+                        </VerticalStackLayout>
+
+                        <!-- 其他 -->
+                        <VerticalStackLayout Spacing="8">
+                            <Label Text="其他" FontSize="12" TextColor="#7C749B" />
+                            <FlexLayout Wrap="Wrap" JustifyContent="Start">
+                                <Button Text="外部播放器打开…" Style="{StaticResource SheetBtn}" Clicked="OnExternalPlayer" />
+                                <Button Text="投屏…" Style="{StaticResource SheetBtn}" Clicked="OnCast" />
+                            </FlexLayout>
+                        </VerticalStackLayout>
+                    </VerticalStackLayout>
+                </ScrollView>
+
+                <Button Grid.Row="2" Text="取消" Clicked="OnCancelClicked"
+                        Margin="16,4,16,14" HeightRequest="44"
+                        BackgroundColor="#3A3157" TextColor="#FFFFFF" CornerRadius="12" />
+            </Grid>
+        </Border>
+    </Grid>
+</ContentPage>
