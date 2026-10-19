@@ -143,14 +143,7 @@
 		<Content Include="Platforms\Windows\libs\mpv-2.dll" CopyToOutputDirectory="PreserveNewest" Link="mpv-2.dll" />
 	</ItemGroup>
 
-	<!-- 超分 shader（Anime4K v4.0，MIT，132KB）：开源现成轮子，我们只做目录管理 + glsl-shaders 选项。
-	     输出到程序目录下的 shaders\anime4k\（MpvVideoBackend.ApplyEnhance 按此路径拼链）。
-	     Anime4K 的官方推荐链：Clamp_Highlights → AutoDownscalePre_x2 → Restore_CNN_* → Upscale_CNN_x2_*。 -->
-	<ItemGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
-		<Content Include="Resources\shaders\anime4k\*.glsl"
-		         CopyToOutputDirectory="PreserveNewest"
-		         Link="shaders\anime4k\%(Filename)%(Extension)" />
-	</ItemGroup>
+	<!-- 插帧/超分辨率已于 2026-10-19 移除：Anime4K shader 不再随包，mpv-2.dll 保留（杜比视界 tone-map 需要）。 -->
 
 	<!-- FFmpegInteropX 包把 FFmpegInteropX.winmd 作为 Reference 传入（供 C++ 消费），
 	     会触发 cswinrt 现场生成投影 → 需要本机安装的 Windows SDK（注册表），构建机没有。

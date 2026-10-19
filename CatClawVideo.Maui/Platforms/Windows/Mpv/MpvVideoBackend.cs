@@ -157,24 +157,9 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
                 break;
 
             case Services.InterpolationMode.Rife:
-                // AI 插帧：环境就绪才挂 vf=vapoursynth（脚本由 RifeEnvironment 生成），
-                // 否则**自动退回运动补偿** —— 用户至少还有插帧，不会黑屏/卡住。
-                var rifeFps = Services.InterpTargetPrefs.Fps(Services.InterpTargetPrefs.Load());
-                if (Services.RifeEnvironment.IsReady
-                    && Services.RifeEnvironment.EnsureScript(rifeFps) is { } vpy)
-                {
-                    MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");
-                    MpvLib.SetPropertyString(_mpv, "interpolation", "yes");
-                    MpvLib.SetPropertyString(_mpv, "tscale", "oversample");
-                    MpvLib.SetPropertyString(_mpv, "vf", $"vapoursynth={vpy.Replace('\\', '/')}");
-                    BtLog($"[mpv] 插帧=RIFE(AI) → vf=vapoursynth={vpy}");
-                    break;
-                }
-                // ⚠ 退回**平滑运动**而不是运动补偿：运动补偿是最重的一档（lavfi minterpolate 吃 CPU，
-                //   4K 片源直接卡成幻灯片 —— 2026-10-18 用户实测反馈）。环境未就绪时给最便宜的那档。
-                BtLog($"[mpv] 插帧=RIFE 环境未就绪（{Services.RifeEnvironment.StatusText}）→ 退回平滑运动（最省）");
-                mode = Services.InterpolationMode.Smooth;   // 末尾档位日志与实际生效一致
-                goto case Services.InterpolationMode.Smooth;
+                // 插帧/RIFE 已于 2026-10-19 整线移除（用户决定）：Load() 恒返回 Off，此分支不可达。
+                // 保留空分支只为兼容历史存档里的旧枚举值，不做任何事。
+                break;
 
             case Services.InterpolationMode.MotionCompensated:
                 MpvLib.SetPropertyString(_mpv, "video-sync", "display-resample");

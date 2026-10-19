@@ -808,84 +808,8 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
             if (host is not null)
                 await host.DisplayAlertAsync("播放内核", Services.PlayerBackendPrefs.Hint(val), "好");
         };
-
-        // 超分（Windows 独有）：走 mpv 的 gpu 缩放链（内建 scaler；shader 包是下一步的 Anime4K/NIS）
-        var enhRow = AddRow("🔍", "超分辨率（Windows）",
-            "默认关；「内建缩放」零下载、几乎不花钱（下一步接 Anime4K/NIS 的 glsl shader）",
-            ref rows, Services.EnhancePrefs.Label(Services.EnhancePrefs.Load()));
-        enhRow.Activated += async (_, _) =>
-        {
-            var (ok, val) = await PickPrefAsync("超分辨率",
-                "内建缩放：零下载；Anime4K：随包 shader，动画最明显（真人更推荐内建）",
-                Services.EnhancePrefs.Load(), Services.EnhancePrefs.Next, Services.EnhancePrefs.Label);
-            if (!ok) return;
-            Services.EnhancePrefs.Save(val);
-            enhRow.ValueText = Services.EnhancePrefs.Label(val);
-            var host = HostPage();
-            if (host is not null)
-                await host.DisplayAlertAsync("超分辨率", Services.EnhancePrefs.Hint(val), "好");
-        };
-
-        // 插帧（Windows 独有）：我们的 Windows 播放器是 libmpv，插帧就是两条现成的 mpv 路径
-        //（时间维重采样 / lavfi minterpolate）；安卓端 ExoPlayer(Media3) 没有等价钩子 ——
-        // 只有 GlEffect 那层 shader，所以安卓端这一行不出现（2026-10-18 用户要求先试插帧）。
-        var interpRow = AddRow("⚡", "插帧（Windows）",
-            "四档：平滑运动（几乎不耗资源）/ 运动补偿（真 MEMC，1080p 约 1 核）/ RIFE（AI，需下载 ~300MB 环境）",
-            ref rows, Services.InterpolationPrefs.Label(Services.InterpolationPrefs.Load()));
-        interpRow.Activated += async (_, _) =>
-        {
-            var (ok, val) = await PickPrefAsync("插帧",
-                "平滑运动：几乎不耗资源；运动补偿：真 MEMC 但吃 CPU（4K 会卡）；RIFE：AI，需先下载 ~300MB 环境",
-                Services.InterpolationPrefs.Load(), Services.InterpolationPrefs.Next, Services.InterpolationPrefs.Label);
-            if (!ok) return;
-
-            var host = HostPage();
-            // RIFE 环境没装就不要让人"选了个假档"：明确告知并保持原档不变（旧版会静默退回最重的
-            // 运动补偿 —— 用户开着 4K 片源时直接卡成幻灯片，2026-10-18 实测反馈）。
-            if (val == Services.InterpolationMode.Rife && !Services.RifeEnvironment.IsReady)
-            {
-                if (host is not null)
-                    await host.DisplayAlertAsync("插帧 · RIFE 还不能用",
-                        Services.RifeEnvironment.StatusText + "\n\n" +
-                        "下载入口还没做好（下一步）。现在先选「平滑运动」或「运动补偿」。", "好");
-                return;
-            }
-
-            Services.InterpolationPrefs.Save(val);
-            interpRow.ValueText = Services.InterpolationPrefs.Label(val);
-            if (host is not null)
-                await host.DisplayAlertAsync("插帧", Services.InterpolationPrefs.Hint(val), "好");
-        };
-#endif
-
-#if WINDOWS
-        // 超分强度（Windows 独有）：决定 Anime4K 用 S/M/L 哪一档 CNN 权重（随包 1.2MB 全在）
-        var enhStrengthRow = AddRow("🎚", "超分强度（Windows）",
-            "Anime4K 的 S/M/L 档：越大越锐、GPU 开销越高（「超分辨率」选 Anime4K 时才生效）",
-            ref rows, Services.EnhanceStrengthPrefs.Label(Services.EnhanceStrengthPrefs.Load()));
-        enhStrengthRow.Activated += async (_, _) =>
-        {
-            var (ok, val) = await PickPrefAsync("超分强度",
-                "轻 S：最省；中 M：平衡（默认）；强 L：更锐但吃 GPU",
-                Services.EnhanceStrengthPrefs.Load(), Services.EnhanceStrengthPrefs.Next, Services.EnhanceStrengthPrefs.Label);
-            if (!ok) return;
-            Services.EnhanceStrengthPrefs.Save(val);
-            enhStrengthRow.ValueText = Services.EnhanceStrengthPrefs.Label(val);
-        };
-
-        // 插帧强度 = 目标帧率（喂 minterpolate=fps 与 RIFE 的 fps_num）
-        var interpTargetRow = AddRow("🎚", "插帧目标帧率（Windows）",
-            "插帧到多少帧；高于显示器刷新率没有意义（真实结果看播放页左上角「出 xx fps」）",
-            ref rows, Services.InterpTargetPrefs.Label(Services.InterpTargetPrefs.Load()));
-        interpTargetRow.Activated += async (_, _) =>
-        {
-            var (ok, val) = await PickPrefAsync("插帧目标帧率",
-                "24/30fps 片源：60 最稳、90/120 更顺但开销更大",
-                Services.InterpTargetPrefs.Load(), Services.InterpTargetPrefs.Next, Services.InterpTargetPrefs.Label);
-            if (!ok) return;
-            Services.InterpTargetPrefs.Save(val);
-            interpTargetRow.ValueText = Services.InterpTargetPrefs.Label(val);
-        };
+        // 插帧 / 超分辨率 / 相关强度：2026-10-19 用户决定整线移除（实测无法稳定达标，反而拖慢播放）
+        // 相关行已删除，偏好类保留为恒关的惰性桩，后端因此永远不会启用它们。
 #endif
 
         var histRow = AddRow("🕮", "历史条数上限", "超过就按「最早看过」删；同一部剧本来就合并成一条", ref rows,
