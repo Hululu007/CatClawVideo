@@ -3330,7 +3330,13 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     /// <summary>仅"播放中且非拖动"才自动隐藏——暂停/拖动时常驻，否则进度条与时长都看不见。
     /// <para>2026-10-03 调整的只是**唤出方式**（鼠标移入不再弹出，改为单击切换），自动隐藏保持原样：
     /// 单击唤出后仍按「播放中 3s」收起，再次单击也能立刻收起。</para></summary>
-    private bool CanAutoHideControls() => _playing && !_seeking;
+    /// <summary>QA/自动化用：CATCLAW_CONTROLS_PIN=1 时控件常驻不自动隐藏。
+    /// <para>为什么需要它：控件条播放中 3 秒自动隐藏，而自动化点击是"盲点"——点一次可能是"唤出"也可能是"收起"，
+    /// 导致「音画」按钮在自动化里永远点不到（2026-10-19 实测反复点空，还误触了长按倍速）。</para></summary>
+    private static readonly bool ControlsPinned =
+        Environment.GetEnvironmentVariable("CATCLAW_CONTROLS_PIN") == "1";
+
+    private bool CanAutoHideControls() => !ControlsPinned && _playing && !_seeking;
 
     private void HideControlsIfIdle()
     {
