@@ -237,11 +237,16 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
             {
                 // ★ 失败自动换线（2026-10-19）：夸克原画这类线路经常"首帧 20 秒不来 / 直接没数据"，
                 //   与其让用户对着「播放失败」点确定后自己去翻线路，不如自动试下一条（最多 2 次）。
-                if (_sources.Count > 1 && _autoSwitchOnFail < 2 && _currentSourceIndex >= 0)
+                if (_sources.Count > 1 && _currentSourceIndex >= 0)
                 {
+                    var nextSource = NextAliveSource();
+                    if (nextSource < 0)
+                    {
+                        await ShowTipAsync($"这部片 {_sources.Count} 条线路都播不了。建议换个站点或用「换源」。");
+                        return;
+                    }
                     _autoSwitchOnFail++;
-                    var nextSource = (_currentSourceIndex + 1) % _sources.Count;
-                    WatchLog($"[换线] 播放失败 → 自动切到「{_sources[nextSource].Name}」（第 {_autoSwitchOnFail} 次）");
+                    WatchLog($"[换线] 播放失败 → 自动切到「{_sources[nextSource].Name}」（第 {_autoSwitchOnFail} 次，已试 {_deadSources.Count}/{_sources.Count} 条）");
                     await SelectSourceAsync(nextSource);
                     return;
                 }
@@ -1292,6 +1297,19 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     private int _stallSwitchCount;
     private TimeSpan _stallLastPos;
     private TimeSpan _stallLastBuf;
+    private readonly HashSet<int> _deadSources = [];   // 本次进入播放页后已确认"取不到可播地址/播放失败"的线路
+
+    /// <summary>挑下一条**没被判死**的线路；全死了返回 -1（调用方据此收手并提示，别再来回跳）。</summary>
+    private int NextAliveSource()
+    {
+        _deadSources.Add(_currentSourceIndex);
+        for (var step = 1; step <= _sources.Count; step++)
+        {
+            var i = (_currentSourceIndex + step) % _sources.Count;
+            if (!_deadSources.Contains(i)) return i;
+        }
+        return -1;
+    }
 
     private void StartStallWatchdog()
     {
@@ -1340,13 +1358,13 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
 
             if (++_stallDeadTicks < 25) return;
             _stallDeadTicks = 0;
-            if (_stallSwitchCount >= 2)
-            {
-                _ = ShowTipAsync("这条线路一直取不到数据，请手动切换其他线路");
-                return;
-            }
 
-            var next = (_currentSourceIndex + 1) % _sources.Count;
+            var next = NextAliveSource();
+            if (next < 0)
+            {
+                _ = ShowTipAsync($"这部片 {_sources.Count} 条线路都取不到数据。建议换个站点或用「换源」。");
+                return;   // 全死了就一直保持这个提示，不再来回跳
+            }
             _stallSwitchCount++;
             WatchLog($"[换线] 位置与缓冲 25s 都没动（pos={pos.TotalSeconds:F0}s buf={buf.TotalSeconds:F0}s）→ 自动切到「{_sources[next].Name}」");
             await SelectSourceAsync(next);
@@ -2339,11 +2357,16 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
                 //   阶段就返回未解码 token（形如 xxx++yyy++zzz），根本组不出 URL。
                 //   以前这里直接弹窗让用户自己翻线路；现在自动换（≤2 次，与失败/卡死换线共用额度），
                 //   换完仍不行才弹窗 —— 换线日志会写明这一条为什么被跳过。
-                if (_sources.Count > 1 && _autoSwitchOnFail < 2 && _currentSourceIndex >= 0)
+                if (_sources.Count > 1 && _currentSourceIndex >= 0)
                 {
+                    var nextSource = NextAliveSource();
+                    if (nextSource < 0)
+                    {
+                        await ShowTipAsync($"这部片 {_sources.Count} 条线路都取不到可播地址（最后一条：{notPlayableWhy}）。建议换个站点或用「换源」。");
+                        return;
+                    }
                     _autoSwitchOnFail++;
-                    var nextSource = (_currentSourceIndex + 1) % _sources.Count;
-                    WatchLog($"[换线] 「{_sources[_currentSourceIndex].Name}」无可播地址（{notPlayableWhy}）→ 自动切到「{_sources[nextSource].Name}」（第 {_autoSwitchOnFail} 次）");
+                    WatchLog($"[换线] 「{_sources[_currentSourceIndex].Name}」无可播地址（{notPlayableWhy}）→ 自动切到「{_sources[nextSource].Name}」（第 {_autoSwitchOnFail} 次，已试 {_deadSources.Count}/{_sources.Count} 条）");
                     await SelectSourceAsync(nextSource);
                     return;
                 }
