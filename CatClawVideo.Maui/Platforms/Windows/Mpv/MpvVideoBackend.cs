@@ -71,8 +71,14 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
         MpvLib.SetPropertyString(_mpv, "tone-mapping", "bt.2446a");
         // 网络流：mpv 自带缓存（默认 demuxer-max-bytes 150MiB 已够），Range 直连可 seek
         MpvLib.SetPropertyString(_mpv, "cache", "yes");
-        MpvLib.SetPropertyString(_mpv, "demuxer-max-bytes", "64MiB");
-        MpvLib.SetPropertyString(_mpv, "demuxer-readahead-secs", "10");
+        // 2026-10-19 实测："播放突然卡住"是**数据供不上**（mpv 日志 Still buffering 一路涨、
+        //   End buffering waited 174.997813 secs、Enter buffering 100% → 0%），与解码/渲染无关
+        //   （vf 为空、丢帧仅 2）。夸克代理链路吞吐不稳时，64MiB/10s 的缓存太浅，一抖就断流。
+        //   调到 512MiB / 60s：源慢但稳定时能扛过抖动，代价是起播多等一会儿、多占点内存。
+        MpvLib.SetPropertyString(_mpv, "demuxer-max-bytes", "512MiB");
+        MpvLib.SetPropertyString(_mpv, "demuxer-max-back-bytes", "128MiB");
+        MpvLib.SetPropertyString(_mpv, "demuxer-readahead-secs", "60");
+        MpvLib.SetPropertyString(_mpv, "cache-pause", "yes");
         // 网络超时与重试：跟播放场景对齐（长超时，别秒断）
         MpvLib.SetPropertyString(_mpv, "network-timeout", "30");
         MpvLib.SetPropertyString(_mpv, "stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=10");
