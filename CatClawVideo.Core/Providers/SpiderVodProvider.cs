@@ -104,6 +104,15 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
         return items;
     }
 
+    /// <summary>判定"重线路"：原画 / VIP / 4K 这类大码率直连流（实测最容易卡）。</summary>
+    private static bool IsHeavyLine(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        return name.Contains("原画", StringComparison.Ordinal)
+            || name.Contains("VIP", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("4K", StringComparison.OrdinalIgnoreCase);
+    }
+
     public async Task<List<VodPlaySource>> GetPlaySourcesAsync(VodSiteInfo site, VodItem item, CancellationToken ct = default)
     {
         var rt = RuntimeFor(site) ?? throw new NotSupportedException(site.StatusNote ?? "爬虫运行时不可用");
@@ -138,7 +147,19 @@ public class SpiderVodProvider : IVodSourceProvider, IActionVodSourceProvider
                 Episodes = [new VodEpisode { Name = item.Title, Url = item.Id }],
             });
         }
-        return sources;
+
+        // ★ 线路排序（2026-10-19 实测）：站点给的首条常常是「夸克原画 / VIP」这类大文件直连流 ——
+        //   例：1.21GB/23分32秒 ≈ 6.9Mbps，经本地代理经常给不到 ⇒ 表现为"播十几二十秒必卡、进度条不走"。
+        //   这里做**稳定重排**：非原画/VIP 优先，同组内保持站点原顺序；用户在「切换线路」里仍可手动选原画。
+        var ordered = sources
+            .Select((s, i) => (s, i))
+            .OrderBy(x => IsHeavyLine(x.s.Name) ? 1 : 0)
+            .ThenBy(x => x.i)
+            .Select(x => x.s)
+            .ToList();
+        if (ordered.Count > 1 && !ReferenceEquals(ordered[0], sources[0]))
+            _log?.Invoke($"[线路] 已重排：首条 {sources[0].Name} → {ordered[0].Name}（原画/VIP 不再默认优先）");
+        return ordered;
     }
 
     /// <summary>
