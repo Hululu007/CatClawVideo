@@ -323,6 +323,27 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
             //   "Assuming 71/74/78 FPS for display sync" → 每秒重做一次 display sync →
             //   表现为**进度条不走、画面冻住**（实际 1.1fps、drops 上升）。插帧移除后是 video-sync=audio，
             //   根本不需要 override，故整段去掉。
+            // ★ 上报播放状态（2026-10-19 定位）：VideoPlayerView 只在状态=Playing/Buffering 时才启动
+            //   **位置轮询定时器**，而 mpv 后端从来没上报过状态 ⇒ 进度条永远 0:00、继续观看/历史进度/
+            //   弹幕同步全部失效（以前默认内核是 MF、会报状态，所以没暴露）。这里每 500ms 采样一次，
+            //   只在状态变化时才抬事件，避免刷屏。
+            var nowState = Environment.TickCount64;
+            if (nowState - _lastStateMs >= 500)
+            {
+                _lastStateMs = nowState;
+                var st = MpvLib.GetPropertyString(_mpv, "paused-for-cache") == "yes"
+                    ? CatClawVideo.Maui.Controls.VideoPlayerState.Buffering
+                    : MpvLib.GetPropertyString(_mpv, "paused") == "yes"
+                        ? CatClawVideo.Maui.Controls.VideoPlayerState.Paused
+                        : CatClawVideo.Maui.Controls.VideoPlayerState.Playing;
+                if (st != _lastReportedState)
+                {
+                    _lastReportedState = st;
+                    var view = _view;
+                    DispatchOnUi(() => view.RaiseStateChanged(st));
+                }
+            }
+
             var upFlags = MpvLib.mpv_render_context_update(_renderCtx);
             if ((upFlags & 1UL) != 0) TickFpsWindow();
 
@@ -346,6 +367,9 @@ public unsafe sealed class MpvVideoBackend : IVideoPlayerImplementation, IDispos
 
     private double _lastDisplayHzGuess;
     private int _hzStableTicks;
+
+    private long _lastStateMs;
+    private CatClawVideo.Maui.Controls.VideoPlayerState _lastReportedState;
 
     private long _fpsWindowStartMs = Environment.TickCount64;
     private long _fpsWindowFrames;
