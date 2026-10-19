@@ -828,17 +828,39 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     {
         _danmuUrl = url;
         Danmaku.SetCues([]);
-        if (!Danmaku.IsOn || string.IsNullOrWhiteSpace(url)) return;
-        try
+        if (!Danmaku.IsOn) return;
+
+        var cues = new List<CatClawVideo.Core.Services.DanmuCue>();
+        if (!string.IsNullOrWhiteSpace(url))
         {
-            var cues = await CatClawVideo.Core.Services.DanmuParser.LoadAsync(url, DanmuHttp);
-            MainThread.BeginInvokeOnMainThread(() =>
-            {
-                Danmaku.SetCues(cues);
-                Danmaku.SyncPosition(Player.Position.TotalSeconds);
-            });
+            try { cues = await CatClawVideo.Core.Services.DanmuParser.LoadAsync(url, DanmuHttp); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[弹幕] 站点弹幕载入失败: {ex.Message}"); }
         }
-        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[弹幕] 载入失败: {ex.Message}"); }
+
+        // ★ P3（2026-10-19）：站点没给弹幕 / 取失败时，走用户配置的"弹弹play 兼容"源。
+        //   默认关（地址为空）；env CATCLAW_DANDANPLAY_URL 可覆盖，便于自动化验证。
+        if (cues.Count == 0)
+        {
+            var baseUrl = Services.DanmakuSourcePrefs.Url;
+            if (baseUrl.Length > 0)
+            {
+                var fileName = _currentSourceIndex >= 0 && _currentSourceIndex < _sources.Count
+                    && _currentEpisodeIndex >= 0 && _currentEpisodeIndex < _sources[_currentSourceIndex].Episodes.Count
+                    ? _sources[_currentSourceIndex].Episodes[_currentEpisodeIndex].Name ?? ""
+                    : (_item?.Title ?? "");
+                cues = await CatClawVideo.Core.Services.DandanplayDanmaku.LoadAsync(
+                    baseUrl, Services.DanmakuSourcePrefs.AppId, Services.DanmakuSourcePrefs.Secret,
+                    fileName, 0, DanmuHttp);
+                WatchLog($"[弹幕] 弹弹play 源({baseUrl}) fileName=「{fileName}」→ {cues.Count} 条");
+            }
+        }
+
+        if (cues.Count == 0) return;
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            Danmaku.SetCues(cues);
+            Danmaku.SyncPosition(Player.Position.TotalSeconds);
+        });
     }
 
     private async Task ShowDanmakuSheetAsync()
