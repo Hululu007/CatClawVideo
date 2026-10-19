@@ -317,7 +317,10 @@ public class VideoPlayerViewHandler : ViewHandler<VideoPlayerView, Microsoft.UI.
         var gen = ++_mpvWatchdogGen;
         _ = System.Threading.Tasks.Task.Run(async () =>
         {
-            for (var i = 0; i < 12; i++)   // 12 × 500ms = 6s
+            // 2026-10-19 实测：夸克原画这类线路要十几二十秒才出头一帧，6 秒就判死会把它误判成
+            // "视频轨 EOF" ⇒ 无谓地切到 MF（MF 一样喂不动，用户体感就是"20 秒后必卡"）。
+            // 放宽到 25 秒：慢源有机会自己跑起来，真死的流仍会回退。
+            for (var i = 0; i < 50; i++)   // 50 × 500ms = 25s
             {
                 await System.Threading.Tasks.Task.Delay(500).ConfigureAwait(false);
                 if (gen != _mpvWatchdogGen) return;                                     // 已换源/重开
