@@ -86,7 +86,16 @@ public sealed class SpiderProxyServer : IDisposable
     public int Port { get; private set; }
 
     /// <summary>日志回调（可设属性，便于对象初始化器注入）。</summary>
-    public Action<string>? Log { get; set; }
+    private Action<string>? _log;
+    public Action<string>? Log
+    {
+        get => _log;
+        set { _log = value; StaticLog = value; }   // 静态方法（WriteStreamAsync 等）也要能打同一通道
+    }
+
+    /// <summary>静态中转：<see cref="WriteStreamAsync"/> 是 static，拿不到实例的 <see cref="Log"/>。
+    /// 2026-10-19 踩过的坑：先写去 <c>CatClawLog</c>，但它的 Sink 走 DiagLog、**默认关闭** ⇒ 日志被丢掉。</summary>
+    internal static Action<string>? StaticLog;
 
     /// <summary>
     /// JS Spider 回环代理回调（js2Proxy 语义，<c>from=catvod</c> 或 <c>do=js</c> 的请求）。
@@ -474,12 +483,38 @@ public sealed class SpiderProxyServer : IDisposable
         var status = (int)resp.StatusCode is 206 ? "206 Partial Content" : "200 OK";
         var extra = new StringBuilder();
         if (resp.Content.Headers.ContentRange is { } cr) extra.Append($"Content-Range: {cr}\r\n");
-        if (resp.Content.Headers.ContentLength is { } cl) extra.Append($"Content-Length: {cl}\r\n");
+        // ★★ 2026-10-19 根因修复：这里必须给**本次范围的长度**当作 Content-Length。
+        //   之前只透传 Content-Range、不给长度 ⇒ 播放器不知道这一段读多少才算完，
+        //   读一小撮就断开重开（代理日志实测："播放器断开 0.13MB / 5.3s" ⇒ 25KB/s）。
+        //   而夸克对**每条新连接**重新限速 ⇒ 每条新连接都从慢速开始 ⇒ 体感"播 20 秒必卡"。
+        if (resp.Content.Headers.ContentRange is { } crl && TryRangeLength(crl.ToString(), out var rangeLen))
+            extra.Append($"Content-Length: {rangeLen}\r\n");
+        else if (resp.Content.Headers.ContentLength is { } cl) extra.Append($"Content-Length: {cl}\r\n");
         extra.Append("Accept-Ranges: bytes\r\n");
         extra.Append("Connection: close\r\n");
 
         await RespondBytesAsync(clientStream, status, body, contentType, extra.ToString(), contentLength: false)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>从 <c>bytes X-Y/Z</c> 里解出这一段长度（Y-X+1）。解析失败返回 false，退回原来的透传行为。</summary>
+    private static bool TryRangeLength(string contentRange, out long length)
+    {
+        length = 0;
+        try
+        {
+            // 形如 "bytes 0-204800/1294673608"（大小写/多余空格都容忍）
+            var s = contentRange.Trim();
+            var slash = s.IndexOf('/');
+            var dash = s.IndexOf('-');
+            if (dash <= 0) return false;
+            var startPart = s[(s.IndexOf(' ')+1)..dash];
+            var endPart = slash > dash ? s[(dash+1)..slash] : s[(dash+1)..];
+            if (!long.TryParse(startPart.Trim(), out var a) || !long.TryParse(endPart.Trim(), out var b) || b < a) return false;
+            length = b - a + 1;
+            return length > 0;
+        }
+        catch { return false; }
     }
 
     /// <summary>把播放列表里的分片/密钥地址改写成再走本代理（相对路径先补全为绝对地址）。</summary>
@@ -688,25 +723,25 @@ public sealed class SpiderProxyServer : IDisposable
                 if (sinceLog >= 8L * 1024 * 1024)
                 {
                     var dt = Math.Max((Environment.TickCount64 - lastLogMs) / 1000.0, 0.001);
-                    Providers.CatClawLog.Write($"[spider-proxy] 推流中 累计 {total / 1048576.0:F1}MB，本段 {sinceLog / 1048576.0:F1}MB/{dt:F1}s = {sinceLog / 1048576.0 / dt:F2} MB/s");
+                    StaticLog?.Invoke($"[spider-proxy] 推流中 累计 {total / 1048576.0:F1}MB，本段 {sinceLog / 1048576.0:F1}MB/{dt:F1}s = {sinceLog / 1048576.0 / dt:F2} MB/s");
                     sinceLog = 0;
                     lastLogMs = Environment.TickCount64;
                 }
             }
-            Providers.CatClawLog.Write($"[spider-proxy] 推流结束(EOF) {status} 共 {total / 1048576.0:F2}MB / {(Environment.TickCount64 - startedMs) / 1000.0:F1}s");
+            StaticLog?.Invoke($"[spider-proxy] 推流结束(EOF) {status} 共 {total / 1048576.0:F2}MB / {(Environment.TickCount64 - startedMs) / 1000.0:F1}s");
         }
         catch (IOException)
         {
             // 播放器提前断开（换集/退出）：正常，不算错误 —— 但要记下"推到哪一步被断开"
-            Providers.CatClawLog.Write($"[spider-proxy] 播放器断开 {status}，已推 {total / 1048576.0:F2}MB / {(Environment.TickCount64 - startedMs) / 1000.0:F1}s");
+            StaticLog?.Invoke($"[spider-proxy] 播放器断开 {status}，已推 {total / 1048576.0:F2}MB / {(Environment.TickCount64 - startedMs) / 1000.0:F1}s");
         }
         catch (ObjectDisposedException)
         {
-            Providers.CatClawLog.Write($"[spider-proxy] 上游流被关闭 {status}，已推 {total / 1048576.0:F2}MB");
+            StaticLog?.Invoke($"[spider-proxy] 上游流被关闭 {status}，已推 {total / 1048576.0:F2}MB");
         }
         catch (Exception ex)
         {
-            Providers.CatClawLog.Write($"[spider-proxy] 推流异常 {status} 已推 {total / 1048576.0:F2}MB：{ex.GetType().Name} {ex.Message}");
+            StaticLog?.Invoke($"[spider-proxy] 推流异常 {status} 已推 {total / 1048576.0:F2}MB：{ex.GetType().Name} {ex.Message}");
         }
     }
 
