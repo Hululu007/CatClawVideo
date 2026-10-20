@@ -28,6 +28,19 @@ namespace CatClawVideo.Maui.Services;
 /// </summary>
 public static class WindowDragHelper
 {
+    /// <summary>拖拽区诊断日志（写 %APPDATA%\CatClawVideo.debug\watch-debug.log），排查"哪一块拖不动"用。</summary>
+    private static void DragLog(string msg)
+    {
+        try
+        {
+            var dir = CatClawVideo.Core.AppPaths.DataRoot;
+            System.IO.Directory.CreateDirectory(dir);
+            System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "watch-debug.log"),
+                $"{DateTime.Now:HH:mm:ss.fff} [dragrect] {msg}\n");
+        }
+        catch { }
+    }
+
     /// <summary>
     /// 把指定元素声明为窗口拖拽区（元素须已布局）。
     /// <para>元素为 null 或尺寸为 0 时**不动**已有拖拽区 —— 清零会导致窗口拖不动。</para>
@@ -79,6 +92,35 @@ public static class WindowDragHelper
         {
             System.Diagnostics.Debug.WriteLine($"[WindowDrag] Attach 失败: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// 兜底拖拽带：整窗顶部 30 DIP 全宽（跳过右侧窗口按钮占位）。
+    ///
+    /// <para>修复"有些页面窗口完全拖不动"：除主页/播放页外，其它页面（详情/搜索/设置/源配置/
+    /// 下载/收藏/直播…）以前没有拖拽元素 ⇒ 拖拽区被清空 ⇒ 拖不动。这些页面顶部 30 DIP 是空的
+    /// （各页首个控件都在 32 DIP 以下），挂一条窄带既不影响点击、又保证任何页面都能拖窗。</para>
+    /// </summary>
+    public static void AttachFallbackTopBar()
+    {
+        try
+        {
+            if (!EnsureWindow(out var aw, out var hwnd)) return;
+            var scale = GetDpiForWindow(hwnd) / 96.0;
+            if (!GetClientRect(hwnd, out var rc)) return;
+
+            var inset = 0;
+            try { inset = aw.TitleBar.RightInset; } catch { }
+
+            var w = rc.Right - inset;
+            var h = (int)Math.Round(30 * scale);
+            if (rc.Bottom > 0 && h > rc.Bottom) h = rc.Bottom;
+            DragLog($"fallback client={rc.Right}x{rc.Bottom} scale={scale:0.##} inset={inset} rect=(0,0,{w},{h})");
+            if (w <= 0 || h <= 0) return;
+
+            aw.TitleBar.SetDragRectangles([new Windows.Graphics.RectInt32 { X = 0, Y = 0, Width = w, Height = h }]);
+        }
+        catch (Exception ex) { DragLog("AttachFallbackTopBar 失败: " + ex.Message); }
     }
 
     /// <summary>

@@ -470,7 +470,9 @@ public partial class App : Application
             DiagLog.Write(el is null
                 ? $"[drag] sync → 清空（页面 {current?.GetType().Name} 无拖拽元素）"
                 : $"[drag] sync → 挂 {current?.GetType().Name} 顶栏空白段");
-            if (el is null) Services.WindowDragHelper.Detach();
+            // 2026-10-20：没有拖拽元素的页面（详情/搜索/设置/源配置/下载/收藏/直播…）原来走 Detach()
+            // （SetDragRectangles([]) 清空）⇒ 这些页面**完全拖不动窗口**。改挂"顶部 30 DIP 兜底带"。
+            if (el is null) Services.WindowDragHelper.AttachFallbackTopBar();
             else Services.WindowDragHelper.Attach(el);
         }
         catch (Exception ex)
