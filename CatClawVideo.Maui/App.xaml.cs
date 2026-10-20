@@ -459,24 +459,19 @@ public partial class App : Application
                 return;
             }
 
-            // ⚠ 2026-10-20 回退：试过官方 Window.SetTitleBar(整条顶栏) + InputNonClientPointerSource
-            //   Passthrough（矩形算得对：日志 (130,6,415,45) 与 tabs 实际位置吻合），但在 **MAUI** 里
-            //   整条顶栏变成标题栏后，MAUI 的输入路由被拦 —— tabs/搜索框**点不动**了 ✗。
-            //   结论：按钮可点优先。回到"只把空白段声明为拖拽区"的做法（控件天然属客户区、点击直达），
-            //   并用 AttachFallbackTopBar 兜底那些没有拖拽元素的页面（修掉"这些页面拖不动窗口"）。
-            if (current is Pages.MainPage mp)
+            var el = current switch
             {
-                // ⚠ 2026-10-20 关键教训：ExtendsContentIntoTitleBar=true 时，**不清空**就会保留
-                //   系统默认的"整条标题栏 = 非客户区"⇒ tabs 那一整条点不动（用户截图绿框）。
-                //   必须显式把"空白段"声明成拖拽区，其余自动归客户区、控件点击直达。
-                //   （Z 序拖拽层保留在顶栏底层，负责空白处按下拖窗，两者不冲突。）
-                Services.WindowDragHelper.Attach(mp.TitleBarDragElement);
-                DiagLog.Write("[drag] sync → 主页 顶栏空白段（控件区归客户区 ⇒ 可点）");
-                return;
-            }
+                Pages.MainPage mp => mp.TitleBarDragElement,
+                _ => null,
+            };
 
-            Services.WindowDragHelper.AttachFallbackTopBar();
-            DiagLog.Write($"[drag] sync → 兜底顶带（页面 {current?.GetType().Name} 无拖拽元素）");
+            // 有拖拽元素的页面 → 声明矩形；没有的页面 → 清空。
+            // 清空是必须的：否则上一页留下的拖拽区会在这个页面上把顶栏当标题栏、误吞点击。
+            DiagLog.Write(el is null
+                ? $"[drag] sync → 清空（页面 {current?.GetType().Name} 无拖拽元素）"
+                : $"[drag] sync → 挂 {current?.GetType().Name} 顶栏空白段");
+            if (el is null) Services.WindowDragHelper.Detach();
+            else Services.WindowDragHelper.Attach(el);
         }
         catch (Exception ex)
         {

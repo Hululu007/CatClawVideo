@@ -7,23 +7,12 @@
     <Grid RowDefinitions="Auto,*" RowSpacing="0">
 
         <!-- 顶部导航栏：品牌 + 页面 tabs + 版本（Windows / 安卓横屏共用；电视遥控横向可达） -->
-        <!-- 官方自定义标题栏（2026-10-20）：整条 TopBar 交给 Window.SetTitleBar ⇒ 默认整条可拖；
-             tabs / 搜索框再声明为 Passthrough ⇒ 点击直达控件。 -->
-        <Border Grid.Row="0" x:Name="AppTitleBarHost"
+        <Border Grid.Row="0"
                 BackgroundColor="{DynamicResource TabBarBackgroundColor}"
                 Padding="20,0"
                 StrokeThickness="0"
                 Stroke="{DynamicResource DividerColor}">
             <Grid ColumnDefinitions="Auto,Auto,Auto,*,140" ColumnSpacing="16" HeightRequest="56">
-                <!-- ★ 窗口拖拽层（2026-10-20 按用户建议的层级思路）：
-                     透明、铺满整条顶栏、**放在最底层**（第一个子元素），按钮都在它上面 ⇒
-                     按钮正常收到点击，空白处落到这里 → PointerPressed 时调系统拖窗口（不靠算矩形）。 -->
-                <BoxView x:Name="TitleBarDragLayer" Grid.ColumnSpan="5" Color="Transparent">
-                    <BoxView.GestureRecognizers>
-                        <PointerGestureRecognizer PointerPressed="OnTitleBarDragLayerPressed" />
-                    </BoxView.GestureRecognizers>
-                </BoxView>
-
                 <!-- 品牌 -->
                 <HorizontalStackLayout Grid.Column="0" Spacing="10" VerticalOptions="Center">
                     <Border WidthRequest="26" HeightRequest="26"

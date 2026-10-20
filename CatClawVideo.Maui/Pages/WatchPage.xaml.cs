@@ -367,8 +367,8 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         {
             // 整条顶栏的空白段都可拖（含返回按钮上方、线路芯片上下的留白），
             // 控件本身（返回 / 标题 / 线路芯片）仍归客户区、照常可点。
-            // ⚠ 2026-10-20 回退（同 App）：SetTitleBar 方案在 MAUI 里会让顶栏控件点不动，
-            //   所以仍用"整条顶栏的横向补集"当拖拽区 —— 控件属客户区、点击直达，空白处可拖。
+            // ⚠ 2026-10-20 结论：MAUI 里 Window.SetTitleBar + Passthrough 的坐标对不上（实测透传区偏 20px，
+            //   按钮点不动），所以仍用"横向补集算拖拽矩形"的做法 —— 它点得动、也拖得动。
             Services.WindowDragHelper.AttachStrip(
                 TopBarGrid?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
                 TitleBarDragArea?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,

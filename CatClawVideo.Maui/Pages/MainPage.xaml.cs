@@ -471,22 +471,6 @@ public partial class MainPage : ContentPage, IRemoteKeyHandler
     /// </summary>
     public Microsoft.UI.Xaml.FrameworkElement? TitleBarDragElement =>
         TitleBarDragArea?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement;
-
-    /// <summary>拖拽层被按下 → 让系统直接拖窗口（Win32 ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION）。
-    /// 拖拽层铺满顶栏且在**最底层**，所以按钮点击不受影响（Z 序：按钮在上）。</summary>
-    private void OnTitleBarDragLayerPressed(object? sender, PointerEventArgs e)
-        => Services.WindowDragHelper.StartNativeWindowDrag();
-
-    /// <summary>官方做法用：**整条顶栏**（交给 Window.SetTitleBar ⇒ 默认整条都能拖）。</summary>
-    public Microsoft.UI.Xaml.FrameworkElement? TitleBarHost =>
-        AppTitleBarHost?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement;
-
-    /// <summary>顶栏里的交互控件：必须声明 Passthrough，否则点击会被当标题栏吞掉（官方文档明确要求）。</summary>
-    public Microsoft.UI.Xaml.FrameworkElement?[] TitleBarInteractive =>
-    [
-        NavTabs?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-        TopSearchBox?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-    ];
 #endif
 
     private int TabIndexOf(object? sender) =>

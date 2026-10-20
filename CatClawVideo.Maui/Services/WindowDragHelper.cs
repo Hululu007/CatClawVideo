@@ -28,119 +28,6 @@ namespace CatClawVideo.Maui.Services;
 /// </summary>
 public static class WindowDragHelper
 {
-    // ════════════════════════════════════════════════════════════════════
-    // 官方实现（2026-10-20 按 Microsoft 文档重写）：
-    //   learn.microsoft.com/windows/apps/develop/title-bar
-    //   ① 完全自定义标题栏 = Window.SetTitleBar(整条顶栏元素) ⇒ **默认整条都能拖**
-    //   ② 顶栏里的交互控件（tab/搜索框/返回键/线路芯片）必须用
-    //      InputNonClientPointerSource.SetRegionRects(NonClientRegionKind.Passthrough, …)
-    //      声明"透传区域"，否则点击会被当标题栏吞掉
-    //   ③ 只在**顶栏元素 SizeChanged** 时重算（文档明确警告：用窗口 Changed 重算，
-    //      最大化/最小化时会拿到错误尺寸 —— 这正是旧实现"时好时坏"的另一个原因）
-    //   ④ 没有自定义顶栏的页面：SetTitleBar(null) 保留**默认拖动区域**即可（不要清成空数组）
-    //
-    // 旧实现（SetDragRectangles + 自己算"空白补集"）方向是反的，已废弃（保留方法仅供回退）。
-    // ════════════════════════════════════════════════════════════════════
-
-    private static readonly List<Microsoft.UI.Xaml.FrameworkElement> _hooked = [];
-    private static Microsoft.UI.Xaml.FrameworkElement?[] _lastInteractive = [];
-
-    /// <summary>官方做法：把**整条顶栏**设为标题栏（默认可拖），并为交互控件声明 Passthrough。</summary>
-    public static void ApplyTitleBar(Microsoft.UI.Xaml.FrameworkElement? titleBar,
-        params Microsoft.UI.Xaml.FrameworkElement?[] interactive)
-    {
-        try
-        {
-            var win = App.CurrentNativeWindow;
-            var aw = App.CurrentAppWindow;
-            if (win is null || aw is null || titleBar is null) return;
-
-            if (!win.ExtendsContentIntoTitleBar) win.ExtendsContentIntoTitleBar = true;
-
-            win.SetTitleBar(titleBar);
-            _lastInteractive = interactive;
-            UpdatePassthrough(aw, interactive);
-
-            // 只挂一次：顶栏尺寸变化时重算透传区域（官方推荐时机）
-            if (!_hooked.Contains(titleBar))
-            {
-                _hooked.Add(titleBar);
-                titleBar.SizeChanged += (_, _) => UpdatePassthrough(App.CurrentAppWindow!, _lastInteractive);
-            }
-            DragLog($"apply titlebar：整条可拖 + 透传 {interactive.Length} 个控件");
-        }
-        catch (Exception ex) { DragLog("ApplyTitleBar 失败: " + ex.Message); }
-    }
-
-    /// <summary>把交互控件矩形声明成 Passthrough（客户区坐标 × DPI 缩放）。</summary>
-    private static void UpdatePassthrough(Microsoft.UI.Windowing.AppWindow aw, Microsoft.UI.Xaml.FrameworkElement?[] interactive)
-    {
-        try
-        {
-            var rects = new List<Windows.Graphics.RectInt32>();
-            foreach (var el in interactive)
-            {
-                if (el is null || el.ActualWidth <= 0 || el.ActualHeight <= 0) continue;
-                var scale = el.XamlRoot?.RasterizationScale ?? 1.0;
-                var b = el.TransformToVisual(null).TransformBounds(
-                    new Windows.Foundation.Rect(0, 0, el.ActualWidth, el.ActualHeight));
-                rects.Add(new Windows.Graphics.RectInt32
-                {
-                    X = (int)Math.Round(b.X * scale),
-                    Y = (int)Math.Round(b.Y * scale),
-                    Width = (int)Math.Round(b.Width * scale),
-                    Height = (int)Math.Round(b.Height * scale),
-                });
-            }
-            Microsoft.UI.Input.InputNonClientPointerSource.GetForWindowId(aw.Id)
-                .SetRegionRects(Microsoft.UI.Input.NonClientRegionKind.Passthrough, rects.ToArray());
-            DragLog("passthrough → " + string.Join(" | ", rects.Select(r => $"({r.X},{r.Y},{r.Width},{r.Height})")));
-        }
-        catch (Exception ex) { DragLog("passthrough 失败: " + ex.Message); }
-    }
-
-    [DllImport("user32.dll")] private static extern bool ReleaseCapture();
-    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-    private const int WM_NCLBUTTONDOWN = 0xA1;
-    private const int HTCAPTION = 2;
-
-    /// <summary>
-    /// 让系统直接拖窗口：ReleaseCapture() + SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)。
-    ///
-    /// <para><b>为什么用这个（2026-10-20 用户建议的"层级"思路）</b>：把**透明拖拽层垫在顶栏最底层**、
-    /// 按钮压在它上面 —— 按钮正常收到点击，空白处落到拖拽层，拖拽层按下就调这里让系统拖窗口。
-    /// 这样完全**不需要算任何矩形**（不依赖 DPI/客户区偏移），也不会像 Window.SetTitleBar 那样
-    /// 让 MAUI 的按钮输入失效（实测那套会让 tabs 点不动）。WPF/WinForms 的窗口拖动也是这么干的。</para>
-    /// </summary>
-    public static void StartNativeWindowDrag()
-    {
-        try
-        {
-            var hwnd = App.MainWindowHwnd;
-            if (hwnd == IntPtr.Zero) return;
-            ReleaseCapture();
-            SendMessage(hwnd, WM_NCLBUTTONDOWN, (IntPtr)HTCAPTION, IntPtr.Zero);
-            DragLog("native drag（层垫底方案）");
-        }
-        catch (Exception ex) { DragLog("native drag 失败: " + ex.Message); }
-    }
-
-    /// <summary>没有自定义顶栏的页面：恢复**默认**拖动区域（官方：未放交互内容时保留默认区域）。</summary>
-    public static void RestoreDefaultTitleBar()
-    {
-        try
-        {
-            var win = App.CurrentNativeWindow;
-            var aw = App.CurrentAppWindow;
-            if (win is null || aw is null) return;
-            win.SetTitleBar(null);   // null ⇒ 默认 AppWindowTitleBar 的整条拖动区域
-            Microsoft.UI.Input.InputNonClientPointerSource.GetForWindowId(aw.Id)
-                .SetRegionRects(Microsoft.UI.Input.NonClientRegionKind.Passthrough, []);
-            _lastInteractive = [];
-            DragLog("restore 默认拖动区域（本页无自定义顶栏）");
-        }
-        catch (Exception ex) { DragLog("RestoreDefault 失败: " + ex.Message); }
-    }
     /// <summary>
     /// 把指定元素声明为窗口拖拽区（元素须已布局）。
     /// <para>元素为 null 或尺寸为 0 时**不动**已有拖拽区 —— 清零会导致窗口拖不动。</para>
@@ -171,23 +58,21 @@ public static class WindowDragHelper
             var b = el.TransformToVisual(null).TransformBounds(
                 new Windows.Foundation.Rect(0, 0, el.ActualWidth, el.ActualHeight));
 
-            // ★★ 2026-10-20 修复"窗口最顶部那条拖不动"：SetDragRectangles 的矩形是**客户区坐标**。
-            //   原实现又加了一次「客户区原点 − 窗口位置」的偏移 offX/offY —— 当
-            //   ExtendsContentIntoTitleBar 尚未生效时客户区顶边距窗口顶 32px ⇒ offY=32 ⇒
-            //   拖拽带被整体推到 y=32 以下，**恰好把最顶部那条 32px 排除掉**（用户第一反应就是拖那条）。
-            //   而 offY 有时是 0、有时是 32 ⇒ 表现成"时好时坏"。这里直接按客户区坐标给，不再加偏移。
             if (!GetClientRect(hwnd, out _)) return;
+            var origin = new POINT { X = 0, Y = 0 };
+            ClientToScreen(hwnd, ref origin);
+            var offX = origin.X - aw.Position.X;
+            var offY = origin.Y - aw.Position.Y;
 
             var rect = new Windows.Graphics.RectInt32
             {
-                X = (int)Math.Round(b.X * scale),
-                Y = (int)Math.Round(b.Y * scale),
+                X = offX + (int)Math.Round(b.X * scale),
+                Y = offY + (int)Math.Round(b.Y * scale),
                 Width = (int)Math.Round(b.Width * scale),
                 Height = (int)Math.Round(b.Height * scale),
             };
             if (rect.Width <= 0 || rect.Height <= 0) return;
 
-            DragLog($"attach rect=({rect.X},{rect.Y},{rect.Width},{rect.Height}) scale={scale:0.##}");
             aw.TitleBar.SetDragRectangles([rect]);
         }
         catch (Exception ex)
@@ -210,57 +95,6 @@ public static class WindowDragHelper
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"[WindowDrag] Detach 失败: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// 兜底拖拽带：整窗顶部 30 DIP 全宽（跳过右侧窗口按钮占位）。
-    ///
-    /// <para><b>2026-10-20 修复"有时候不能拖拽窗口"</b>：全应用只有 <c>MainPage</c> 与
-    /// <c>WatchPage</c> 会声明拖拽区，其它页面（详情/搜索/设置/源配置/下载/收藏/直播…）
-    /// 过去在 <c>App.SyncTitleBarDrag</c> 里走 <c>Detach()</c> —— 也就是
-    /// <c>SetDragRectangles([])</c> 把拖拽区**清零**，于是这些页面上窗口完全拖不动，
-    /// 得等某次重算（缩放/回主页）才恢复。这就是"时好时坏"的来源。</para>
-    ///
-    /// <para>这些页面顶部 30 DIP 是空的（详情页返回键 ~57、搜索框 ~42、设置页签 ~64），
-    /// 所以挂一条窄带既不影响点击，又保证**任何页面都能拖窗**。</para>
-    /// </summary>
-    /// <summary>拖拽区诊断日志（写 %APPDATA%\CatClawVideo.debug\watch-debug.log）。
-    /// 用于排查"有时能拖有时不能拖"：把每次设置/清空的矩形记下来，一眼看出是没设、设成 0、还是位置错。</summary>
-    private static void DragLog(string msg)
-    {
-        try
-        {
-            var dir = CatClawVideo.Core.AppPaths.DataRoot;
-            System.IO.Directory.CreateDirectory(dir);
-            System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "watch-debug.log"),
-                $"{DateTime.Now:HH:mm:ss.fff} [dragrect] {msg}\n");
-        }
-        catch { }
-    }
-
-    public static void AttachFallbackTopBar()
-    {
-        try
-        {
-            if (!EnsureWindow(out var aw, out var hwnd)) return;
-            var scale = GetDpiForWindow(hwnd) / 96.0;
-            if (!GetClientRect(hwnd, out var rc)) return;
-
-            var inset = 0;
-            try { inset = aw.TitleBar.RightInset; } catch { }   // 右侧 最小化/最大化/关闭 占位
-
-            var w = rc.Right - inset;
-            var h = (int)Math.Round(30 * scale);
-            if (rc.Bottom > 0 && h > rc.Bottom) h = rc.Bottom;
-            DragLog($"fallback client={rc.Right}x{rc.Bottom} scale={scale:0.##} inset={inset} rect=(0,0,{w},{h})");
-            if (w <= 0 || h <= 0) return;
-
-            aw.TitleBar.SetDragRectangles([new Windows.Graphics.RectInt32 { X = 0, Y = 0, Width = w, Height = h }]);
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"[WindowDrag] AttachFallbackTopBar 失败: {ex.Message}");
         }
     }
 
@@ -330,7 +164,6 @@ public static class WindowDragHelper
                 });
 
             if (rects.Count == 0) return;
-            DragLog("strip → " + string.Join(" | ", rects.Select(r => $"({r.X},{r.Y},{r.Width},{r.Height})")));
             aw.TitleBar.SetDragRectangles(rects.ToArray());
         }
         catch (Exception ex)
@@ -353,12 +186,15 @@ public static class WindowDragHelper
             new Windows.Foundation.Rect(0, 0, el.ActualWidth, el.ActualHeight));
 
         if (!GetClientRect(hwnd, out _)) return null;
+        var origin = new POINT { X = 0, Y = 0 };
+        ClientToScreen(hwnd, ref origin);
+        var offX = origin.X - aw.Position.X;
+        var offY = origin.Y - aw.Position.Y;
 
-        // 同上（2026-10-20）：矩形按**客户区坐标**给，不再叠加客户区原点偏移（那会把顶部 32px 排除掉）。
         var rect = new Windows.Graphics.RectInt32
         {
-            X = (int)Math.Round(b.X * scale),
-            Y = (int)Math.Round(b.Y * scale),
+            X = offX + (int)Math.Round(b.X * scale),
+            Y = offY + (int)Math.Round(b.Y * scale),
             Width = (int)Math.Round(b.Width * scale),
             Height = (int)Math.Round(b.Height * scale),
         };
