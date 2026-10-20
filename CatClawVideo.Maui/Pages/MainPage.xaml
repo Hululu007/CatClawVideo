@@ -15,6 +15,15 @@
                 StrokeThickness="0"
                 Stroke="{DynamicResource DividerColor}">
             <Grid ColumnDefinitions="Auto,Auto,Auto,*,140" ColumnSpacing="16" HeightRequest="56">
+                <!-- ★ 窗口拖拽层（2026-10-20 按用户建议的层级思路）：
+                     透明、铺满整条顶栏、**放在最底层**（第一个子元素），按钮都在它上面 ⇒
+                     按钮正常收到点击，空白处落到这里 → PointerPressed 时调系统拖窗口（不靠算矩形）。 -->
+                <BoxView x:Name="TitleBarDragLayer" Grid.ColumnSpan="5" Color="Transparent">
+                    <BoxView.GestureRecognizers>
+                        <PointerGestureRecognizer PointerPressed="OnTitleBarDragLayerPressed" />
+                    </BoxView.GestureRecognizers>
+                </BoxView>
+
                 <!-- 品牌 -->
                 <HorizontalStackLayout Grid.Column="0" Spacing="10" VerticalOptions="Center">
                     <Border WidthRequest="26" HeightRequest="26"

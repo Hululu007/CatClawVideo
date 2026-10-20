@@ -99,6 +99,32 @@ public static class WindowDragHelper
         catch (Exception ex) { DragLog("passthrough 失败: " + ex.Message); }
     }
 
+    [DllImport("user32.dll")] private static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    private const int WM_NCLBUTTONDOWN = 0xA1;
+    private const int HTCAPTION = 2;
+
+    /// <summary>
+    /// 让系统直接拖窗口：ReleaseCapture() + SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)。
+    ///
+    /// <para><b>为什么用这个（2026-10-20 用户建议的"层级"思路）</b>：把**透明拖拽层垫在顶栏最底层**、
+    /// 按钮压在它上面 —— 按钮正常收到点击，空白处落到拖拽层，拖拽层按下就调这里让系统拖窗口。
+    /// 这样完全**不需要算任何矩形**（不依赖 DPI/客户区偏移），也不会像 Window.SetTitleBar 那样
+    /// 让 MAUI 的按钮输入失效（实测那套会让 tabs 点不动）。WPF/WinForms 的窗口拖动也是这么干的。</para>
+    /// </summary>
+    public static void StartNativeWindowDrag()
+    {
+        try
+        {
+            var hwnd = App.MainWindowHwnd;
+            if (hwnd == IntPtr.Zero) return;
+            ReleaseCapture();
+            SendMessage(hwnd, WM_NCLBUTTONDOWN, (IntPtr)HTCAPTION, IntPtr.Zero);
+            DragLog("native drag（层垫底方案）");
+        }
+        catch (Exception ex) { DragLog("native drag 失败: " + ex.Message); }
+    }
+
     /// <summary>没有自定义顶栏的页面：恢复**默认**拖动区域（官方：未放交互内容时保留默认区域）。</summary>
     public static void RestoreDefaultTitleBar()
     {
