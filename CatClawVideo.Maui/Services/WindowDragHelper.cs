@@ -28,19 +28,6 @@ namespace CatClawVideo.Maui.Services;
 /// </summary>
 public static class WindowDragHelper
 {
-    /// <summary>拖拽区诊断日志（写 %APPDATA%\CatClawVideo.debug\watch-debug.log），便于排查"哪一块拖不动"。</summary>
-    private static void DragLog(string msg)
-    {
-        try
-        {
-            var dir = CatClawVideo.Core.AppPaths.DataRoot;
-            System.IO.Directory.CreateDirectory(dir);
-            System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "watch-debug.log"),
-                $"{DateTime.Now:HH:mm:ss.fff} [dragrect] {msg}\n");
-        }
-        catch { }
-    }
-
     /// <summary>
     /// 把指定元素声明为窗口拖拽区（元素须已布局）。
     /// <para>元素为 null 或尺寸为 0 时**不动**已有拖拽区 —— 清零会导致窗口拖不动。</para>
@@ -92,18 +79,6 @@ public static class WindowDragHelper
         {
             System.Diagnostics.Debug.WriteLine($"[WindowDrag] Attach 失败: {ex.Message}");
         }
-    }
-
-    /// <summary>直接用一组**固定矩形**声明拖拽区（物理像素）。用于"标题栏左侧也要能拖"这类场景。</summary>
-    public static void AttachRects(IReadOnlyList<Windows.Graphics.RectInt32> rects)
-    {
-        try
-        {
-            if (!EnsureWindow(out var aw, out _)) return;
-            DragLog("rects → " + string.Join(" | ", rects.Select(r => $"({r.X},{r.Y},{r.Width},{r.Height})")));
-            aw.TitleBar.SetDragRectangles(rects.ToArray());
-        }
-        catch (Exception ex) { DragLog("AttachRects 失败: " + ex.Message); }
     }
 
     /// <summary>
