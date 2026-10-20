@@ -11,32 +11,27 @@
         <BackButtonBehavior IsVisible="False" />
     </Shell.BackButtonBehavior>
 
-    <Grid>
-    <ScrollView x:Name="ContentScroll">
-        <VerticalStackLayout x:Name="ContentStack" Padding="24,14,24,28" Spacing="14">
+    <!-- ★ 2026-10-20 用户要求：把返回按钮放到**标题栏**上。
+         结构改成两行：第 0 行 = 固定 48px 标题栏（不随内容滚动，返回键是交互控件、其余空白可拖），
+         第 1 行 = 原来的滚动内容。拖拽矩形由 WatchPage.xaml.cs 按返回键位置"挖洞"声明。 -->
+    <Grid RowDefinitions="56,*">
+        <Grid x:Name="TopBarGrid" Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="12"
+              Padding="16,8,12,0" HeightRequest="56">
+            <Border Grid.Column="0" x:Name="BackButtonHost" StrokeThickness="0" BackgroundColor="{DynamicResource ChipInactiveColor}"
+                    StrokeShape="RoundRectangle 12" WidthRequest="38" HeightRequest="38" VerticalOptions="Center">
+                <Image Source="ic_back.png" WidthRequest="18" HeightRequest="18"
+                       HorizontalOptions="Center" VerticalOptions="Center" />
+                <Border.GestureRecognizers>
+                    <TapGestureRecognizer Tapped="OnBackTapped" />
+                </Border.GestureRecognizers>
+            </Border>
+            <Label Grid.Column="1" x:Name="TopBarTitle" Text="猫爪影视" FontSize="14.5" FontFamily="OpenSansSemibold"
+                   LineBreakMode="TailTruncation" MaxLines="1" VerticalOptions="Center"
+                   TextColor="{DynamicResource TextPrimaryColor}" />
+        </Grid>
 
-            <!-- 顶栏：返回 + 品牌（全屏模式下隐藏） -->
-            <Grid x:Name="TopBarGrid" ColumnDefinitions="Auto,Auto,*,Auto" ColumnSpacing="12">
-                <Border Grid.Column="0" x:Name="BackButtonHost" StrokeThickness="0" BackgroundColor="{DynamicResource ChipInactiveColor}"
-                        StrokeShape="RoundRectangle 12" WidthRequest="38" HeightRequest="38" VerticalOptions="Start">
-                    <Image Source="ic_back.png" WidthRequest="18" HeightRequest="18"
-                           HorizontalOptions="Center" VerticalOptions="Center" />
-                    <Border.GestureRecognizers>
-                        <TapGestureRecognizer Tapped="OnBackTapped" />
-                    </Border.GestureRecognizers>
-                </Border>
-                <Label Grid.Column="1" x:Name="TopBarTitle" Text="猫爪影视" FontSize="14.5" FontFamily="OpenSansSemibold"
-                       LineBreakMode="TailTruncation" MaxLines="1" VerticalOptions="Center"
-                       TextColor="{DynamicResource TextPrimaryColor}" />
-
-                <!-- Windows 窗口拖拽区（照抄猫爪音乐：Window.SetTitleBar 指定元素为拖拽区）：
-                     顶栏中间这段空白声明为标题栏拖拽区，双击可最大化；两侧控件照常可点。
-                     注：SetTitleBar 只作用于本元素，其他平台该元素透明无影响。 -->
-                <BoxView x:Name="TitleBarDragArea" Grid.Column="2" Color="Transparent"
-                         HorizontalOptions="Fill" VerticalOptions="Fill" />
-
-                <!-- 线路切换已搬到播放器上方独立行（顶栏 520px 装不下 17 条线路，横向滚不动） -->
-            </Grid>
+    <ScrollView x:Name="ContentScroll" Grid.Row="1">
+        <VerticalStackLayout x:Name="ContentStack" Padding="24,6,24,28" Spacing="14">
 
             <!-- ═══ 线路行：右侧下拉框 = "切换线路"前缀 + 当前路线（17 条收进下拉） ═══ -->
             <Grid x:Name="RouteBar" ColumnDefinitions="*,Auto" ColumnSpacing="10"

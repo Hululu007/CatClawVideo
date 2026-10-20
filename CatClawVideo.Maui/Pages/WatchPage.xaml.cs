@@ -365,16 +365,54 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     {
         try
         {
-            // 整条顶栏的空白段都可拖（含返回按钮上方、线路芯片上下的留白），
-            // 控件本身（返回 / 标题 / 线路芯片）仍归客户区、照常可点。
-            // ⚠ 2026-10-20 结论：MAUI 里 Window.SetTitleBar + Passthrough 的坐标对不上（实测透传区偏 20px，
-            //   按钮点不动），所以仍用"横向补集算拖拽矩形"的做法 —— 它点得动、也拖得动。
-            Services.WindowDragHelper.AttachStrip(
-                TopBarGrid?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-                TitleBarDragArea?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-                BackButtonHost?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-                TopBarTitle?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-                RouteBar?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement);
+            // ★ 2026-10-20（用户明确要求：**标题栏左侧也要能拖**）：
+            //   用两组固定矩形声明拖拽区（不用算补集，避免滚动错位）：
+            //     ① 顶部整条 0..30 —— 页面最上面那条空白；
+            //     ② 标题行：从返回键右侧到窗口右缘（含标题文字那片）—— 标题本身不可点，所以安全。
+            //   返回键区域**不**包含在内 ⇒ 仍然正常可点。
+            var pageW = (ContentScroll?.Width ?? 0) > 0 ? ContentScroll!.Width : (Width > 0 ? Width : 1200);
+            var scale = 1.0;
+            var back = BackButtonHost?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement;
+            double backRight = 70, rowTop = 32, rowBottom = 82;
+            if (back is not null && back.ActualWidth > 0)
+            {
+                scale = back.XamlRoot?.RasterizationScale ?? 1.0;
+                var b = back.TransformToVisual(null).TransformBounds(
+                    new Windows.Foundation.Rect(0, 0, back.ActualWidth, back.ActualHeight));
+                backRight = b.X + b.Width + 6;
+                rowTop = b.Y;
+                rowBottom = b.Y + b.Height;
+            }
+            var w = (int)Math.Round(pageW * scale);
+            var rightInset = 0;
+            try { rightInset = App.CurrentAppWindow?.TitleBar.RightInset ?? 0; } catch { }
+            // 标题栏高 48（返回键居中），按返回键位置挖洞：
+            //   ① 返回键**左边**那条（0..buttonLeft）
+            //   ② 返回键**右边**到窗口右缘（含标题文字那片）
+            var t = 56.0;
+            var bh = 38.0;
+            rowTop = (t - bh) / 2;          // 返回键在 48 高标题栏里居中
+            rowBottom = rowTop + bh;
+            var buttonLeft = backRight - 38 - 6;   // backRight 是"按钮右缘 + 6"
+            var scaleF = scale <= 0 ? 1.0 : scale;
+            var rects = new List<Windows.Graphics.RectInt32>
+            {
+                new()
+                {
+                    X = 0,
+                    Y = 0,
+                    Width = Math.Max(0, (int)Math.Round(Math.Max(0, buttonLeft) * scaleF)),
+                    Height = (int)Math.Round(t * scaleF),
+                },
+                new()
+                {
+                    X = (int)Math.Round(Math.Max(0, backRight) * scaleF),
+                    Y = 0,
+                    Width = Math.Max(0, w - rightInset - (int)Math.Round(Math.Max(0, backRight) * scaleF)),
+                    Height = (int)Math.Round(t * scaleF),
+                },
+            };
+            Services.WindowDragHelper.AttachRects(rects);
         }
         catch { }
     }
@@ -1537,8 +1575,10 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         //   实测：退出播放页 ≈19:52:18.7 + 350ms → 19:52:19 崩溃，时间严丝合缝。
         //   返回主页后 MainPage 自己会 SyncTitleBarDrag（SizeChanged + 自己的 timer），
         //   由目标页面负责即可，本页不需要抢跑。
-        Services.WindowDragHelper.Detach();
-        DiagLog.Write("[drag] 离开播放页：解绑拖拽区（不再延迟重算，交给目标页面）");
+        // ⚠ 2026-10-20 二次确认：连这句 Detach() 也不能留 —— 它同样是在**导航过程中**调
+        //   SetDragRectangles([])，实测点返回后进程直接消失（stowed exception，日志无托管异常）。
+        //   目标页面（首页/详情页）导航完成后自己会 SyncTitleBarDrag 重新声明，不需要本页收尾。
+        DiagLog.Write("[drag] 离开播放页：不动拖拽区（交给目标页面，避免导航中 SetDragRectangles 原生崩溃）");
 #endif
         // 切后台 + 开了「后台继续播放」→ 什么都不敢动，让声音继续（对位 TVBox MusicPlaybackService）。
         // 导航离开（回主页/返回）仍然照旧停：那时 IsInBackground 是 false。
