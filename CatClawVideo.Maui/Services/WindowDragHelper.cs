@@ -58,21 +58,23 @@ public static class WindowDragHelper
             var b = el.TransformToVisual(null).TransformBounds(
                 new Windows.Foundation.Rect(0, 0, el.ActualWidth, el.ActualHeight));
 
+            // ★★ 2026-10-20 修复"窗口最顶部那条拖不动"：SetDragRectangles 的矩形是**客户区坐标**。
+            //   原实现又加了一次「客户区原点 − 窗口位置」的偏移 offX/offY —— 当
+            //   ExtendsContentIntoTitleBar 尚未生效时客户区顶边距窗口顶 32px ⇒ offY=32 ⇒
+            //   拖拽带被整体推到 y=32 以下，**恰好把最顶部那条 32px 排除掉**（用户第一反应就是拖那条）。
+            //   而 offY 有时是 0、有时是 32 ⇒ 表现成"时好时坏"。这里直接按客户区坐标给，不再加偏移。
             if (!GetClientRect(hwnd, out _)) return;
-            var origin = new POINT { X = 0, Y = 0 };
-            ClientToScreen(hwnd, ref origin);
-            var offX = origin.X - aw.Position.X;
-            var offY = origin.Y - aw.Position.Y;
 
             var rect = new Windows.Graphics.RectInt32
             {
-                X = offX + (int)Math.Round(b.X * scale),
-                Y = offY + (int)Math.Round(b.Y * scale),
+                X = (int)Math.Round(b.X * scale),
+                Y = (int)Math.Round(b.Y * scale),
                 Width = (int)Math.Round(b.Width * scale),
                 Height = (int)Math.Round(b.Height * scale),
             };
             if (rect.Width <= 0 || rect.Height <= 0) return;
 
+            DragLog($"attach rect=({rect.X},{rect.Y},{rect.Width},{rect.Height}) scale={scale:0.##}");
             aw.TitleBar.SetDragRectangles([rect]);
         }
         catch (Exception ex)
@@ -110,6 +112,20 @@ public static class WindowDragHelper
     /// <para>这些页面顶部 30 DIP 是空的（详情页返回键 ~57、搜索框 ~42、设置页签 ~64），
     /// 所以挂一条窄带既不影响点击，又保证**任何页面都能拖窗**。</para>
     /// </summary>
+    /// <summary>拖拽区诊断日志（写 %APPDATA%\CatClawVideo.debug\watch-debug.log）。
+    /// 用于排查"有时能拖有时不能拖"：把每次设置/清空的矩形记下来，一眼看出是没设、设成 0、还是位置错。</summary>
+    private static void DragLog(string msg)
+    {
+        try
+        {
+            var dir = CatClawVideo.Core.AppPaths.DataRoot;
+            System.IO.Directory.CreateDirectory(dir);
+            System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "watch-debug.log"),
+                $"{DateTime.Now:HH:mm:ss.fff} [dragrect] {msg}\n");
+        }
+        catch { }
+    }
+
     public static void AttachFallbackTopBar()
     {
         try
@@ -124,6 +140,7 @@ public static class WindowDragHelper
             var w = rc.Right - inset;
             var h = (int)Math.Round(30 * scale);
             if (rc.Bottom > 0 && h > rc.Bottom) h = rc.Bottom;
+            DragLog($"fallback client={rc.Right}x{rc.Bottom} scale={scale:0.##} inset={inset} rect=(0,0,{w},{h})");
             if (w <= 0 || h <= 0) return;
 
             aw.TitleBar.SetDragRectangles([new Windows.Graphics.RectInt32 { X = 0, Y = 0, Width = w, Height = h }]);
@@ -200,6 +217,7 @@ public static class WindowDragHelper
                 });
 
             if (rects.Count == 0) return;
+            DragLog("strip → " + string.Join(" | ", rects.Select(r => $"({r.X},{r.Y},{r.Width},{r.Height})")));
             aw.TitleBar.SetDragRectangles(rects.ToArray());
         }
         catch (Exception ex)
@@ -222,15 +240,12 @@ public static class WindowDragHelper
             new Windows.Foundation.Rect(0, 0, el.ActualWidth, el.ActualHeight));
 
         if (!GetClientRect(hwnd, out _)) return null;
-        var origin = new POINT { X = 0, Y = 0 };
-        ClientToScreen(hwnd, ref origin);
-        var offX = origin.X - aw.Position.X;
-        var offY = origin.Y - aw.Position.Y;
 
+        // 同上（2026-10-20）：矩形按**客户区坐标**给，不再叠加客户区原点偏移（那会把顶部 32px 排除掉）。
         var rect = new Windows.Graphics.RectInt32
         {
-            X = offX + (int)Math.Round(b.X * scale),
-            Y = offY + (int)Math.Round(b.Y * scale),
+            X = (int)Math.Round(b.X * scale),
+            Y = (int)Math.Round(b.Y * scale),
             Width = (int)Math.Round(b.Width * scale),
             Height = (int)Math.Round(b.Height * scale),
         };
