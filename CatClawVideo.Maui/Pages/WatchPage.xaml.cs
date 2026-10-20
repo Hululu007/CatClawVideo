@@ -489,6 +489,8 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     private void UpdateSpeedBadge()
     {
         // 网速数据源（内置 BT）已移除：该位置改用于**倍速提示**（非 1.0 时常驻）。
+        // 兜底：若已不在提速状态，「长按快进」气泡一律收掉（防止松手事件丢失时赖着）
+        if (_badgeIsBoost && !_boosting) ClearBoostBadge();
         if (DateTime.UtcNow < _badgeUntilUtc) return;   // 临时提示（A-B 标记 / 长按快进）先占着徽章
         SpeedBadge.IsVisible = _playing && Math.Abs(Player.Speed - 1.0) > 0.01;
         if (SpeedBadge.IsVisible) SpeedLabel.Text = $"{Player.Speed:0.0#}× 播放";
@@ -748,13 +750,25 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     // ═══════════════════ 临时徽章 / 长按快进 / A-B 循环 ═══════════════════
 
     private DateTime _badgeUntilUtc;
+    /// <summary>当前徽章是否是「长按快进」那条 —— 它必须在松手瞬间消失，不能等有效期。</summary>
+    private bool _badgeIsBoost;
 
     /// <summary>借用倍速徽章的位置闪一条提示。<see cref="UpdateSpeedBadge"/> 在有效期内不覆盖它。</summary>
-    private void FlashBadge(string text, int ms = 1800)
+    private void FlashBadge(string text, int ms = 1800, bool boostBadge = false)
     {
         _badgeUntilUtc = DateTime.UtcNow.AddMilliseconds(ms);
+        _badgeIsBoost = boostBadge;
         SpeedLabel.Text = text;
         SpeedBadge.IsVisible = true;
+    }
+
+    /// <summary>立刻收掉「长按快进」气泡（松手时调用）。</summary>
+    private void ClearBoostBadge()
+    {
+        if (!_badgeIsBoost) return;
+        _badgeIsBoost = false;
+        _badgeUntilUtc = DateTime.MinValue;
+        SpeedBadge.IsVisible = false;
     }
 
     private IDispatcherTimer? _pressTimer;
@@ -783,12 +797,16 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         _boosting = true;
         _speedBeforeBoost = Player.Speed;
         Player.Speed = 3.0;
-        FlashBadge("3× 快进中（松手恢复）", 60_000);
+        // 有效期只作"松手事件丢失"时的兜底（8s），正常松手会立刻 ClearBoostBadge 收掉。
+        FlashBadge("3× 快进中（松手恢复）", 8_000, boostBadge: true);
     }
 
     private void OnScreenReleased(object? sender, PointerEventArgs e)
     {
         _pressTimer?.Stop();
+        // ⚠ 2026-10-20 用户反馈"松手后气泡不消失"：原来这里只恢复倍速，而徽章有效期是 60s ⇒
+        //   UpdateSpeedBadge 在有效期内直接 return，气泡就赖着不走。现在松手**立刻收气泡**。
+        ClearBoostBadge();
         if (!_boosting) return;
         _boosting = false;
         Player.Speed = _speedBeforeBoost;
