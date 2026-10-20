@@ -1366,7 +1366,10 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     {
         try
         {
-            if (_sources.Count < 2) return;                         // 只有一条线路，换也没用
+            // ⚠ 2026-10-20 修正：原来这里 "if (_sources.Count < 2) return;" —— 而实测有些站点
+            //   detailContent 只合成出**一条**线路（如「玩偶|4K」的骤雨2026），此时看门狗直接摆烂，
+            //   既不换线也不跨站换源，用户看到的就是"永远卡在 0:00"。现在只有一条也照常判定：
+            //   卡住 → 没有别的线可换 → 直接跨站换源。
             if (_currentSourceIndex < 0 || _currentSourceIndex >= _sources.Count) return;
 
             // 判据**不依赖任何内核**（2026-10-19 实测：死线常表现为"黑屏 + 无失败事件 + mpv 已回落"）：
@@ -1391,6 +1394,14 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
             {
                 if (await MaybeAutoSwitchSourceAsync(force: true)) return;
                 _ = ShowTipAsync($"本站 {_sources.Count} 条线路都卡，其他站点也没找到同名可播内容。");
+                return;
+            }
+
+            // 只有一条线路时，没必要"换线"这一步，直接跨站换源。
+            if (_sources.Count < 2)
+            {
+                if (await MaybeAutoSwitchSourceAsync(force: true)) return;
+                _ = ShowTipAsync("这条线路一直取不到数据，其他站点也没找到同名可播内容。");
                 return;
             }
 
