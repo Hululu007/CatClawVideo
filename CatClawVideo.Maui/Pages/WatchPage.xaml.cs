@@ -242,6 +242,7 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
                     var nextSource = NextAliveSource();
                     if (nextSource < 0)
                     {
+                        if (await MaybeAutoSwitchSourceAsync(force: true)) return;
                         await ShowTipAsync($"这部片 {_sources.Count} 条线路都播不了。建议换个站点或用「换源」。");
                         return;
                     }
@@ -1384,9 +1385,19 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
             if (++_stallDeadTicks < 25) return;
             _stallDeadTicks = 0;
 
+            // ★ 反复卡住（已经换过 2 条线路、同样卡）⇒ 问题在"这个站点的镜像"，直接跨站换源。
+            //   实测「骤雨2026」6 条线路全卡，挨个试要 6×26s≈2.6 分钟；而换站点立刻能播。
+            if (_stallSwitchCount >= 2)
+            {
+                if (await MaybeAutoSwitchSourceAsync(force: true)) return;
+                _ = ShowTipAsync($"本站 {_sources.Count} 条线路都卡，其他站点也没找到同名可播内容。");
+                return;
+            }
+
             var next = NextAliveSource();
             if (next < 0)
             {
+                if (await MaybeAutoSwitchSourceAsync(force: true)) return;
                 _ = ShowTipAsync($"这部片 {_sources.Count} 条线路都取不到数据。建议换个站点或用「换源」。");
                 return;   // 全死了就一直保持这个提示，不再来回跳
             }
@@ -2387,6 +2398,7 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
                     var nextSource = NextAliveSource();
                     if (nextSource < 0)
                     {
+                        if (await MaybeAutoSwitchSourceAsync(force: true)) return;
                         await ShowTipAsync($"这部片 {_sources.Count} 条线路都取不到可播地址（最后一条：{notPlayableWhy}）。建议换个站点或用「换源」。");
                         return;
                     }
@@ -2493,56 +2505,90 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     /// 给最终用户用的：不要求任何账号、零配置 —— 磁力起不来就自动落到能播的源上。
     /// <para>只对「整部片都是磁力」的影片触发；混合线路里换一条线路就够了。</para>
     /// </summary>
-    private async Task MaybeAutoSwitchSourceAsync()
+    private static long _lastAutoSiteSwitchMs;   // 跨页限频：一次跳转一个新页面，防止 A→B→A 来回弹
+
+    /// <summary>
+    /// 跨站换源：按标题在其他站点找同名、且有可播直链的内容并跳转续播。
+    /// <para>2026-10-20 扩展：不再只服务"磁力站起播失败" —— 实测有些片（如「骤雨2026」）**本站 6 条线路全卡**
+    /// （同一部片都走夸克镜像，卡法一致），而**换站点就能播**。所以线路全死/反复卡住时也强制走这条路径。</para>
+    /// <returns>true = 已跳转到别的站点；false = 没找到可播的同名内容。</returns>
+    /// </summary>
+    private async Task<bool> MaybeAutoSwitchSourceAsync(bool force = false)
     {
-        if (_autoSwitching) return;
-        if (!CurrentItemIsMagnetOnly()) return;
+        if (_autoSwitching) return false;
+        if (!force && !CurrentItemIsMagnetOnly()) return false;
+        if (DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond - _lastAutoSiteSwitchMs < 60_000) return false;
+        _lastAutoSiteSwitchMs = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
 
         _autoSwitching = true;
         try
         {
             var title = Core.Services.TitleNormalizer.ForSearchQuery(_item.Title);
-            if (title.Length < 2) return;
+            if (title.Length < 2) return false;
 
-            DiagLog.Write($"[换源] 磁力站起播失败，开始跨站搜索：{title}");
-            int tried = 0;
-            foreach (var site in SiteRegistry.Playable)
+            WatchLog($"[换源] 开始跨站搜索：{title}（原因：{(force ? "本站线路已全部失败" : "磁力站起播失败")}）");
+            // ★ 并发搜（2026-10-20 修正）：原来串行最多 20 站 ⇒ 又慢又容易"没找到"就放弃。
+            //   反证：用户手搜同一关键词能出 400+ 条结果（成功 44 站），说明站点**有**，
+            //   是自动路径搜得太窄。这里改成 40 站 × 12 并发 + 25s 总超时。
+            var candidates = SiteRegistry.Playable.Where(s => s.Key != _site.Key).Take(40).ToList();
+            var gate = new SemaphoreSlim(12);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+            var tasks = candidates.Select(async site =>
             {
-                if (site.Key == _site.Key || tried >= 10) continue;
-                tried++;
+                await gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    if (cts.IsCancellationRequested) return ((VodSiteInfo?)null, (VodItem?)null, (VodSiteInfo?)null);
+                    var hits = await _provider.SearchAsync(site, title).ConfigureAwait(false);
+                    var m = hits.FirstOrDefault(h => Core.Services.TitleNormalizer.Matches(h.Title, title));
+                    return m is null ? (((VodSiteInfo?)null, (VodItem?)null, (VodSiteInfo?)null))
+                                     : ((VodSiteInfo?)site, (VodItem?)m, (VodSiteInfo?)null);
+                }
+                catch { return ((VodSiteInfo?)null, (VodItem?)null, (VodSiteInfo?)null); }
+                finally { gate.Release(); }
+            }).ToList();
+            var found = (await Task.WhenAll(tasks).ConfigureAwait(false))
+                .Where(x => x.Item1 is not null)
+                .Select(x => (site: x.Item1!, item: x.Item2!))
+                .ToList();
+            WatchLog($"[换源] 并发搜 {candidates.Count} 站，同名命中 {found.Count} 站");
 
-                List<VodItem> hits;
-                try { hits = await _provider.SearchAsync(site, title); }
+            // 逐个验证"有可播直链"（最多 8 个，防太慢）
+            int verified = 0, noDirect = 0;
+            foreach (var (site, match) in found.Take(8))
+            {
+                verified++;
+                List<VodPlaySource> srcs;
+                try { srcs = await _provider.GetPlaySourcesAsync(site, match).ConfigureAwait(false); }
                 catch { continue; }
-
-                var match = hits.FirstOrDefault(h => Core.Services.TitleNormalizer.Matches(h.Title, title));
-                if (match is null) continue;
 
                 // 必须确认有非磁力剧集，否则换过去还是播不了
-                List<VodPlaySource> srcs;
-                try { srcs = await _provider.GetPlaySourcesAsync(site, match); }
-                catch { continue; }
                 var hasDirect = srcs.SelectMany(s => s.Episodes).Any(e =>
                     !e.Url.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase) &&
                     !e.Url.StartsWith("ed2k:", StringComparison.OrdinalIgnoreCase));
-                if (!hasDirect) continue;
+                if (!hasDirect) { noDirect++; continue; }
 
                 var ep = _currentEpisode?.Name;
-                DiagLog.Write($"[换源] 命中 {site.Name}/{site.Key}《{match.Title}》，跳转续播 {ep}");
+                WatchLog($"[换源] 命中 {site.Name}/{site.Key}《{match.Title}》，跳转续播 {ep}");
                 var q = "watch?sourceKey=" + Uri.EscapeDataString(site.Key)
                       + "&itemId=" + Uri.EscapeDataString(match.Id)
                       + "&title=" + Uri.EscapeDataString(match.Title);
                 if (!string.IsNullOrEmpty(match.Cover)) q += "&cover=" + Uri.EscapeDataString(match.Cover);
                 if (!string.IsNullOrEmpty(ep)) q += "&resumeEp=" + Uri.EscapeDataString(ep);
-                await Shell.Current.GoToAsync(q);
-                return;
+                // ⚠ 2026-10-20 实测：换源搜索跑在后台线程，直接 GoToAsync 会抛
+                //   COMException 0x8001010E（RPC_E_WRONG_THREAD，应用程序调用一个已为另一线程整理的接口），
+                //   结果被 catch 成"没找到"、还弹了错误提示。导航必须回 UI 线程。
+                await MainThread.InvokeOnMainThreadAsync(async () => await Shell.Current.GoToAsync(q));
+                WatchLog($"[换源] 已跳转 {site.Key}/{match.Id}");
+                return true;
             }
-            DiagLog.Write("[换源] 其他站点没有找到可播的同名内容");
-            await ShowTipAsync("磁力源不可用，其他站点也没有同名可播内容");
+            WatchLog($"[换源] 未找到：同名 {found.Count} 站、验证 {verified} 个（其中 {noDirect} 个无直链）");
+            return false;
         }
         catch (Exception ex)
         {
-            DiagLog.Write($"[换源] 失败：{ex.GetType().Name}: {ex.Message}");
+            WatchLog($"[换源] 失败：{ex.GetType().Name}: {ex.Message}");
+            return false;
         }
         finally { _autoSwitching = false; }
     }
