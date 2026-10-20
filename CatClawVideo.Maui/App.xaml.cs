@@ -467,10 +467,13 @@ public partial class App : Application
 
             // 有拖拽元素的页面 → 声明矩形；没有的页面 → 清空。
             // 清空是必须的：否则上一页留下的拖拽区会在这个页面上把顶栏当标题栏、误吞点击。
+            // 2026-10-20 修复：原来没有拖拽元素的页面走 Detach()（SetDragRectangles([]) 清零），
+            // 结果是详情/搜索/设置/源配置… 这些页面上窗口**根本拖不动** —— 用户反馈的"有时候不能拖拽窗口"。
+            // 现在改成挂一条"顶部 30 DIP 全宽"的兜底带（这些页面顶部是空的），任何页面都能拖窗。
             DiagLog.Write(el is null
-                ? $"[drag] sync → 清空（页面 {current?.GetType().Name} 无拖拽元素）"
+                ? $"[drag] sync → 兜底顶带（页面 {current?.GetType().Name} 无拖拽元素）"
                 : $"[drag] sync → 挂 {current?.GetType().Name} 顶栏空白段");
-            if (el is null) Services.WindowDragHelper.Detach();
+            if (el is null) Services.WindowDragHelper.AttachFallbackTopBar();
             else Services.WindowDragHelper.Attach(el);
         }
         catch (Exception ex)

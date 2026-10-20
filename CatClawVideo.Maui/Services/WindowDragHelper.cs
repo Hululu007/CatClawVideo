@@ -98,6 +98,42 @@ public static class WindowDragHelper
         }
     }
 
+    /// <summary>
+    /// 兜底拖拽带：整窗顶部 30 DIP 全宽（跳过右侧窗口按钮占位）。
+    ///
+    /// <para><b>2026-10-20 修复"有时候不能拖拽窗口"</b>：全应用只有 <c>MainPage</c> 与
+    /// <c>WatchPage</c> 会声明拖拽区，其它页面（详情/搜索/设置/源配置/下载/收藏/直播…）
+    /// 过去在 <c>App.SyncTitleBarDrag</c> 里走 <c>Detach()</c> —— 也就是
+    /// <c>SetDragRectangles([])</c> 把拖拽区**清零**，于是这些页面上窗口完全拖不动，
+    /// 得等某次重算（缩放/回主页）才恢复。这就是"时好时坏"的来源。</para>
+    ///
+    /// <para>这些页面顶部 30 DIP 是空的（详情页返回键 ~57、搜索框 ~42、设置页签 ~64），
+    /// 所以挂一条窄带既不影响点击，又保证**任何页面都能拖窗**。</para>
+    /// </summary>
+    public static void AttachFallbackTopBar()
+    {
+        try
+        {
+            if (!EnsureWindow(out var aw, out var hwnd)) return;
+            var scale = GetDpiForWindow(hwnd) / 96.0;
+            if (!GetClientRect(hwnd, out var rc)) return;
+
+            var inset = 0;
+            try { inset = aw.TitleBar.RightInset; } catch { }   // 右侧 最小化/最大化/关闭 占位
+
+            var w = rc.Right - inset;
+            var h = (int)Math.Round(30 * scale);
+            if (rc.Bottom > 0 && h > rc.Bottom) h = rc.Bottom;
+            if (w <= 0 || h <= 0) return;
+
+            aw.TitleBar.SetDragRectangles([new Windows.Graphics.RectInt32 { X = 0, Y = 0, Width = w, Height = h }]);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[WindowDrag] AttachFallbackTopBar 失败: {ex.Message}");
+        }
+    }
+
     // ─────────── 手动拖拽兜底 ───────────
     //
     // 拖拽矩形正确时由系统接管（鼠标按下在非客户区，事件根本到不了应用），这几段不会触发；
