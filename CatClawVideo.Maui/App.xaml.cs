@@ -464,13 +464,14 @@ public partial class App : Application
             //   整条顶栏变成标题栏后，MAUI 的输入路由被拦 —— tabs/搜索框**点不动**了 ✗。
             //   结论：按钮可点优先。回到"只把空白段声明为拖拽区"的做法（控件天然属客户区、点击直达），
             //   并用 AttachFallbackTopBar 兜底那些没有拖拽元素的页面（修掉"这些页面拖不动窗口"）。
-            if (current is Pages.MainPage)
+            if (current is Pages.MainPage mp)
             {
-                // 主页改成"**拖拽层垫底**"方案（用户 2026-10-20 建议的 Z 序思路）：
-                // 拖拽层是顶栏第一个子元素（最底层），按钮都在它上面 ⇒ 按钮点击正常、空白处可拖。
-                // 因此**不能**再声明任何 SetDragRectangles 区域（那条非客户区会盖住按钮）。
-                Services.WindowDragHelper.Detach();
-                DiagLog.Write("[drag] sync → 主页：全客户区（拖拽层负责拖动）");
+                // ⚠ 2026-10-20 关键教训：ExtendsContentIntoTitleBar=true 时，**不清空**就会保留
+                //   系统默认的"整条标题栏 = 非客户区"⇒ tabs 那一整条点不动（用户截图绿框）。
+                //   必须显式把"空白段"声明成拖拽区，其余自动归客户区、控件点击直达。
+                //   （Z 序拖拽层保留在顶栏底层，负责空白处按下拖窗，两者不冲突。）
+                Services.WindowDragHelper.Attach(mp.TitleBarDragElement);
+                DiagLog.Write("[drag] sync → 主页 顶栏空白段（控件区归客户区 ⇒ 可点）");
                 return;
             }
 
