@@ -459,19 +459,20 @@ public partial class App : Application
                 return;
             }
 
-            // 官方两态（2026-10-20，按 learn.microsoft.com/windows/apps/develop/title-bar 重写）：
-            //   ① 主页：SetTitleBar(整条顶栏) ⇒ 默认整条可拖；tabs/搜索框声明 Passthrough；
-            //   ② 其它页面：SetTitleBar(null) 保留**默认拖动区域**。
-            //   旧实现是自算"空白补集"当拖拽区（方向相反），无拖拽元素时还清成空数组 ⇒ 拖不动。
+            // ⚠ 2026-10-20 回退：试过官方 Window.SetTitleBar(整条顶栏) + InputNonClientPointerSource
+            //   Passthrough（矩形算得对：日志 (130,6,415,45) 与 tabs 实际位置吻合），但在 **MAUI** 里
+            //   整条顶栏变成标题栏后，MAUI 的输入路由被拦 —— tabs/搜索框**点不动**了 ✗。
+            //   结论：按钮可点优先。回到"只把空白段声明为拖拽区"的做法（控件天然属客户区、点击直达），
+            //   并用 AttachFallbackTopBar 兜底那些没有拖拽元素的页面（修掉"这些页面拖不动窗口"）。
             if (current is Pages.MainPage mp)
             {
-                Services.WindowDragHelper.ApplyTitleBar(mp.TitleBarHost, mp.TitleBarInteractive);
-                DiagLog.Write("[drag] sync → MainPage 官方标题栏（整条可拖 + 透传 tabs/搜索框）");
+                Services.WindowDragHelper.Attach(mp.TitleBarDragElement);
+                DiagLog.Write("[drag] sync → MainPage 顶栏空白段（可拖；tabs/搜索框可点）");
                 return;
             }
 
-            Services.WindowDragHelper.RestoreDefaultTitleBar();
-            DiagLog.Write($"[drag] sync → 默认拖动区（页面 {current?.GetType().Name} 无自定义顶栏）");
+            Services.WindowDragHelper.AttachFallbackTopBar();
+            DiagLog.Write($"[drag] sync → 兜底顶带（页面 {current?.GetType().Name} 无拖拽元素）");
         }
         catch (Exception ex)
         {

@@ -273,6 +273,7 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         // 按住画面 = 临时 3× 快进，松手回原倍速（对位 TVBox VodController 的长按提速）
         pointer.PointerPressed += OnScreenPressed;
         pointer.PointerReleased += OnScreenReleased;
+        pointer.PointerMoved += OnScreenMoved;   // 长按中横向滑动：右滑快进 / 左滑快退（2026-10-20 用户需求）
         ControlsOverlay.GestureRecognizers.Add(pointer);
 
         // A-B 区间循环（对位 play_time_start / play_time_end）：越过 B 点就回到 A 点
@@ -366,11 +367,13 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         {
             // 整条顶栏的空白段都可拖（含返回按钮上方、线路芯片上下的留白），
             // 控件本身（返回 / 标题 / 线路芯片）仍归客户区、照常可点。
-            // 官方做法（2026-10-20）：整条顶栏设为标题栏 ⇒ 默认整条可拖；
-            //   返回键 / 线路芯片声明 Passthrough ⇒ 点击直达控件（旧实现在算"空白补集"，方向是反的）。
-            Services.WindowDragHelper.ApplyTitleBar(
+            // ⚠ 2026-10-20 回退（同 App）：SetTitleBar 方案在 MAUI 里会让顶栏控件点不动，
+            //   所以仍用"整条顶栏的横向补集"当拖拽区 —— 控件属客户区、点击直达，空白处可拖。
+            Services.WindowDragHelper.AttachStrip(
                 TopBarGrid?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
+                TitleBarDragArea?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
                 BackButtonHost?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
+                TopBarTitle?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
                 RouteBar?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement);
         }
         catch { }
@@ -775,10 +778,17 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
     private bool _boosting;
     private double _speedBeforeBoost = 1.0;
 
-    /// <summary>
-    /// 按住画面 450ms 起算 3× 快进（对位 TVBox <c>VodController</c> 的长按提速）。
-    /// <para>没到时长就松手 → 定时器被停掉，什么也不发生，所以普通「点一下唤出控制层」不受影响。</para>
-    /// </summary>
+    // ─────────── 长按提速 + 左右分区 + 按住横滑（2026-10-20 用户需求）───────────
+    //   右半屏长按 = 3× 快进；左半屏长按 = 3× 快退（周期回退 Seek，不依赖负倍速）；
+    //   按住时横向滑动 = 以按下点为基准的拖动定位：每 12px ≈ 1 秒，右滑快进、左滑快退。
+    private bool _boostForward = true;
+    private double _boostStartX;
+    private TimeSpan _boostStartPos;
+    private bool _boostDragging = false;
+    private long _boostLastSeekMs;
+    private IDispatcherTimer? _boostRewindTimer;
+
+    /// <summary>按住画面 450ms 起算提速。没到时长就松手 → 停定时器，不影响"单击唤出控制层"。</summary>
     private void OnScreenPressed(object? sender, PointerEventArgs e)
     {
         _pressTimer ??= Dispatcher.CreateTimer();
@@ -788,29 +798,99 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         _pressTimer.Tick += OnPressHoldElapsed;
         _pressTimer.Stop();
         _pressTimer.Start();
+
+        // 记录按下点：① 决定左右分区（快进/快退）② 作为拖动定位的基准
+        var p = e.GetPosition(ControlsOverlay);
+        if (p is not null) _boostStartX = p.Value.X;
     }
 
     private void OnPressHoldElapsed(object? sender, EventArgs e)
     {
-        // 进度条拖动中不提速：按住 slider 是「找位置」，不是 TVBox 那种「按住画面快进」
+        // 进度条拖动中不提速：按住 slider 是「找位置」，不是"按住画面快进"
         if (!_playing || _boosting || _seeking || _locked) return;
+        var width = ControlsOverlay?.Width ?? 0;
+        var rightHalf = width <= 0 || _boostStartX >= width / 2;
+        StartBoost(rightHalf);
+    }
+
+    /// <summary>开始长按提速：右半屏 3× 快进；左半屏 3× 快退（每 200ms 回退 0.6s ≈ 3×）。</summary>
+    private void StartBoost(bool forward)
+    {
         _boosting = true;
+        _boostForward = forward;
+        _boostDragging = false;
+        _boostStartPos = Player.Position;
         _speedBeforeBoost = Player.Speed;
-        Player.Speed = 3.0;
-        // 有效期只作"松手事件丢失"时的兜底（8s），正常松手会立刻 ClearBoostBadge 收掉。
-        FlashBadge("3× 快进中（松手恢复）", 8_000, boostBadge: true);
+
+        if (forward)
+        {
+            Player.Speed = 3.0;
+            FlashBadge("» 3× 快进（右滑加速 / 松手恢复）", 8_000, boostBadge: true);
+        }
+        else
+        {
+            Player.Speed = 1.0;
+            _boostRewindTimer ??= Dispatcher.CreateTimer();
+            _boostRewindTimer.Interval = TimeSpan.FromMilliseconds(200);
+            _boostRewindTimer.Tick -= OnBoostRewindTick;
+            _boostRewindTimer.Tick += OnBoostRewindTick;
+            _boostRewindTimer.Start();
+            FlashBadge("« 3× 快退（左滑加速 / 松手恢复）", 8_000, boostBadge: true);
+        }
+        WatchLog($"[手势] 长按{(forward ? "右" : "左")}半屏 → 3× {(forward ? "快进" : "快退")}");
+    }
+
+    private void OnBoostRewindTick(object? sender, EventArgs e)
+    {
+        try
+        {
+            var t = Player.Position - TimeSpan.FromSeconds(0.6);
+            Player.Seek(t < TimeSpan.Zero ? TimeSpan.Zero : t);
+        }
+        catch { }
+    }
+
+    /// <summary>按住时横向滑动：以按下点为基准拖动定位（12px ≈ 1s），右滑快进、左滑快退。</summary>
+    private void OnScreenMoved(object? sender, PointerEventArgs e)
+    {
+        if (!_boosting) return;
+        try
+        {
+            var p = e.GetPosition(ControlsOverlay);
+            if (p is null) return;
+
+            var dx = p.Value.X - _boostStartX;
+            if (!_boostDragging && Math.Abs(dx) < 24) return;   // 小于 24px 仍算"长按提速"，防手抖
+
+            _boostDragging = true;
+            var now = Environment.TickCount64;
+            if (now - _boostLastSeekMs < 80) return;            // Seek 限频（≈12 次/秒）
+            _boostLastSeekMs = now;
+
+            var deltaSec = dx / 12.0;
+            var target = _boostStartPos + TimeSpan.FromSeconds(deltaSec);
+            if (target < TimeSpan.Zero) target = TimeSpan.Zero;
+            if (Player.Duration > TimeSpan.Zero && target > Player.Duration) target = Player.Duration;
+
+            if (Math.Abs(Player.Speed - 1.0) > 0.01) Player.Speed = 1.0;   // 拖动定位时不加速
+            Player.Seek(target);
+            FlashBadge($"{(deltaSec >= 0 ? "» 快进" : "« 快退")} {deltaSec:+0.0;-0.0}s", 8_000, boostBadge: true);
+        }
+        catch { }
     }
 
     private void OnScreenReleased(object? sender, PointerEventArgs e)
     {
         _pressTimer?.Stop();
-        // ⚠ 2026-10-20 用户反馈"松手后气泡不消失"：原来这里只恢复倍速，而徽章有效期是 60s ⇒
-        //   UpdateSpeedBadge 在有效期内直接 return，气泡就赖着不走。现在松手**立刻收气泡**。
+        // 松手**立刻**收气泡（2026-10-20 用户反馈"松手后不消失"）
         ClearBoostBadge();
+        _boostRewindTimer?.Stop();
         if (!_boosting) return;
         _boosting = false;
+        _boostDragging = false;
         Player.Speed = _speedBeforeBoost;
         UpdateSpeedBadge();
+        WatchLog($"[手势] 松手：回到 {_speedBeforeBoost:0.##}×（当前 {FormatTime(Player.Position)}）");
     }
 
     private TimeSpan? _loopA;
