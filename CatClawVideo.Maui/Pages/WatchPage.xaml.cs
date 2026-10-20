@@ -366,11 +366,11 @@ public partial class WatchPage : ContentPage, IQueryAttributable, IRemoteKeyHand
         {
             // 整条顶栏的空白段都可拖（含返回按钮上方、线路芯片上下的留白），
             // 控件本身（返回 / 标题 / 线路芯片）仍归客户区、照常可点。
-            Services.WindowDragHelper.AttachStrip(
+            // 官方做法（2026-10-20）：整条顶栏设为标题栏 ⇒ 默认整条可拖；
+            //   返回键 / 线路芯片声明 Passthrough ⇒ 点击直达控件（旧实现在算"空白补集"，方向是反的）。
+            Services.WindowDragHelper.ApplyTitleBar(
                 TopBarGrid?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-                TitleBarDragArea?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
                 BackButtonHost?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
-                TopBarTitle?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement,
                 RouteBar?.Handler?.PlatformView as Microsoft.UI.Xaml.FrameworkElement);
         }
         catch { }

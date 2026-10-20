@@ -28,6 +28,93 @@ namespace CatClawVideo.Maui.Services;
 /// </summary>
 public static class WindowDragHelper
 {
+    // ════════════════════════════════════════════════════════════════════
+    // 官方实现（2026-10-20 按 Microsoft 文档重写）：
+    //   learn.microsoft.com/windows/apps/develop/title-bar
+    //   ① 完全自定义标题栏 = Window.SetTitleBar(整条顶栏元素) ⇒ **默认整条都能拖**
+    //   ② 顶栏里的交互控件（tab/搜索框/返回键/线路芯片）必须用
+    //      InputNonClientPointerSource.SetRegionRects(NonClientRegionKind.Passthrough, …)
+    //      声明"透传区域"，否则点击会被当标题栏吞掉
+    //   ③ 只在**顶栏元素 SizeChanged** 时重算（文档明确警告：用窗口 Changed 重算，
+    //      最大化/最小化时会拿到错误尺寸 —— 这正是旧实现"时好时坏"的另一个原因）
+    //   ④ 没有自定义顶栏的页面：SetTitleBar(null) 保留**默认拖动区域**即可（不要清成空数组）
+    //
+    // 旧实现（SetDragRectangles + 自己算"空白补集"）方向是反的，已废弃（保留方法仅供回退）。
+    // ════════════════════════════════════════════════════════════════════
+
+    private static readonly List<Microsoft.UI.Xaml.FrameworkElement> _hooked = [];
+    private static Microsoft.UI.Xaml.FrameworkElement?[] _lastInteractive = [];
+
+    /// <summary>官方做法：把**整条顶栏**设为标题栏（默认可拖），并为交互控件声明 Passthrough。</summary>
+    public static void ApplyTitleBar(Microsoft.UI.Xaml.FrameworkElement? titleBar,
+        params Microsoft.UI.Xaml.FrameworkElement?[] interactive)
+    {
+        try
+        {
+            var win = App.CurrentNativeWindow;
+            var aw = App.CurrentAppWindow;
+            if (win is null || aw is null || titleBar is null) return;
+
+            if (!win.ExtendsContentIntoTitleBar) win.ExtendsContentIntoTitleBar = true;
+
+            win.SetTitleBar(titleBar);
+            _lastInteractive = interactive;
+            UpdatePassthrough(aw, interactive);
+
+            // 只挂一次：顶栏尺寸变化时重算透传区域（官方推荐时机）
+            if (!_hooked.Contains(titleBar))
+            {
+                _hooked.Add(titleBar);
+                titleBar.SizeChanged += (_, _) => UpdatePassthrough(App.CurrentAppWindow!, _lastInteractive);
+            }
+            DragLog($"apply titlebar：整条可拖 + 透传 {interactive.Length} 个控件");
+        }
+        catch (Exception ex) { DragLog("ApplyTitleBar 失败: " + ex.Message); }
+    }
+
+    /// <summary>把交互控件矩形声明成 Passthrough（客户区坐标 × DPI 缩放）。</summary>
+    private static void UpdatePassthrough(Microsoft.UI.Windowing.AppWindow aw, Microsoft.UI.Xaml.FrameworkElement?[] interactive)
+    {
+        try
+        {
+            var rects = new List<Windows.Graphics.RectInt32>();
+            foreach (var el in interactive)
+            {
+                if (el is null || el.ActualWidth <= 0 || el.ActualHeight <= 0) continue;
+                var scale = el.XamlRoot?.RasterizationScale ?? 1.0;
+                var b = el.TransformToVisual(null).TransformBounds(
+                    new Windows.Foundation.Rect(0, 0, el.ActualWidth, el.ActualHeight));
+                rects.Add(new Windows.Graphics.RectInt32
+                {
+                    X = (int)Math.Round(b.X * scale),
+                    Y = (int)Math.Round(b.Y * scale),
+                    Width = (int)Math.Round(b.Width * scale),
+                    Height = (int)Math.Round(b.Height * scale),
+                });
+            }
+            Microsoft.UI.Input.InputNonClientPointerSource.GetForWindowId(aw.Id)
+                .SetRegionRects(Microsoft.UI.Input.NonClientRegionKind.Passthrough, rects.ToArray());
+            DragLog("passthrough → " + string.Join(" | ", rects.Select(r => $"({r.X},{r.Y},{r.Width},{r.Height})")));
+        }
+        catch (Exception ex) { DragLog("passthrough 失败: " + ex.Message); }
+    }
+
+    /// <summary>没有自定义顶栏的页面：恢复**默认**拖动区域（官方：未放交互内容时保留默认区域）。</summary>
+    public static void RestoreDefaultTitleBar()
+    {
+        try
+        {
+            var win = App.CurrentNativeWindow;
+            var aw = App.CurrentAppWindow;
+            if (win is null || aw is null) return;
+            win.SetTitleBar(null);   // null ⇒ 默认 AppWindowTitleBar 的整条拖动区域
+            Microsoft.UI.Input.InputNonClientPointerSource.GetForWindowId(aw.Id)
+                .SetRegionRects(Microsoft.UI.Input.NonClientRegionKind.Passthrough, []);
+            _lastInteractive = [];
+            DragLog("restore 默认拖动区域（本页无自定义顶栏）");
+        }
+        catch (Exception ex) { DragLog("RestoreDefault 失败: " + ex.Message); }
+    }
     /// <summary>
     /// 把指定元素声明为窗口拖拽区（元素须已布局）。
     /// <para>元素为 null 或尺寸为 0 时**不动**已有拖拽区 —— 清零会导致窗口拖不动。</para>

@@ -459,22 +459,19 @@ public partial class App : Application
                 return;
             }
 
-            var el = current switch
+            // 官方两态（2026-10-20，按 learn.microsoft.com/windows/apps/develop/title-bar 重写）：
+            //   ① 主页：SetTitleBar(整条顶栏) ⇒ 默认整条可拖；tabs/搜索框声明 Passthrough；
+            //   ② 其它页面：SetTitleBar(null) 保留**默认拖动区域**。
+            //   旧实现是自算"空白补集"当拖拽区（方向相反），无拖拽元素时还清成空数组 ⇒ 拖不动。
+            if (current is Pages.MainPage mp)
             {
-                Pages.MainPage mp => mp.TitleBarDragElement,
-                _ => null,
-            };
+                Services.WindowDragHelper.ApplyTitleBar(mp.TitleBarHost, mp.TitleBarInteractive);
+                DiagLog.Write("[drag] sync → MainPage 官方标题栏（整条可拖 + 透传 tabs/搜索框）");
+                return;
+            }
 
-            // 有拖拽元素的页面 → 声明矩形；没有的页面 → 清空。
-            // 清空是必须的：否则上一页留下的拖拽区会在这个页面上把顶栏当标题栏、误吞点击。
-            // 2026-10-20 修复：原来没有拖拽元素的页面走 Detach()（SetDragRectangles([]) 清零），
-            // 结果是详情/搜索/设置/源配置… 这些页面上窗口**根本拖不动** —— 用户反馈的"有时候不能拖拽窗口"。
-            // 现在改成挂一条"顶部 30 DIP 全宽"的兜底带（这些页面顶部是空的），任何页面都能拖窗。
-            DiagLog.Write(el is null
-                ? $"[drag] sync → 兜底顶带（页面 {current?.GetType().Name} 无拖拽元素）"
-                : $"[drag] sync → 挂 {current?.GetType().Name} 顶栏空白段");
-            if (el is null) Services.WindowDragHelper.AttachFallbackTopBar();
-            else Services.WindowDragHelper.Attach(el);
+            Services.WindowDragHelper.RestoreDefaultTitleBar();
+            DiagLog.Write($"[drag] sync → 默认拖动区（页面 {current?.GetType().Name} 无自定义顶栏）");
         }
         catch (Exception ex)
         {
