@@ -57,6 +57,18 @@ public static class AppPaths
     {
         var exeDir = AppContext.BaseDirectory.TrimEnd(
             Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var localRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CatClawVideo");
+
+        // ★ 2026-10-21 修「覆盖安装后 2.6GB 运行环境要重新下载」：
+        //   ① 环境变量优先（排障/自定义）→ ② 程序目录已有 → ③ 用户数据目录已有（复用）→
+        //   ④ 安装版固定用户数据目录（重装/升级都不丢）→ ⑤ 绿色版/Debug 才就地放。
+        var envDir = Environment.GetEnvironmentVariable("CATCLAW_RUNTIME_DIR");
+        if (!string.IsNullOrWhiteSpace(envDir)) return (envDir.Trim(), false);
+        if (Directory.Exists(Path.Combine(exeDir, "AndroidSdk"))) return (exeDir, true);
+        if (Directory.Exists(Path.Combine(localRoot, "AndroidSdk"))) return (localRoot, false);
+        if (LooksInstalled(exeDir)) return (localRoot, false);
+
         try
         {
             // 写一次探测文件：能写才把 2.6GB 运行环境放在程序目录旁
@@ -71,6 +83,19 @@ public static class AppPaths
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "CatClawVideo"), false);
         }
+    }
+
+    /// <summary>判断程序目录是不是「装出来的」：Program Files 下，或目录里有 Inno Setup 卸载器。
+    /// <para>安装版必须把运行环境放用户数据目录 —— 否则每次覆盖安装都会被 2.6GB 重下。</para></summary>
+    private static bool LooksInstalled(string exeDir)
+    {
+        try
+        {
+            if (exeDir.Contains(@"\Program Files", StringComparison.OrdinalIgnoreCase)) return true;
+            return Directory.EnumerateFiles(exeDir, "unins*.exe").Any()
+                || Directory.EnumerateFiles(exeDir, "*uninstall*.exe").Any();
+        }
+        catch { return false; }
     }
 
     /// <summary>旧版本（未按配置隔离）的共享数据目录：<c>%APPDATA%\CatClawVideo</c>，仅用于首次迁移。</summary>

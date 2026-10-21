@@ -633,7 +633,8 @@ public partial class SettingsPage : ContentView, ITabView, IRemoteKeyHandler
             {
                 if (!await page.DisplayAlertAsync("安装 Android 运行环境",
                         "· 下载约 938MB（断点续传，走镜像加速）\n" +
-                        "· 解压后约 2.6GB，落在**程序同目录**的 AndroidSdk\n" +
+                        "· 解压后约 2.6GB，落在 %LOCALAPPDATA%\\CatClawVideo\\AndroidSdk\n" +
+                        "  （安装版固定放这里 —— 以后覆盖安装/升级都不会重下；绿色版才放程序同目录）\n" +
                         "· 装好后会自动启动模拟器（首次冷启约 1 分钟）\n\n现在开始吗？",
                         "开始下载", "以后再说"))
                     return;
